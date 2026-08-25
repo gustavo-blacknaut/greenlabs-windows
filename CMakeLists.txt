@@ -45,6 +45,9 @@ add_library(greenlabs_core STATIC
     src/capture/ScreenCapture.cpp
     src/video/ColorConverter.cpp
     src/encoder/VideoEncoder.cpp
+    src/util/Json.cpp
+    src/network/WebSocketClient.cpp
+    src/network/Signaling.cpp
 )
 
 target_include_directories(greenlabs_core PUBLIC src)
@@ -60,11 +63,17 @@ target_link_libraries(greenlabs_core PUBLIC
     mfplat       # Media Foundation: encoder H.264 por hardware
     mfuuid       # GUIDs de midia
     strmiids     # GUIDs do ICodecAPI
+    ws2_32       # sockets do cliente WebSocket
+    crypt32      # base64 do handshake
+    bcrypt       # bytes aleatorios da mascara
 )
 
 # ---------------------------------------------------------------- probe
 add_executable(greenlabs-probe tools/probe/main.cpp)
 target_link_libraries(greenlabs-probe PRIVATE greenlabs_core)
 
-set_target_properties(greenlabs-probe PROPERTIES
+add_executable(greenlabs-sinal tools/sinal/main.cpp)
+target_link_libraries(greenlabs-sinal PRIVATE greenlabs_core)
+
+set_target_properties(greenlabs-probe greenlabs-sinal PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
