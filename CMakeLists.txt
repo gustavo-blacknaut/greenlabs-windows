@@ -48,9 +48,11 @@ add_library(greenlabs_core STATIC
     src/util/Json.cpp
     src/network/WebSocketClient.cpp
     src/network/Signaling.cpp
+    ui/Renderizador.cpp
+    ui/Aplicacao.cpp
 )
 
-target_include_directories(greenlabs_core PUBLIC src)
+target_include_directories(greenlabs_core PUBLIC src ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Tudo do Windows SDK. Nenhuma dependencia externa nesta etapa.
 target_link_libraries(greenlabs_core PUBLIC
@@ -66,7 +68,16 @@ target_link_libraries(greenlabs_core PUBLIC
     ws2_32       # sockets do cliente WebSocket
     crypt32      # base64 do handshake
     bcrypt       # bytes aleatorios da mascara
+    d2d1         # interface: formas e imagem
+    dwrite       # interface: texto
+    shell32      # CommandLineToArgvW
 )
+
+# ---------------------------------------------------------------- aplicativo
+#
+# WIN32 e o que faz o executavel abrir sem console atras da janela.
+add_executable(GreenLabs WIN32 src/main/main.cpp)
+target_link_libraries(GreenLabs PRIVATE greenlabs_core)
 
 # ---------------------------------------------------------------- probe
 add_executable(greenlabs-probe tools/probe/main.cpp)
@@ -75,5 +86,5 @@ target_link_libraries(greenlabs-probe PRIVATE greenlabs_core)
 add_executable(greenlabs-sinal tools/sinal/main.cpp)
 target_link_libraries(greenlabs-sinal PRIVATE greenlabs_core)
 
-set_target_properties(greenlabs-probe greenlabs-sinal PROPERTIES
+set_target_properties(GreenLabs greenlabs-probe greenlabs-sinal PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
