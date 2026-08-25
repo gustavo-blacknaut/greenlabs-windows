@@ -10,6 +10,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -18,6 +20,7 @@
 #include "capture/ProcessTree.h"
 #include "capture/ScreenCapture.h"
 #include "encoder/VideoEncoder.h"
+#include "network/Midia.h"
 #include "network/Signaling.h"
 #include "ui/Renderizador.h"
 #include "ui/Tema.h"
@@ -93,6 +96,11 @@ struct Aplicacao::Interno {
 
     std::mutex travaPares;
     std::vector<Participante> pares;
+
+    // Uma conexão de mídia por participante. Numa sala de N pessoas são N-1:
+    // é a topologia em malha, a mesma dos outros clientes.
+    std::mutex travaConexoes;
+    std::map<std::string, std::shared_ptr<ConexaoPar>> conexoes;
     std::string meuId;
     std::atomic<bool> conectado{false};
 
@@ -115,6 +123,9 @@ struct Aplicacao::Interno {
     bool comecarTransmissao();
     void pararTransmissao();
     void conectar();
+    std::shared_ptr<ConexaoPar> abrirMidiaPara(const std::string& peerId);
+    void tratarRepasse(const std::string& de, const Json& msg);
+    void enviarQuadroParaTodos(const PacoteCodificado& pacote);
 
     Campo* campoFocado();
     void desenharCampo(Campo& campo, const std::wstring& rotulo);
@@ -218,12 +229,30 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
         d_->telaAtual = Tela::AoVivo;
     };
     ouvintes.aoChegarAlguem = [this](const Participante& p) {
-        std::lock_guard trava(d_->travaPares);
-        d_->pares.push_back(p);
+        {
+            std::lock_guard trava(d_->travaPares);
+            d_->pares.push_back(p);
+        }
+        // Chegou no meio da transmissão: abre a mídia e oferece na hora, senão
+        // a pessoa fica olhando tela preta até alguém reiniciar a transmissão.
+        if (d_->transmitindo) {
+            if (auto conexao = d_->abrirMidiaPara(p.id)) {
+                conexao->oferecer();
+                d_->encoder.pedirQuadroChave();
+            }
+        }
     };
     ouvintes.aoSairAlguem = [this](const std::string& id) {
-        std::lock_guard trava(d_->travaPares);
-        std::erase_if(d_->pares, [&](const Participante& p) { return p.id == id; });
+        {
+            std::lock_guard trava(d_->travaPares);
+            std::erase_if(d_->pares, [&](const Participante& p) { return p.id == id; });
+        }
+        std::lock_guard trava(d_->travaConexoes);
+        d_->conexoes.erase(id);
+    };
+
+    ouvintes.aoRepasse = [this](const std::string& de, const Json& msg) {
+        d_->tratarRepasse(de, msg);
     };
     ouvintes.aoCair = [this](const std::string& motivo) {
         d_->conectado.store(false);
@@ -317,9 +346,10 @@ bool Aplicacao::Interno::comecarTransmissao() {
     cfg.fps = 60;
     cfg.bitrate = 4'500'000;
 
-    // O consumidor ainda só conta: o transporte de mídia é a etapa seguinte.
-    // Quando ela existir, é aqui que o pacote vai para a rede.
-    if (!encoder.iniciar(tela.dispositivo(), cfg, [](const PacoteCodificado&) {})) {
+    if (!encoder.iniciar(tela.dispositivo(), cfg,
+                         [this](const PacoteCodificado& pacote) {
+                             enviarQuadroParaTodos(pacote);
+                         })) {
         aviso = L"Nao foi possivel iniciar o encoder H.264.";
         return false;
     }
@@ -329,6 +359,17 @@ bool Aplicacao::Interno::comecarTransmissao() {
     const uint32_t excluir = acharRaizParaExcluir(
         {"discord", "discordptb", "discordcanary", "discorddevelopment"});
     audio.iniciar(excluir, [](const float*, uint32_t) {});
+
+    // Quem já está na sala precisa receber a oferta agora; quem chegar depois
+    // recebe no aoChegarAlguem.
+    std::vector<Participante> agora;
+    {
+        std::lock_guard trava(travaPares);
+        agora = pares;
+    }
+    for (const auto& p : agora) {
+        if (auto conexao = abrirMidiaPara(p.id)) conexao->oferecer();
+    }
 
     transmitindo = true;
     aviso.clear();
@@ -340,6 +381,10 @@ void Aplicacao::Interno::pararTransmissao() {
     transmitindo = false;
     encoder.parar();
     audio.parar();
+    {
+        std::lock_guard trava(travaConexoes);
+        conexoes.clear();
+    }
 }
 
 void Aplicacao::Interno::conectar() {
@@ -354,6 +399,95 @@ void Aplicacao::Interno::conectar() {
         return;
     }
     aviso.clear();
+}
+
+// ---------------------------------------------------------------- midia
+
+std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string& peerId) {
+    {
+        std::lock_guard trava(travaConexoes);
+        auto achou = conexoes.find(peerId);
+        if (achou != conexoes.end()) return achou->second;
+    }
+
+    const auto& m = tela.monitor();
+    ConfigMidia cfg;
+    cfg.largura = m.largura;
+    cfg.altura = m.altura;
+    cfg.fps = 60;
+    cfg.bitrate = 4'500'000;
+
+    auto conexao = std::make_shared<ConexaoPar>(peerId, cfg);
+
+    // O cliente web le "sdp" e o de Electron le "description". Mandar os dois
+    // faz o mesmo pacote servir para os dois sem eles precisarem mudar.
+    conexao->aoDescrever([this, peerId](const std::string& tipo, const std::string& sdp) {
+        Json descricao = Json::objeto();
+        descricao["type"] = Json{tipo};
+        descricao["sdp"] = Json{sdp};
+
+        Json msg = Json::objeto();
+        msg["type"] = Json{tipo};
+        msg["sdp"] = descricao;
+        msg["description"] = descricao;
+        sinal.enviarPara(peerId, msg);
+    });
+
+    conexao->aoCandidato([this, peerId](const std::string& candidato, const std::string& mid) {
+        Json corpo = Json::objeto();
+        corpo["candidate"] = Json{candidato};
+        corpo["sdpMid"] = Json{mid};
+        corpo["sdpMLineIndex"] = Json{0};
+
+        Json msg = Json::objeto();
+        msg["type"] = Json{"ice"};
+        msg["candidate"] = corpo;
+        sinal.enviarPara(peerId, msg);
+    });
+
+    {
+        std::lock_guard trava(travaConexoes);
+        conexoes[peerId] = conexao;
+    }
+    return conexao;
+}
+
+void Aplicacao::Interno::tratarRepasse(const std::string& de, const Json& msg) {
+    const std::string tipo = msg.texto("type");
+
+    std::shared_ptr<ConexaoPar> conexao;
+    {
+        std::lock_guard trava(travaConexoes);
+        auto achou = conexoes.find(de);
+        if (achou != conexoes.end()) conexao = achou->second;
+    }
+    if (!conexao) return;
+
+    if (tipo == "answer" || tipo == "offer") {
+        // De novo os dois nomes de campo, porque os dois clientes usam nomes
+        // diferentes para a mesma coisa.
+        const Json& corpo = msg.tem("sdp") ? msg.filho("sdp") : msg.filho("description");
+        const std::string sdp = corpo.ehObjeto() ? corpo.texto("sdp") : msg.texto("sdp");
+        if (!sdp.empty()) conexao->receberDescricao(tipo, sdp);
+        return;
+    }
+
+    if (tipo == "ice") {
+        const Json& corpo = msg.filho("candidate");
+        const std::string candidato =
+            corpo.ehObjeto() ? corpo.texto("candidate") : msg.texto("candidate");
+        const std::string mid = corpo.ehObjeto() ? corpo.texto("sdpMid", "0") : "0";
+        if (!candidato.empty()) conexao->receberCandidato(candidato, mid);
+    }
+}
+
+void Aplicacao::Interno::enviarQuadroParaTodos(const PacoteCodificado& pacote) {
+    // Um encoder, N transportes. Codificar por destinatario multiplicaria o
+    // custo pelo tamanho da sala e derrubaria a maquina numa chamada grande.
+    std::lock_guard trava(travaConexoes);
+    for (auto& [id, conexao] : conexoes) {
+        conexao->enviarVideo(pacote.dados, pacote.tamanho, pacote.tempoUs);
+    }
 }
 
 // ---------------------------------------------------------------- entrada
@@ -653,6 +787,19 @@ void Aplicacao::Interno::desenharAoVivo() {
         linhaInfo(L"audio",
                   audio.pidExcluido() ? L"sem o Discord" : L"tudo",
                   audio.ativo() ? tema::kVerde : tema::kApagado);
+        size_t abertas = 0;
+        uint64_t pacotes = 0;
+        {
+            std::lock_guard trava(travaConexoes);
+            for (auto& [id, c] : conexoes) {
+                if (c->pronto()) ++abertas;
+                pacotes += c->pacotesEnviados();
+            }
+            ::swprintf_s(buffer, L"%zu/%zu", abertas, conexoes.size());
+        }
+        linhaInfo(L"midia", buffer, abertas > 0 ? tema::kVerde : tema::kApagado);
+        ::swprintf_s(buffer, L"%llu", static_cast<unsigned long long>(pacotes));
+        linhaInfo(L"quadros enviados", buffer, tema::kTexto);
     } else {
         linhaInfo(L"encoder", L"parado", tema::kApagado);
     }
