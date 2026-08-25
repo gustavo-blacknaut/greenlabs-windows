@@ -25,7 +25,9 @@
 #include "capture/AudioCapture.h"
 #include "capture/ProcessTree.h"
 #include "capture/ScreenCapture.h"
+#include "encoder/VideoEncoder.h"
 #include "util/Log.h"
+#include "video/ColorConverter.h"
 
 namespace {
 
@@ -37,6 +39,8 @@ struct Opcoes {
                                         "discorddevelopment"};
     bool semAudio = false;
     bool semVideo = false;
+    std::string gravar;   // caminho do .h264 a escrever
+    uint32_t bitrate = 4500;  // kbps
 };
 
 std::vector<std::string> separarPorVirgula(const std::string& texto) {
@@ -72,6 +76,10 @@ Opcoes lerOpcoes(int argc, char** argv) {
             o.segundos = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--excluir" && temProximo) {
             o.excluir = separarPorVirgula(argv[++i]);
+        } else if (arg == "--gravar" && temProximo) {
+            o.gravar = argv[++i];
+        } else if (arg == "--bitrate" && temProximo) {
+            o.bitrate = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "-h" || arg == "--help") {
             std::puts(
                 "greenlabs-probe\n"
@@ -81,7 +89,9 @@ Opcoes lerOpcoes(int argc, char** argv) {
                 "  --excluir a,b,c       nomes a deixar fora do audio\n"
                 "                        (padrao: discord e variantes)\n"
                 "  --sem-audio           mede so o video\n"
-                "  --sem-video           mede so o audio");
+                "  --sem-video           mede so o audio\n"
+                "  --gravar saida.h264   codifica em H.264 e grava o fluxo\n"
+                "  --bitrate N           kbps do encoder (padrao: 4500)");
             std::exit(0);
         }
     }
@@ -204,6 +214,40 @@ int main(int argc, char** argv) {
         latencias.reserve(static_cast<size_t>(opcoes.segundos) * 200);
     }
 
+    // --------------------------------------------------------------- encoder
+    gl::ColorConverter conversor;
+    gl::VideoEncoder encoder;
+    FILE* arquivo = nullptr;
+    std::vector<int64_t> latenciasEncode;
+    uint64_t quadrosChave = 0;
+    bool codificando = false;
+
+    if (!opcoes.gravar.empty() && !opcoes.semVideo) {
+        const auto& m = tela.monitor();
+        if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), m.largura, m.altura,
+                               m.largura, m.altura)) {
+            gl::erro("conversor de cor nao iniciou");
+        } else {
+            gl::ConfigEncoder cfg;
+            cfg.largura = conversor.largura();
+            cfg.altura = conversor.altura();
+            cfg.fps = 60;
+            cfg.bitrate = opcoes.bitrate * 1000;
+
+            arquivo = std::fopen(opcoes.gravar.c_str(), "wb");
+            if (!arquivo) {
+                gl::erro("nao foi possivel criar {}", opcoes.gravar);
+            } else if (encoder.iniciar(tela.dispositivo(), cfg,
+                                       [&](const gl::PacoteCodificado& pacote) {
+                                           std::fwrite(pacote.dados, 1, pacote.tamanho, arquivo);
+                                           if (pacote.chave) ++quadrosChave;
+                                       })) {
+                codificando = true;
+                encoder.pedirQuadroChave();
+            }
+        }
+    }
+
     gl::info("medindo por {} segundos...", opcoes.segundos);
     const auto inicio = std::chrono::steady_clock::now();
     const auto fim = inicio + std::chrono::seconds(opcoes.segundos);
@@ -220,7 +264,20 @@ int main(int argc, char** argv) {
                 ++quadrosVideo;
                 acumuladosTotal += quadro.quadrosAcumulados;
                 latencias.push_back(quadro.latenciaUs);
-                // Aqui é onde o encoder receberia quadro.textura, ainda na GPU.
+
+                if (codificando) {
+                    const auto antes = std::chrono::steady_clock::now();
+                    // A textura nunca sai da GPU: duplicação -> conversão de cor
+                    // -> encoder, tudo no mesmo dispositivo D3D11.
+                    if (auto* nv12 = conversor.converter(quadro.textura)) {
+                        encoder.codificar(nv12, std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    antes - inicio).count());
+                    }
+                    latenciasEncode.push_back(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - antes).count());
+                }
+
                 tela.liberarQuadro();
                 break;
             case gl::ResultadoQuadro::SemMudanca:
@@ -241,6 +298,8 @@ int main(int argc, char** argv) {
         std::chrono::duration<double>(std::chrono::steady_clock::now() - inicio).count();
 
     audio.parar();
+    if (codificando) encoder.parar();
+    if (arquivo) std::fclose(arquivo);
     consumindo.store(false);
     if (consumidor.joinable()) consumidor.join();
 
@@ -272,6 +331,28 @@ int main(int argc, char** argv) {
                 soma / static_cast<double>(latencias.size()) / 1000.0,
                 percentil(latencias, 0.50) / 1000.0, percentil(latencias, 0.95) / 1000.0,
                 percentil(latencias, 1.00) / 1000.0);
+        }
+        if (codificando) {
+            const double segundos = decorrido > 0 ? decorrido : 1.0;
+            std::puts("");
+            std::printf("  encoder            : %s (%s)\n", encoder.nomeDoEncoder(),
+                        encoder.porHardware() ? "hardware" : "software");
+            std::printf("  quadros codificados: %llu  (%llu chave)\n",
+                        (unsigned long long)encoder.quadrosCodificados(),
+                        (unsigned long long)quadrosChave);
+            std::printf("  bitrate real       : %.0f kbps  (alvo %u kbps)\n",
+                        encoder.bytesGerados() * 8.0 / segundos / 1000.0, opcoes.bitrate);
+            std::printf("  arquivo            : %s  (%.1f MB)\n", opcoes.gravar.c_str(),
+                        encoder.bytesGerados() / 1024.0 / 1024.0);
+            if (!latenciasEncode.empty()) {
+                int64_t soma = 0;
+                for (int64_t v : latenciasEncode) soma += v;
+                std::printf("  latencia de encode : media %.2f ms | p95 %.2f ms | max %.2f ms\n",
+                            soma / static_cast<double>(latenciasEncode.size()) / 1000.0,
+                            percentil(latenciasEncode, 0.95) / 1000.0,
+                            percentil(latenciasEncode, 1.00) / 1000.0);
+            }
+            std::puts("");
         }
         std::puts("  borda amarela      : nao (a duplicacao nao desenha nada na tela)");
         std::puts("  cursor             : nao vem no quadro (composicao ainda nao implementada)");

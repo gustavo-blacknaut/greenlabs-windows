@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.25)
 
 project(GreenLabs
     VERSION 0.0.1
@@ -23,6 +23,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_compile_definitions(
     UNICODE
     _UNICODE
+    _CRT_SECURE_NO_WARNINGS  # fopen: a alternativa segura nao e portavel
     NOMINMAX                 # senao windows.h define min/max como macro
     WIN32_LEAN_AND_MEAN
 )
@@ -42,6 +43,8 @@ add_library(greenlabs_core STATIC
     src/capture/ProcessTree.cpp
     src/capture/AudioCapture.cpp
     src/capture/ScreenCapture.cpp
+    src/video/ColorConverter.cpp
+    src/encoder/VideoEncoder.cpp
 )
 
 target_include_directories(greenlabs_core PUBLIC src)
@@ -54,6 +57,9 @@ target_link_libraries(greenlabs_core PUBLIC
     avrt         # MMCSS, prioridade de tempo real na thread de audio
     ole32        # COM
     runtimeobject # WRL: FtmBase do handler de ativacao
+    mfplat       # Media Foundation: encoder H.264 por hardware
+    mfuuid       # GUIDs de midia
+    strmiids     # GUIDs do ICodecAPI
 )
 
 # ---------------------------------------------------------------- probe

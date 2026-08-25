@@ -137,7 +137,8 @@ bool ScreenCapture::iniciar(uint32_t indiceMonitor) {
 
     HRESULT resultado = ::D3D11CreateDevice(
         d_->adaptador.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, niveis, ARRAYSIZE(niveis), D3D11_SDK_VERSION,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, niveis,
+        ARRAYSIZE(niveis), D3D11_SDK_VERSION,
         &d_->dispositivo, &nivelObtido, &d_->contexto);
     if (FAILED(resultado)) {
         erro("D3D11CreateDevice falhou: {}", hr(resultado));
