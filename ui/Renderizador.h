@@ -54,9 +54,19 @@ public:
 
     // Desenha uma textura de vídeo encaixada na área, mantendo a proporção.
     // A textura precisa ser do mesmo dispositivo D3D11.
+    //
+    // Passar nullptr redesenha o último quadro recebido. A duplicação de área de
+    // trabalho só entrega quadro quando a tela muda, então na maior parte dos
+    // instantes não há nada novo — e apagar a imagem nesses instantes fazia a
+    // prévia piscar sem parar.
     void video(ID3D11Texture2D* textura, const D2D1_RECT_F& area);
 
+    // Houve algum quadro desde que a captura começou.
+    bool temQuadro() const;
+
 private:
+    void desenharUltimo(const D2D1_RECT_F& area);
+
     struct Interno;
     std::unique_ptr<Interno> d_;
 };

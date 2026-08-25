@@ -277,8 +277,14 @@ float Renderizador::larguraDoTexto(const std::wstring& conteudo, Fonte fonte) {
     return medidas.widthIncludingTrailingWhitespace;
 }
 
+bool Renderizador::temQuadro() const { return d_->bitmapVideo != nullptr; }
+
 void Renderizador::video(ID3D11Texture2D* textura, const D2D1_RECT_F& area) {
-    if (!textura) return;
+    // Sem textura nova: repinta a última. Ver o comentário no cabeçalho.
+    if (!textura) {
+        if (d_->bitmapVideo) desenharUltimo(area);
+        return;
+    }
 
     D3D11_TEXTURE2D_DESC descricao{};
     textura->GetDesc(&descricao);
@@ -317,6 +323,11 @@ void Renderizador::video(ID3D11Texture2D* textura, const D2D1_RECT_F& area) {
     }
 
     d_->contexto->CopyResource(d_->copiaVideo.Get(), textura);
+    desenharUltimo(area);
+}
+
+void Renderizador::desenharUltimo(const D2D1_RECT_F& area) {
+    if (!d_->bitmapVideo || d_->larguraVideo == 0 || d_->alturaVideo == 0) return;
 
     // Encaixa mantendo a proporção: esticar a tela de alguém é feio e engana
     // sobre o que está sendo transmitido.
@@ -324,7 +335,8 @@ void Renderizador::video(ID3D11Texture2D* textura, const D2D1_RECT_F& area) {
     const float alturaArea = area.bottom - area.top;
     if (larguraArea <= 0 || alturaArea <= 0) return;
 
-    const float proporcao = static_cast<float>(descricao.Width) / static_cast<float>(descricao.Height);
+    const float proporcao =
+        static_cast<float>(d_->larguraVideo) / static_cast<float>(d_->alturaVideo);
     float largura = larguraArea;
     float altura = largura / proporcao;
     if (altura > alturaArea) {

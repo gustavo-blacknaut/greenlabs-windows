@@ -58,6 +58,24 @@ bool dentro(const D2D1_RECT_F& area, float x, float y) {
 
 enum class Tela { Entrada, AoVivo };
 
+// Taxa e resolução são fixas de propósito. Deixar o encoder seguir a taxa de
+// entrega da duplicação — que varia com o quanto a tela muda — faz o bitrate
+// oscilar e o outro lado ver a imagem acelerar e travar. Fixando, cada quadro
+// tem o mesmo peso e o controle de bitrate tem um alvo estável.
+struct Qualidade {
+    const wchar_t* rotulo;
+    uint32_t largura;
+    uint32_t altura;
+    uint32_t fps;
+    uint32_t bitrate;
+};
+
+constexpr Qualidade kQualidades[] = {
+    {L"720p  30fps",  1280,  720, 30, 2'200'000},
+    {L"1080p 30fps", 1920, 1080, 30, 4'500'000},
+    {L"1080p 60fps", 1920, 1080, 60, 7'500'000},
+};
+
 // Campo de texto: guarda o conteúdo e se está com o foco. O desenho fica na
 // Aplicacao, que é quem conhece o layout.
 struct Campo {
@@ -81,12 +99,13 @@ struct Aplicacao::Interno {
 
     Tela telaAtual = Tela::Entrada;
 
-    Campo campoNome{L"", L"como os outros vao te ver"};
+    Campo campoNome{L"", L"como os outros vão te ver"};
     Campo campoServidor{L"", L"exemplo.com:25640"};
     Campo campoSala{L"call1", L"call1"};
 
     std::vector<MonitorInfo> monitores;
     int monitorEscolhido = 0;
+    int qualidadeEscolhida = 1;  // 1080p 30fps
     bool transmitindo = false;
     std::wstring aviso;
 
@@ -108,10 +127,12 @@ struct Aplicacao::Interno {
     D2D1_RECT_F btMinimizar{}, btMaximizar{}, btFechar{};
     D2D1_RECT_F btEntrar{}, btTransmitir{}, btSair{};
     std::vector<D2D1_RECT_F> btMonitores;
+    std::vector<D2D1_RECT_F> btQualidades;
 
     double fps = 0;
     int64_t quadrosNoSegundo = 0;
     std::chrono::steady_clock::time_point marcaFps = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point ultimoEncode = std::chrono::steady_clock::now();
 
     void desenhar();
     void desenharBarraTitulo();
@@ -119,6 +140,7 @@ struct Aplicacao::Interno {
     void desenharAoVivo();
     void clique(float x, float y);
     void tecla(wchar_t c);
+    void colar();
     void bombearCaptura();
     bool comecarTransmissao();
     void pararTransmissao();
@@ -256,7 +278,7 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     };
     ouvintes.aoCair = [this](const std::string& motivo) {
         d_->conectado.store(false);
-        d_->aviso = L"A conexao caiu: " + paraW(motivo);
+        d_->aviso = L"A conexão caiu: " + paraW(motivo);
         d_->telaAtual = Tela::Entrada;
     };
     d_->sinal.definirOuvintes(std::move(ouvintes));
@@ -308,10 +330,19 @@ void Aplicacao::Interno::bombearCaptura() {
             quadrosNoSegundo += 1;
 
             if (transmitindo) {
-                if (auto* nv12 = conversor.converter(quadro.textura)) {
-                    const auto agora = std::chrono::steady_clock::now().time_since_epoch();
-                    encoder.codificar(
-                        nv12, std::chrono::duration_cast<std::chrono::microseconds>(agora).count());
+                // Taxa fixa: a duplicação entrega quadro sempre que a tela muda,
+                // o que num jogo passa fácil de 100 por segundo. Codificar todos
+                // gastaria GPU e banda para nada — o alvo é o fps escolhido, e o
+                // que passar disso é descartado aqui, antes de custar encode.
+                const auto agora = std::chrono::steady_clock::now();
+                const auto intervalo =
+                    std::chrono::microseconds(1'000'000 / kQualidades[qualidadeEscolhida].fps);
+                if (agora - ultimoEncode >= intervalo) {
+                    ultimoEncode = agora;
+                    if (auto* nv12 = conversor.converter(quadro.textura)) {
+                        encoder.codificar(nv12, std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    agora.time_since_epoch()).count());
+                    }
                 }
             }
             break;
@@ -334,23 +365,28 @@ void Aplicacao::Interno::bombearCaptura() {
 
 bool Aplicacao::Interno::comecarTransmissao() {
     const auto& m = tela.monitor();
-    if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), m.largura, m.altura, m.largura,
-                           m.altura)) {
-        aviso = L"Nao foi possivel preparar a conversao de cor.";
+    const Qualidade& q = kQualidades[qualidadeEscolhida];
+
+    // O Video Processor redimensiona de graça no mesmo passo da conversão de
+    // cor, então a tela vai para o encoder já no tamanho escolhido: menos
+    // pixels para codificar e menos banda, sem custo extra de CPU.
+    if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), m.largura, m.altura, q.largura,
+                           q.altura)) {
+        aviso = L"Não foi possível preparar a conversão de cor.";
         return false;
     }
 
     ConfigEncoder cfg;
     cfg.largura = conversor.largura();
     cfg.altura = conversor.altura();
-    cfg.fps = 60;
-    cfg.bitrate = 4'500'000;
+    cfg.fps = q.fps;
+    cfg.bitrate = q.bitrate;
 
     if (!encoder.iniciar(tela.dispositivo(), cfg,
                          [this](const PacoteCodificado& pacote) {
                              enviarQuadroParaTodos(pacote);
                          })) {
-        aviso = L"Nao foi possivel iniciar o encoder H.264.";
+        aviso = L"Não foi possível iniciar o encoder H.264.";
         return false;
     }
     encoder.pedirQuadroChave();
@@ -390,12 +426,12 @@ void Aplicacao::Interno::pararTransmissao() {
 void Aplicacao::Interno::conectar() {
     const std::string servidor = paraUtf8(campoServidor.valor);
     if (servidor.empty()) {
-        aviso = L"Informe o endereco do servidor.";
+        aviso = L"Informe o endereço do servidor.";
         return;
     }
     aviso = L"Conectando...";
     if (!sinal.entrar(servidor, paraUtf8(campoSala.valor), paraUtf8(campoNome.valor))) {
-        aviso = L"Nao foi possivel conectar. Confira o endereco e se o servidor esta no ar.";
+        aviso = L"Não foi possível conectar. Confira o endereço e se o servidor está no ar.";
         return;
     }
     aviso.clear();
@@ -410,12 +446,12 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
         if (achou != conexoes.end()) return achou->second;
     }
 
-    const auto& m = tela.monitor();
+    const Qualidade& q = kQualidades[qualidadeEscolhida];
     ConfigMidia cfg;
-    cfg.largura = m.largura;
-    cfg.altura = m.altura;
-    cfg.fps = 60;
-    cfg.bitrate = 4'500'000;
+    cfg.largura = q.largura;
+    cfg.altura = q.altura;
+    cfg.fps = q.fps;
+    cfg.bitrate = q.bitrate;
 
     auto conexao = std::make_shared<ConexaoPar>(peerId, cfg);
 
@@ -499,7 +535,31 @@ Campo* Aplicacao::Interno::campoFocado() {
     return nullptr;
 }
 
+// Ctrl+V. O WM_CHAR entrega 0x16 para essa combinação, e sem tratar isso
+// simplesmente não dava para colar o endereço do servidor - que é justamente o
+// texto que ninguém quer digitar na mão.
+void Aplicacao::Interno::colar() {
+    Campo* campo = campoFocado();
+    if (!campo || !::OpenClipboard(janela)) return;
+
+    if (HANDLE dados = ::GetClipboardData(CF_UNICODETEXT)) {
+        if (auto* texto = static_cast<const wchar_t*>(::GlobalLock(dados))) {
+            for (const wchar_t* p = texto; *p && campo->valor.size() < 200; ++p) {
+                // Endereço copiado de um chat costuma vir com quebra de linha
+                // grudada; deixá-la entrar quebraria a conexão sem explicação.
+                if (*p >= 32) campo->valor.push_back(*p);
+            }
+            ::GlobalUnlock(dados);
+        }
+    }
+    ::CloseClipboard();
+}
+
 void Aplicacao::Interno::tecla(wchar_t c) {
+    if (c == 0x16) {  // Ctrl+V
+        colar();
+        return;
+    }
     Campo* campo = campoFocado();
     if (!campo) return;
     if (c == L'\b') {
@@ -545,6 +605,22 @@ void Aplicacao::Interno::clique(float x, float y) {
                 // O renderizador vive no dispositivo D3D11 da captura, e trocar
                 // de monitor pode trocar de placa.
                 render.iniciar(janela, tela.dispositivo());
+            }
+            return;
+        }
+    }
+
+    for (size_t i = 0; i < btQualidades.size(); ++i) {
+        if (dentro(btQualidades[i], x, y)) {
+            const int novo = static_cast<int>(i);
+            if (novo != qualidadeEscolhida) {
+                const bool estava = transmitindo;
+                pararTransmissao();
+                qualidadeEscolhida = novo;
+                // Trocar de qualidade refaz encoder e conversor, então a
+                // transmissão precisa recomeçar - e recomeça sozinha para a
+                // pessoa não achar que caiu.
+                if (estava) comecarTransmissao();
             }
             return;
         }
@@ -670,11 +746,13 @@ void Aplicacao::Interno::desenharAoVivo() {
                                    alt - tema::kEspaco - 64);
     render.retangulo(palco, tema::kPainel, tema::kRaioCartao);
 
-    if (quadroAtual) {
-        render.video(quadroAtual, D2D1::RectF(palco.left + 6, palco.top + 6, palco.right - 6,
-                                              palco.bottom - 6));
-    } else {
-        render.texto(L"Aguardando a tela mudar…", palco, tema::kApagado, Fonte::Subtitulo,
+    // Passar quadroAtual mesmo nulo é de propósito: sem quadro novo o
+    // renderizador repinta o último. Antes a prévia apagava a cada instante em
+    // que a tela não mudava, e o resultado era piscar sem parar.
+    render.video(quadroAtual, D2D1::RectF(palco.left + 6, palco.top + 6, palco.right - 6,
+                                          palco.bottom - 6));
+    if (!render.temQuadro()) {
+        render.texto(L"Aguardando o primeiro quadro…", palco, tema::kApagado, Fonte::Subtitulo,
                      DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     render.contorno(palco, tema::kLinha, tema::kRaioCartao);
@@ -726,7 +804,29 @@ void Aplicacao::Interno::desenharAoVivo() {
         linhaY += 48;
     }
 
-    linhaY += 10;
+    linhaY += 4;
+    render.texto(L"QUALIDADE", D2D1::RectF(painel.left + 20, linhaY, painel.right - 20, linhaY + 18),
+                 tema::kApagado, Fonte::Pequena);
+    linhaY += 26;
+
+    btQualidades.clear();
+    for (size_t i = 0; i < std::size(kQualidades); ++i) {
+        const auto area = D2D1::RectF(painel.left + 20, linhaY, painel.right - 20, linhaY + 36);
+        btQualidades.push_back(area);
+
+        const bool ativo = static_cast<int>(i) == qualidadeEscolhida;
+        render.retangulo(area, ativo ? tema::kVerdeSuave : tema::kPainel2, tema::kRaioBotao);
+        render.contorno(area, ativo ? tema::kVerdeLinha : tema::kLinha, tema::kRaioBotao);
+        render.texto(kQualidades[i].rotulo,
+                     D2D1::RectF(area.left + 14, area.top, area.right - 60, area.bottom),
+                     ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+        render.texto(std::to_wstring(kQualidades[i].bitrate / 1000) + L" kbps",
+                     D2D1::RectF(area.left, area.top, area.right - 14, area.bottom),
+                     tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        linhaY += 42;
+    }
+
+    linhaY += 6;
     render.linha(painel.left + 20, linhaY, painel.right - 20, linhaY, tema::kLinha);
     linhaY += 20;
 
@@ -744,7 +844,7 @@ void Aplicacao::Interno::desenharAoVivo() {
     linhaY += 28;
 
     const std::wstring meuNome =
-        campoNome.valor.empty() ? L"Voce" : campoNome.valor + L"  (voce)";
+        campoNome.valor.empty() ? L"Você" : campoNome.valor + L"  (você)";
     render.texto(meuNome, D2D1::RectF(painel.left + 20, linhaY, painel.right - 80, linhaY + 22),
                  tema::kVerde, Fonte::Corpo);
     render.texto(std::to_wstring(sinal.pingMs()) + L" ms",
