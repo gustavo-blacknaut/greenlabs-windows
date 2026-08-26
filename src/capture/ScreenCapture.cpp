@@ -6,6 +6,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <chrono>
 #include <cstring>
 
 #include "util/Log.h"
@@ -14,6 +15,11 @@ using Microsoft::WRL::ComPtr;
 
 namespace gl {
 namespace {
+
+// Meio segundo entre tentativas de reabrir a duplicação. Curto o bastante para
+// a captura voltar sozinha assim que o UAC ou o jogo em tela cheia saírem da
+// frente, e longo o bastante para uma recusa permanente não virar um laço.
+constexpr int kIntervaloEntreTentativasMs = 500;
 
 std::string paraUtf8(const wchar_t* bruto) {
     if (!bruto || !*bruto) return {};
@@ -78,6 +84,10 @@ struct ScreenCapture::Interno {
     int32_t cursorY = 0;
     FormaCursor forma;
     std::vector<uint8_t> bufferForma;
+
+    // Quando a duplicacao esta negada de verdade, o laco pede reinicio a cada
+    // quadro. Sem intervalo minimo isso vira dezenas de tentativas por segundo.
+    std::chrono::steady_clock::time_point ultimaTentativa{};
 
     void lerFormaDoCursor(const DXGI_OUTDUPL_FRAME_INFO& informacao);
 
@@ -158,7 +168,12 @@ bool ScreenCapture::iniciar(uint32_t indiceMonitor) {
         return false;
     }
 
-    if (!d_->criarDuplicacao()) return false;
+    // Duplicacao que nao abre agora nao impede o aplicativo de rodar: da para
+    // entrar na sala, assistir e usar a camera sem ela. proximoQuadro() devolve
+    // PrecisaReiniciar enquanto faltar, e o laco tenta de novo.
+    if (!d_->criarDuplicacao()) {
+        aviso("captura de tela indisponivel por enquanto; o resto do aplicativo funciona");
+    }
 
     info("tela: monitor {} ({}) {}x{}", d_->info.indice, d_->info.nome, d_->info.largura,
          d_->info.altura);
@@ -183,7 +198,18 @@ bool ScreenCapture::Interno::criarDuplicacao() {
     return true;
 }
 
+bool ScreenCapture::capturando() const { return d_->duplicacao != nullptr; }
+
 bool ScreenCapture::reiniciar() {
+    using namespace std::chrono;
+
+    const auto agora = steady_clock::now();
+    if (d_->duplicacao == nullptr &&
+        agora - d_->ultimaTentativa < milliseconds(kIntervaloEntreTentativasMs)) {
+        return false;
+    }
+    d_->ultimaTentativa = agora;
+
     liberarQuadro();
     return d_->criarDuplicacao();
 }

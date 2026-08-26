@@ -77,10 +77,25 @@ public:
     // Lista os monitores disponíveis, sem precisar iniciar a captura.
     static std::vector<MonitorInfo> listarMonitores();
 
+    // Prepara o dispositivo D3D11 do adaptador do monitor e tenta abrir a
+    // duplicação.
+    //
+    // Só falha quando o dispositivo não pôde ser criado. A duplicação em si
+    // pode não abrir agora — durante o UAC, na tela de bloqueio, com jogo em
+    // tela cheia exclusiva — e isso não é motivo para o aplicativo desistir:
+    // dá para entrar na sala, assistir e usar a câmera sem ela. Quando faltar,
+    // proximoQuadro() devolve PrecisaReiniciar e ela é aberta depois.
     bool iniciar(uint32_t indiceMonitor);
     void parar();
 
+    // Verdadeiro quando a duplicação está aberta e dá para capturar agora.
+    bool capturando() const;
+
     // Recria a duplicação depois de ResultadoQuadro::PrecisaReiniciar.
+    //
+    // Tem intervalo mínimo entre tentativas: quando a duplicação está negada de
+    // verdade, o laço pediria reinício a cada quadro e viraria uma tentativa a
+    // cada poucos milissegundos, enchendo o log e queimando CPU à toa.
     bool reiniciar();
 
     // Bloqueia até haver quadro novo ou estourar o prazo. Cada Ok precisa de um
