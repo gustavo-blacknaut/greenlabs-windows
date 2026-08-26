@@ -398,7 +398,7 @@ reais de defeitos já corrigidos que a tradução pode reintroduzir:
 ## 5. Arquivos que serão criados
 
 ```
-greenlabs-live-streaming-cpp/
+greenlabs-windows/
 ├── CMakeLists.txt
 ├── CMakePresets.json
 ├── vcpkg.json
