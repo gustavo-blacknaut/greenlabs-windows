@@ -76,10 +76,35 @@ struct Renderizador::Interno {
 Renderizador::Renderizador() : d_(std::make_unique<Interno>()) {}
 Renderizador::~Renderizador() = default;
 
+ID3D11Device* Renderizador::dispositivo() const { return d_->dispositivo.Get(); }
+
+void Renderizador::liberar() {
+    // A ordem importa: primeiro o que segura o buffer de fundo, depois a
+    // cadeia. Soltar fora de ordem deixa referência pendurada e a próxima
+    // criação falha.
+    if (d_->contexto2d) d_->contexto2d->SetTarget(nullptr);
+    d_->bitmapVideo.Reset();
+    d_->copiaVideo.Reset();
+    d_->bitmapLogo.Reset();
+    d_->tentouLogo = false;
+    d_->formatos.clear();
+    d_->pincel.Reset();
+    d_->alvo.Reset();
+    d_->contexto2d.Reset();
+    d_->dispositivo2d.Reset();
+    d_->fabrica2d.Reset();
+    d_->cadeia.Reset();
+    d_->contexto.Reset();
+    d_->dispositivo.Reset();
+    d_->larguraVideo = 0;
+    d_->alturaVideo = 0;
+}
+
 float Renderizador::largura() const { return static_cast<float>(d_->largura); }
 float Renderizador::altura() const { return static_cast<float>(d_->altura); }
 
 bool Renderizador::iniciar(HWND janela, ID3D11Device* dispositivo) {
+    liberar();
     d_->janela = janela;
     d_->dispositivo = dispositivo;
     dispositivo->GetImmediateContext(&d_->contexto);

@@ -33,6 +33,17 @@ public:
     Renderizador& operator=(const Renderizador&) = delete;
 
     bool iniciar(HWND janela, ID3D11Device* dispositivo);
+
+    // Solta tudo que depende do dispositivo D3D11 e da janela.
+    //
+    // Precisa ser chamado ANTES de destruir o dispositivo da captura: o DXGI
+    // permite uma cadeia de troca por janela, e recriar sem soltar a anterior
+    // falha em silêncio. Pior, a cadeia continuaria apontando para um
+    // dispositivo que já morreu.
+    void liberar();
+
+    // Qual dispositivo está em uso, para quem chama saber se precisa recriar.
+    ID3D11Device* dispositivo() const;
     void redimensionar(uint32_t largura, uint32_t altura);
 
     void comecarQuadro();
