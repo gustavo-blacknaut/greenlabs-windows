@@ -95,6 +95,9 @@ struct Campo {
 }  // namespace
 
 struct Aplicacao::Interno {
+    // Texto mostrado quando iniciar() nao chega ao fim.
+    std::wstring motivoFalha;
+
     HWND janela = nullptr;
     Renderizador render;
 
@@ -221,6 +224,8 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
 
 }  // namespace
 
+const std::wstring& Aplicacao::motivoDaFalha() const { return d_->motivoFalha; }
+
 bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
                         const Inicial& inicial) {
     ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -247,6 +252,7 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
                                    classe.hInstance, nullptr);
     if (!d_->janela) {
         erro("nao foi possivel criar a janela");
+        d_->motivoFalha = L"Nao foi possivel criar a janela do aplicativo.";
         return false;
     }
     ::SetWindowLongPtrW(d_->janela, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(d_.get()));
@@ -263,10 +269,28 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     d_->monitores = ScreenCapture::listarMonitores();
     if (d_->monitores.empty()) {
         erro("nenhum monitor encontrado");
+        d_->motivoFalha =
+            L"Nenhum monitor ligado a placa de video foi encontrado.\n\n"
+            L"Isso costuma acontecer com acesso remoto ou com a tela desconectada.";
         return false;
     }
-    if (!d_->tela.iniciar(0)) return false;
-    if (!d_->render.iniciar(d_->janela, d_->tela.dispositivo())) return false;
+
+    // Falha aqui e do dispositivo D3D11, nao da duplicacao: a captura em si
+    // pode nao estar disponivel agora e o aplicativo continua funcionando.
+    if (!d_->tela.iniciar(0)) {
+        d_->motivoFalha =
+            L"Nao foi possivel preparar o Direct3D 11 no monitor principal.";
+        return false;
+    }
+    if (!d_->render.iniciar(d_->janela, d_->tela.dispositivo())) {
+        d_->motivoFalha =
+            L"Nao foi possivel iniciar o desenho da interface (Direct2D).";
+        return false;
+    }
+
+    if (!d_->tela.capturando()) {
+        aviso("comecando sem captura de tela; sera aberta quando der");
+    }
 
     Signaling::Ouvintes ouvintes;
     ouvintes.aoEntrar = [this](const std::string& eu, const std::vector<Participante>& pares) {

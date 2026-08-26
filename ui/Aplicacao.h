@@ -31,6 +31,13 @@ public:
     bool iniciar(const std::wstring& titulo, int largura, int altura, const Inicial& inicial = {});
     int rodar();
 
+    // O que impediu iniciar() de terminar, em texto para mostrar ao usuário.
+    //
+    // Existe porque um bool só faz toda falha virar a mesma mensagem, e a
+    // mensagem acaba chutando a causa. Quem lê precisa saber se foi a janela,
+    // o monitor ou a placa — chutar manda a pessoa investigar o lugar errado.
+    const std::wstring& motivoDaFalha() const;
+
     // Publico so para o procedimento de janela do Win32 alcancar: ele e uma
     // funcao livre, exigencia da API, e precisa chegar ao estado.
     struct Interno;
