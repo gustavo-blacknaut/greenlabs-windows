@@ -1,6 +1,6 @@
 # GreenLabs — cliente nativo em C++
 
-Migração do cliente [GreenLabs Live Streaming](https://github.com/gustavo-blacknaut/greenlabs-live-streaming)
+Migração do cliente [GreenLabs Live Streaming](https://github.com/gustavo-blacknaut/greenlabs-desktop)
 de Electron para C++ nativo. Sem Electron, sem Chromium, sem Node.
 
 **Estado: etapa 1 de 7.** O núcleo de captura está pronto e medido. Ainda não
