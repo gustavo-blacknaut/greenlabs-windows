@@ -231,7 +231,9 @@ void ConexaoPar::Interno::montarEmpacotador(std::shared_ptr<rtc::Track> faixa) {
     // descartados antes de virar vídeo. Declarar o SSRC é o que amarra os dois.
     try {
         auto descricao = faixa->description();
-        descricao.addSSRC(ssrc, "greenlabs-tela");
+        // msid pelo mesmo motivo do outro caminho: sem ele o Chromium nao
+        // associa a faixa a nenhuma MediaStream.
+        descricao.addSSRC(ssrc, "greenlabs-tela", "greenlabs", "tela");
         faixa->setDescription(std::move(descricao));
     } catch (const std::exception& e) {
         erro("nao foi possivel declarar o SSRC: {}", e.what());
@@ -268,7 +270,11 @@ bool ConexaoPar::prepararFaixa() {
     try {
         rtc::Description::Video video("video", rtc::Description::Direction::SendOnly);
         video.addH264Codec(kPayloadH264);
-        video.addSSRC(42, "greenlabs-tela");
+        // O msid e o que faz o Chromium associar a faixa a uma MediaStream.
+        // Sem ele, event.streams chega vazio do outro lado - e os clientes de
+        // Electron e Android descartam faixa sem stream, entao o video nunca
+        // aparecia para eles mesmo com tudo conectado e enviando.
+        video.addSSRC(42, "greenlabs-tela", "greenlabs", "tela");
         d_->montarEmpacotador(d_->conexao->addTrack(video));
         return true;
     } catch (const std::exception& e) {
