@@ -34,6 +34,10 @@ using Microsoft::WRL::ComPtr;
 namespace gl {
 namespace {
 
+// O identificador que o servidor usa quando esta retransmitindo o video.
+// Ele participa da sala, mas nao e uma pessoa.
+constexpr const char* kIdDoSFU = "sfu";
+
 const wchar_t* kClasse = L"GreenLabsJanela";
 
 std::wstring paraW(const std::string& texto) {
@@ -594,7 +598,12 @@ void Aplicacao::Interno::tratarRepasse(const std::string& de, const Json& msg) {
     // libdatachannel não desfaz uma descrição local, ceder significa recriar a
     // conexão do zero — e é o que acontece aqui.
     if (conexao && tipo == "offer" && conexao->ofertaPendente()) {
-        if (de < meuId) {
+        // Contra o servidor não há desempate: ele é quem renegocia para a sala
+        // inteira, e uma oferta nossa que vença a dele deixa a mídia sem sair
+        // do lugar. O desempate por id ainda por cima favorecia o lado errado
+        // - "sfu" é maior que qualquer UUID em ordem de texto, então nós
+        // sempre mantínhamos a nossa e ignorávamos a dele.
+        if (de == kIdDoSFU || de < meuId) {
             gl::aviso("colisao de ofertas com {}: cedendo", de.substr(0, 8));
             {
                 std::lock_guard trava(travaConexoes);
