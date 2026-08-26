@@ -112,6 +112,9 @@ struct Aplicacao::Interno {
     Campo campoServidor{L"", L"exemplo.com:25640"};
     Campo campoSala{L"call1", L"call1"};
 
+    Config config;
+    std::vector<D2D1_RECT_F> btServidores;
+
     std::vector<MonitorInfo> monitores;
     int monitorEscolhido = 0;
     int qualidadeEscolhida = 1;  // 1080p 30fps
@@ -227,6 +230,11 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     classe.lpfnWndProc = procedimento;
     classe.hInstance = ::GetModuleHandleW(nullptr);
     classe.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+    // O ícone do recurso vira o do arquivo sozinho, mas o da JANELA (barra de
+    // tarefas e Alt+Tab) precisa ser dito à classe. Sem isto o Windows põe o
+    // ícone genérico de aplicativo.
+    classe.hIcon = ::LoadIconW(classe.hInstance, MAKEINTRESOURCEW(1));
+    classe.hIconSm = classe.hIcon;
     classe.lpszClassName = kClasse;
     // Sem pincel de fundo: quem pinta é o Direct2D, e deixar o Windows apagar
     // antes causa piscada a cada redimensionamento.
@@ -242,6 +250,15 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
         return false;
     }
     ::SetWindowLongPtrW(d_->janela, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(d_.get()));
+
+    // Preferências guardadas: ninguém quer digitar o endereço do servidor
+    // toda vez que abre o aplicativo.
+    d_->config = Config::carregar();
+    d_->campoNome.valor = paraW(d_->config.nome);
+    d_->campoSala.valor = paraW(d_->config.sala);
+    d_->campoServidor.valor = paraW(d_->config.servidor);
+    d_->qualidadeEscolhida =
+        (d_->config.qualidade >= 0 && d_->config.qualidade < 3) ? d_->config.qualidade : 1;
 
     d_->monitores = ScreenCapture::listarMonitores();
     if (d_->monitores.empty()) {
@@ -461,6 +478,15 @@ void Aplicacao::Interno::conectar() {
         return;
     }
     aviso = L"Conectando...";
+
+    config.servidor = servidor;
+    config.sala = paraUtf8(campoSala.valor);
+    config.nome = paraUtf8(campoNome.valor);
+    config.qualidade = qualidadeEscolhida;
+    config.monitor = monitorEscolhido;
+    config.lembrarServidor(servidor);
+    config.salvar();
+
     if (!sinal.entrar(servidor, paraUtf8(campoSala.valor), paraUtf8(campoNome.valor))) {
         aviso = L"Não foi possível conectar. Confira o endereço e se o servidor está no ar.";
         return;
@@ -682,6 +708,13 @@ void Aplicacao::Interno::clique(float x, float y) {
             campo->focado = dentro(campo->area, x, y);
             if (!campo->focado) campo->tudoSelecionado = false;
         }
+        for (size_t i = 0; i < btServidores.size() && i < config.servidores.size(); ++i) {
+            if (dentro(btServidores[i], x, y)) {
+                campoServidor.valor = paraW(config.servidores[i]);
+                campoServidor.tudoSelecionado = false;
+                return;
+            }
+        }
         if (dentro(btEntrar, x, y)) conectar();
         return;
     }
@@ -843,6 +876,29 @@ void Aplicacao::Interno::desenharEntrada() {
 
     btEntrar = D2D1::RectF(x + 36, y + 380, x + 36 + larguraCampo, y + 428);
     desenharBotao(btEntrar, L"ENTRAR NA SALA", true);
+
+    // Servidores já usados, como atalho. Clicar preenche o campo.
+    btServidores.clear();
+    if (!config.servidores.empty()) {
+        float linha = y + altCartao + 16;
+        render.texto(L"SERVIDORES SALVOS",
+                     D2D1::RectF(x + 36, linha, x + largCartao - 36, linha + 16), tema::kApagado,
+                     Fonte::Pequena);
+        linha += 24;
+
+        for (const auto& endereco : config.servidores) {
+            const auto area = D2D1::RectF(x + 36, linha, x + largCartao - 36, linha + 34);
+            btServidores.push_back(area);
+
+            const bool atual = paraUtf8(campoServidor.valor) == endereco;
+            render.retangulo(area, atual ? tema::kVerdeSuave : tema::kPainel2, tema::kRaioBotao);
+            render.contorno(area, atual ? tema::kVerdeLinha : tema::kLinha, tema::kRaioBotao);
+            render.texto(paraW(endereco),
+                         D2D1::RectF(area.left + 14, area.top, area.right - 14, area.bottom),
+                         atual ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+            linha += 40;
+        }
+    }
 
     if (!aviso.empty()) {
         render.texto(aviso, D2D1::RectF(x + 36, y + altCartao + 12, x + largCartao - 36,
@@ -1006,6 +1062,7 @@ void Aplicacao::Interno::desenharAoVivo() {
         size_t abertas = 0;
         uint64_t pacotes = 0;
         std::wstring estadoMidia = L"sem ninguem";
+        std::wstring caminhosMidia;
         {
             std::lock_guard trava(travaConexoes);
             for (auto& [id, c] : conexoes) {
@@ -1013,14 +1070,22 @@ void Aplicacao::Interno::desenharAoVivo() {
                 pacotes += c->pacotesEnviados();
             }
             if (!conexoes.empty()) {
-                // Mostrar o estado por extenso quando nada conectou: "0/1" nao
-                // diz se esta negociando, se falhou ou se nem comecou.
+                // Estado por extenso quando nada conectou: "0/1" nao diz se esta
+                // negociando, se falhou ou se nem comecou.
                 ::swprintf_s(buffer, L"%zu/%zu", abertas, conexoes.size());
                 estadoMidia = abertas > 0 ? buffer
                                           : paraW(conexoes.begin()->second->estado());
+                caminhosMidia = paraW(conexoes.begin()->second->caminhos());
             }
         }
         linhaInfo(L"midia", estadoMidia, abertas > 0 ? tema::kVerde : tema::kApagado);
+        if (!caminhosMidia.empty()) {
+            // Sem caminho público nem retransmitido, quem está fora da sua rede
+            // não recebe nada - e essa é a informação que faltava quando a
+            // conexão ficava presa "procurando caminho".
+            const bool soLocal = caminhosMidia == L"local";
+            linhaInfo(L"caminho", caminhosMidia, soLocal ? tema::kVermelho : tema::kTexto);
+        }
         ::swprintf_s(buffer, L"%llu", static_cast<unsigned long long>(pacotes));
         linhaInfo(L"quadros enviados", buffer, tema::kTexto);
     } else {

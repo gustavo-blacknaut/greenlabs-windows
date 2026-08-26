@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace gl {
 
@@ -17,6 +18,15 @@ struct Config {
     std::string nome;
     int qualidade = 1;  // índice na tabela de qualidades
     int monitor = 0;
+
+    // Servidores já usados, do mais recente para o mais antigo. Quem entra numa
+    // sala hoje volta nela amanhã, e digitar o endereço de novo toda vez é o
+    // tipo de atrito que faz a pessoa desistir.
+    std::vector<std::string> servidores;
+
+    // Põe um servidor no topo da lista, sem repetir. Guarda no máximo seis:
+    // além disso vira lista de histórico, não de atalho.
+    void lembrarServidor(const std::string& endereco);
 
     // Devolve o padrão quando o arquivo não existe ou está corrompido: perder a
     // preferência é chato, travar a abertura do aplicativo é pior.

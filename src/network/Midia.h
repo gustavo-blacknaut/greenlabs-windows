@@ -57,6 +57,11 @@ public:
     // Estado da conexão, em uma palavra, para a interface mostrar.
     std::string estado() const;
 
+    // Que caminhos o ICE conseguiu: "local", "publico", "retransmitido".
+    // Quando só há "local", quem está fora da rede não consegue receber - e é
+    // a informação que falta quando a conexão fica presa procurando caminho.
+    std::string caminhos() const;
+
     // Há uma oferta nossa esperando resposta. Serve para detectar colisão:
     // dois lados oferecendo ao mesmo tempo não conseguem se entender.
     bool ofertaPendente() const;
