@@ -674,12 +674,27 @@ void Aplicacao::Interno::clique(float x, float y) {
         if (dentro(btMonitores[i], x, y)) {
             const int novo = static_cast<int>(i);
             if (novo != monitorEscolhido) {
+                const bool estavaTransmitindo = transmitindo;
                 pararTransmissao();
+
+                // O renderizador vive no dispositivo D3D11 da captura. Trocar de
+                // monitor destrói esse dispositivo, então ele precisa soltar
+                // tudo ANTES - senão fica com uma cadeia de troca apontando para
+                // um dispositivo morto, e a nova criação falha em silêncio
+                // porque o DXGI só aceita uma cadeia por janela.
+                render.liberar();
+
                 monitorEscolhido = novo;
-                tela.iniciar(static_cast<uint32_t>(novo));
-                // O renderizador vive no dispositivo D3D11 da captura, e trocar
-                // de monitor pode trocar de placa.
-                render.iniciar(janela, tela.dispositivo());
+                if (!tela.iniciar(static_cast<uint32_t>(novo))) {
+                    aviso = L"Não foi possível capturar esse monitor.";
+                    tela.iniciar(0);
+                    monitorEscolhido = 0;
+                }
+                if (!render.iniciar(janela, tela.dispositivo())) {
+                    aviso = L"A troca de monitor falhou. Reabra o aplicativo.";
+                    return;
+                }
+                if (estavaTransmitindo) comecarTransmissao();
             }
             return;
         }
