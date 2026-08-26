@@ -131,10 +131,13 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
         const std::string texto = std::string(candidato);
         const char* tipo = "?";
         if (texto.find("typ host") != std::string::npos) tipo = "local";
-        else if (texto.find("typ srflx") != std::string::npos) tipo = "publico (STUN)";
-        else if (texto.find("typ relay") != std::string::npos) tipo = "retransmitido (TURN)";
+        else if (texto.find("typ srflx") != std::string::npos) tipo = "publico";
+        else if (texto.find("typ relay") != std::string::npos) tipo = "retransmitido";
         else if (texto.find("typ prflx") != std::string::npos) tipo = "refletido";
-        d_->candidatosPorTipo[tipo] += 1;
+        {
+            std::lock_guard trava(d_->trava);
+            d_->candidatosPorTipo[tipo] += 1;
+        }
 
         if (d_->aoCandidato) d_->aoCandidato(texto, candidato.mid());
     });
@@ -145,16 +148,19 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
         // Resumo de uma linha em vez de despejar cada candidato: o que importa é
         // se apareceu algum caminho que sirva para fora da rede local.
         std::string resumo;
-        for (const auto& [tipo, quantos] : d_->candidatosPorTipo) {
-            if (!resumo.empty()) resumo += ", ";
-            resumo += std::to_string(quantos) + " " + tipo;
+        bool soLocalAqui = true;
+        {
+            std::lock_guard trava(d_->trava);
+            for (const auto& [tipo, quantos] : d_->candidatosPorTipo) {
+                if (!resumo.empty()) resumo += ", ";
+                resumo += std::to_string(quantos) + " " + tipo;
+                if (tipo != "local") soLocalAqui = false;
+            }
         }
         info("candidatos para {}: {}", d_->par.substr(0, 8),
              resumo.empty() ? "nenhum" : resumo);
 
-        const bool soLocal = d_->candidatosPorTipo.size() == 1 &&
-                             d_->candidatosPorTipo.count("local") > 0;
-        if (soLocal) {
+        if (soLocalAqui && !resumo.empty()) {
             aviso("so ha caminho pela rede local: quem estiver fora dela nao vai conseguir ver");
         }
     });
@@ -209,6 +215,18 @@ uint64_t ConexaoPar::bytesEnviados() const { return d_->bytes.load(); }
 std::string ConexaoPar::estado() const {
     std::lock_guard trava(d_->trava);
     return d_->estadoAtual;
+}
+
+std::string ConexaoPar::caminhos() const {
+    std::lock_guard trava(d_->trava);
+    if (d_->candidatosPorTipo.empty()) return "procurando";
+
+    std::string saida;
+    for (const auto& [tipo, quantos] : d_->candidatosPorTipo) {
+        if (!saida.empty()) saida += " + ";
+        saida += tipo;
+    }
+    return saida;
 }
 
 void ConexaoPar::Interno::montarEmpacotador(std::shared_ptr<rtc::Track> faixa) {

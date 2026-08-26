@@ -4,6 +4,7 @@
 
 #include <shlobj.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -71,7 +72,20 @@ Config Config::carregar() {
     c.nome = json.texto("nome");
     c.qualidade = static_cast<int>(json.numero("qualidade", padrao.qualidade));
     c.monitor = static_cast<int>(json.numero("monitor", padrao.monitor));
+
+    for (const Json& item : json.filho("servidores").itens()) {
+        if (item.tipo() == Json::Tipo::Texto && !item.comoTexto().empty()) {
+            c.servidores.push_back(item.comoTexto());
+        }
+    }
     return c;
+}
+
+void Config::lembrarServidor(const std::string& endereco) {
+    if (endereco.empty()) return;
+    std::erase(servidores, endereco);
+    servidores.insert(servidores.begin(), endereco);
+    if (servidores.size() > 6) servidores.resize(6);
 }
 
 void Config::salvar() const {
@@ -84,6 +98,10 @@ void Config::salvar() const {
     json["nome"] = Json{nome};
     json["qualidade"] = Json{qualidade};
     json["monitor"] = Json{monitor};
+
+    Json lista = Json::lista();
+    for (const auto& s : servidores) lista.adicionar(Json{s});
+    json["servidores"] = lista;
 
     // Escreve num temporário e renomeia por cima. Se o aplicativo for fechado
     // no meio da escrita, o arquivo antigo continua inteiro em vez de virar
