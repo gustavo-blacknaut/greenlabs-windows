@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "capture/Cursor.h"
+
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Texture2D;
@@ -45,12 +47,16 @@ struct QuadroCapturado {
     // significa que a tela mudou mais rápido do que estamos lendo.
     uint32_t quadrosAcumulados = 0;
 
-    // O cursor NAO vem desenhado no quadro: o DXGI entrega a área de trabalho
-    // sem ele. Estas posições existem para compor o cursor depois; enquanto
-    // isso não for feito, a transmissão sai sem ponteiro do mouse.
+    // O cursor não vem desenhado no quadro: o DXGI entrega a área de trabalho
+    // sem ele e o ponteiro por um caminho separado. Estes campos são o que
+    // permite compor um por cima do outro.
     bool cursorVisivel = false;
     int32_t cursorX = 0;
     int32_t cursorY = 0;
+
+    // Verdadeiro quando a forma do cursor mudou neste quadro — só aí vale a
+    // pena reenviá-la para a GPU.
+    bool formaMudou = false;
 };
 
 enum class ResultadoQuadro {
@@ -81,6 +87,10 @@ public:
     // liberarQuadro() antes da próxima chamada: é exigência do DXGI.
     ResultadoQuadro proximoQuadro(uint32_t prazoMs, QuadroCapturado& saida);
     void liberarQuadro();
+
+    // A forma atual do cursor, já convertida para BGRA. Vazia enquanto o
+    // Windows não tiver entregado nenhuma.
+    const FormaCursor& formaDoCursor() const;
 
     ID3D11Device* dispositivo() const;
     ID3D11DeviceContext* contexto() const;
