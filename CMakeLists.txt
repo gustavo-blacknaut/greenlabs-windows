@@ -104,6 +104,7 @@ add_library(greenlabs_core STATIC
     src/capture/ProcessTree.cpp
     src/capture/AudioCapture.cpp
     src/capture/ScreenCapture.cpp
+    src/capture/Cursor.cpp
     src/video/ColorConverter.cpp
     src/encoder/VideoEncoder.cpp
     src/network/WebSocketClient.cpp

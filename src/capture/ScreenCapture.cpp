@@ -6,6 +6,8 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
+#include <cstring>
+
 #include "util/Log.h"
 
 using Microsoft::WRL::ComPtr;
@@ -67,6 +69,17 @@ struct ScreenCapture::Interno {
 
     MonitorInfo info;
     bool quadroEmMaos = false;
+
+    // Posição e visibilidade do ponteiro persistem entre quadros: o DXGI só
+    // avisa quando mudam. Guardar aqui evita o cursor sumir a cada quadro em
+    // que o mouse ficou parado.
+    bool cursorVisivel = false;
+    int32_t cursorX = 0;
+    int32_t cursorY = 0;
+    FormaCursor forma;
+    std::vector<uint8_t> bufferForma;
+
+    void lerFormaDoCursor(const DXGI_OUTDUPL_FRAME_INFO& informacao);
 
     bool criarDuplicacao();
 };
@@ -209,6 +222,16 @@ ResultadoQuadro ScreenCapture::proximoQuadro(uint32_t prazoMs, QuadroCapturado& 
 
     d_->quadroEmMaos = true;
 
+    // O DXGI só reporta o ponteiro quando ele muda. LastMouseUpdateTime em zero
+    // significa "nada mudou", e ler PointerPosition nesse caso traria lixo.
+    if (informacao.LastMouseUpdateTime.QuadPart != 0) {
+        d_->cursorVisivel = informacao.PointerPosition.Visible != FALSE;
+        d_->cursorX = informacao.PointerPosition.Position.x;
+        d_->cursorY = informacao.PointerPosition.Position.y;
+    }
+    saida.formaMudou = informacao.PointerShapeBufferSize > 0;
+    if (saida.formaMudou) d_->lerFormaDoCursor(informacao);
+
     if (informacao.LastPresentTime.QuadPart == 0) {
         // Só o cursor se moveu: o DXGI sinaliza, mas a imagem é a mesma de
         // antes. Codificar isso de novo seria banda jogada fora.
@@ -227,9 +250,9 @@ ResultadoQuadro ScreenCapture::proximoQuadro(uint32_t prazoMs, QuadroCapturado& 
     saida.quadrosAcumulados = informacao.AccumulatedFrames;
     saida.latenciaUs =
         (agoraQpc() - informacao.LastPresentTime.QuadPart) * 1'000'000 / frequenciaQpc();
-    saida.cursorVisivel = informacao.PointerPosition.Visible != FALSE;
-    saida.cursorX = informacao.PointerPosition.Position.x;
-    saida.cursorY = informacao.PointerPosition.Position.y;
+    saida.cursorVisivel = d_->cursorVisivel;
+    saida.cursorX = d_->cursorX;
+    saida.cursorY = d_->cursorY;
 
     return ResultadoQuadro::Ok;
 }
@@ -239,6 +262,71 @@ void ScreenCapture::liberarQuadro() {
     d_->texturaAtual.Reset();
     if (d_->duplicacao) d_->duplicacao->ReleaseFrame();
     d_->quadroEmMaos = false;
+}
+
+const FormaCursor& ScreenCapture::formaDoCursor() const { return d_->forma; }
+
+// Converte a forma do cursor para BGRA.
+//
+// O Windows entrega em três formatos. O colorido já é BGRA. O monocromático são
+// duas máscaras de 1 bit empilhadas (AND e XOR) que juntas dizem transparente,
+// preto, branco ou inverter — a inversão vira branco aqui, porque inverter o
+// que está embaixo exigiria ler o quadro. O mascarado é BGRA onde alfa 0 quer
+// dizer "usa o que está embaixo".
+void ScreenCapture::Interno::lerFormaDoCursor(const DXGI_OUTDUPL_FRAME_INFO& informacao) {
+    bufferForma.resize(informacao.PointerShapeBufferSize);
+
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO infoForma{};
+    UINT usado = 0;
+    if (FAILED(duplicacao->GetFramePointerShape(informacao.PointerShapeBufferSize,
+                                                bufferForma.data(), &usado, &infoForma))) {
+        return;
+    }
+
+    forma.ancoraX = static_cast<int32_t>(infoForma.HotSpot.x);
+    forma.ancoraY = static_cast<int32_t>(infoForma.HotSpot.y);
+    forma.largura = infoForma.Width;
+
+    if (infoForma.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+        // Altura vem dobrada: as duas máscaras vêm uma embaixo da outra.
+        forma.altura = infoForma.Height / 2;
+        forma.pixels.assign(static_cast<size_t>(forma.largura) * forma.altura * 4, 0);
+
+        for (uint32_t y = 0; y < forma.altura; ++y) {
+            for (uint32_t x = 0; x < forma.largura; ++x) {
+                const size_t byte = static_cast<size_t>(y) * infoForma.Pitch + x / 8;
+                const uint8_t bit = static_cast<uint8_t>(0x80 >> (x % 8));
+                const bool transparente = (bufferForma[byte] & bit) != 0;
+                const size_t byteXor =
+                    static_cast<size_t>(y + forma.altura) * infoForma.Pitch + x / 8;
+                const bool aceso = (bufferForma[byteXor] & bit) != 0;
+
+                uint8_t* destino = &forma.pixels[(static_cast<size_t>(y) * forma.largura + x) * 4];
+                if (transparente && !aceso) continue;  // nada
+                const uint8_t tom = aceso ? 255 : 0;
+                destino[0] = destino[1] = destino[2] = tom;
+                destino[3] = 255;
+            }
+        }
+        return;
+    }
+
+    // Colorido e mascarado: já vêm em BGRA.
+    forma.altura = infoForma.Height;
+    forma.pixels.assign(static_cast<size_t>(forma.largura) * forma.altura * 4, 0);
+    for (uint32_t y = 0; y < forma.altura; ++y) {
+        const uint8_t* origem = bufferForma.data() + static_cast<size_t>(y) * infoForma.Pitch;
+        uint8_t* destino = &forma.pixels[static_cast<size_t>(y) * forma.largura * 4];
+        std::memcpy(destino, origem, static_cast<size_t>(forma.largura) * 4);
+    }
+
+    if (infoForma.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+        // Alfa 0 quer dizer "deixa passar"; 255 quer dizer "inverte". Tratar a
+        // inversão como opaco é o que os capturadores costumam fazer.
+        for (size_t i = 0; i + 3 < forma.pixels.size(); i += 4) {
+            forma.pixels[i + 3] = forma.pixels[i + 3] == 0 ? 0 : 255;
+        }
+    }
 }
 
 ID3D11Device* ScreenCapture::dispositivo() const { return d_->dispositivo.Get(); }

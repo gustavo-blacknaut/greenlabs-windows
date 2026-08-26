@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -44,7 +45,7 @@ std::string mensagemDoEstado(rtc::PeerConnection::State estado) {
     using Estado = rtc::PeerConnection::State;
     switch (estado) {
         case Estado::New:          return "novo";
-        case Estado::Connecting:   return "conectando";
+        case Estado::Connecting:   return "procurando caminho";
         case Estado::Connected:    return "conectado";
         case Estado::Disconnected: return "desconectado";
         case Estado::Failed:       return "falhou";
@@ -82,6 +83,7 @@ struct ConexaoPar::Interno {
     std::string estadoAtual = "novo";
     std::atomic<bool> esperandoResposta{false};
     std::atomic<bool> esperandoPrimeiraChave{true};
+    std::map<std::string, int> candidatosPorTipo;
 };
 
 ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
@@ -90,12 +92,23 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
     d_->config = config;
 
     rtc::Configuration cfg;
-    // Os mesmos servidores que o cliente web usa, para os dois acharem o mesmo
-    // caminho quando estiverem atrás de roteadores diferentes.
+    // STUN descobre o endereço público de cada lado. Resolve a maioria dos
+    // casos, e é de graça.
     cfg.iceServers.emplace_back("stun:stun.l.google.com:19302");
     cfg.iceServers.emplace_back("stun:stun1.l.google.com:19302");
-    cfg.iceServers.emplace_back(
-        rtc::IceServer("openrelay.metered.ca", 443, "openrelayproject", "openrelayproject"));
+
+    // TURN é o plano B: quando os dois roteadores não deixam a conexão direta
+    // acontecer, o vídeo passa por um retransmissor.
+    //
+    // O padrão do construtor é UDP. Pedir UDP na 443 - que é porta de TLS - não
+    // funciona: o servidor não responde e o candidato nunca sai. Cada porta com
+    // o transporte que ela realmente atende.
+    cfg.iceServers.emplace_back(rtc::IceServer("openrelay.metered.ca", uint16_t{80},
+                                               "openrelayproject", "openrelayproject",
+                                               rtc::IceServer::RelayType::TurnUdp));
+    cfg.iceServers.emplace_back(rtc::IceServer("openrelay.metered.ca", uint16_t{443},
+                                               "openrelayproject", "openrelayproject",
+                                               rtc::IceServer::RelayType::TurnTcp));
 
     // Negociação na mão. Com a automática, adicionar a faixa já disparava uma
     // oferta por conta própria — e como o outro lado também oferece ao entrar,
@@ -112,8 +125,37 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
     });
 
     d_->conexao->onLocalCandidate([this](rtc::Candidate candidato) {
-        if (d_->aoCandidato) {
-            d_->aoCandidato(std::string(candidato), candidato.mid());
+        // O tipo do candidato conta a história: host = rede local, srflx = o
+        // STUN respondeu, relay = o TURN aceitou. Sem srflx nem relay, dois
+        // lados em redes diferentes nunca se acham.
+        const std::string texto = std::string(candidato);
+        const char* tipo = "?";
+        if (texto.find("typ host") != std::string::npos) tipo = "local";
+        else if (texto.find("typ srflx") != std::string::npos) tipo = "publico (STUN)";
+        else if (texto.find("typ relay") != std::string::npos) tipo = "retransmitido (TURN)";
+        else if (texto.find("typ prflx") != std::string::npos) tipo = "refletido";
+        d_->candidatosPorTipo[tipo] += 1;
+
+        if (d_->aoCandidato) d_->aoCandidato(texto, candidato.mid());
+    });
+
+    d_->conexao->onGatheringStateChange([this](rtc::PeerConnection::GatheringState estado) {
+        if (estado != rtc::PeerConnection::GatheringState::Complete) return;
+
+        // Resumo de uma linha em vez de despejar cada candidato: o que importa é
+        // se apareceu algum caminho que sirva para fora da rede local.
+        std::string resumo;
+        for (const auto& [tipo, quantos] : d_->candidatosPorTipo) {
+            if (!resumo.empty()) resumo += ", ";
+            resumo += std::to_string(quantos) + " " + tipo;
+        }
+        info("candidatos para {}: {}", d_->par.substr(0, 8),
+             resumo.empty() ? "nenhum" : resumo);
+
+        const bool soLocal = d_->candidatosPorTipo.size() == 1 &&
+                             d_->candidatosPorTipo.count("local") > 0;
+        if (soLocal) {
+            aviso("so ha caminho pela rede local: quem estiver fora dela nao vai conseguir ver");
         }
     });
 

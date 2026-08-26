@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "capture/AudioCapture.h"
+#include "capture/Cursor.h"
 #include "config/Config.h"
 #include "capture/ProcessTree.h"
 #include "capture/ScreenCapture.h"
@@ -98,6 +99,8 @@ struct Aplicacao::Interno {
     Renderizador render;
 
     ScreenCapture tela;
+    Cursor cursor;
+    bool cursorPronto = false;
     ColorConverter conversor;
     VideoEncoder encoder;
     AudioCapture audio;
@@ -341,8 +344,21 @@ void Aplicacao::Interno::bombearCaptura() {
     // clique e digitação engasgam.
     switch (tela.proximoQuadro(4, quadro)) {
         case ResultadoQuadro::Ok: {
-            quadroAtual = quadro.textura;
             quadrosNoSegundo += 1;
+
+            // O cursor entra aqui, antes de qualquer outra coisa: assim ele
+            // aparece tanto na prévia quanto no que é transmitido, e ninguém
+            // precisa se perguntar por que a seta some do outro lado.
+            if (!cursorPronto) {
+                const auto& m = tela.monitor();
+                cursorPronto = cursor.iniciar(tela.dispositivo(), tela.contexto(), m.largura,
+                                              m.altura);
+            }
+            if (cursorPronto && quadro.formaMudou) cursor.definirForma(tela.formaDoCursor());
+
+            quadroAtual = cursorPronto ? cursor.compor(quadro.textura, quadro.cursorVisivel,
+                                                       quadro.cursorX, quadro.cursorY)
+                                       : quadro.textura;
 
             if (transmitindo) {
                 // Taxa fixa: a duplicação entrega quadro sempre que a tela muda,
@@ -354,7 +370,7 @@ void Aplicacao::Interno::bombearCaptura() {
                     std::chrono::microseconds(1'000'000 / kQualidades[qualidadeEscolhida].fps);
                 if (agora - ultimoEncode >= intervalo) {
                     ultimoEncode = agora;
-                    if (auto* nv12 = conversor.converter(quadro.textura)) {
+                    if (auto* nv12 = conversor.converter(quadroAtual)) {
                         encoder.codificar(nv12, std::chrono::duration_cast<std::chrono::microseconds>(
                                                     agora.time_since_epoch()).count());
                     }
@@ -683,6 +699,7 @@ void Aplicacao::Interno::clique(float x, float y) {
                 // um dispositivo morto, e a nova criação falha em silêncio
                 // porque o DXGI só aceita uma cadeia por janela.
                 render.liberar();
+                cursorPronto = false;
 
                 monitorEscolhido = novo;
                 if (!tela.iniciar(static_cast<uint32_t>(novo))) {
