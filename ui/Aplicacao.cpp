@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "capture/AudioCapture.h"
+#include "config/Config.h"
 #include "capture/ProcessTree.h"
 #include "capture/ScreenCapture.h"
 #include "encoder/VideoEncoder.h"
@@ -83,6 +84,11 @@ struct Campo {
     std::wstring dica;
     D2D1_RECT_F area{};
     bool focado = false;
+
+    // Ctrl+A não tem seleção parcial aqui: ou tudo está marcado, ou nada. É o
+    // que a combinação faz na prática num campo de uma linha - marca tudo para
+    // a próxima tecla substituir.
+    bool tudoSelecionado = false;
 };
 
 }  // namespace
@@ -244,24 +250,33 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
 
     Signaling::Ouvintes ouvintes;
     ouvintes.aoEntrar = [this](const std::string& eu, const std::vector<Participante>& pares) {
-        std::lock_guard trava(d_->travaPares);
-        d_->meuId = eu;
-        d_->pares = pares;
+        {
+            std::lock_guard trava(d_->travaPares);
+            d_->meuId = eu;
+            d_->pares = pares;
+        }
         d_->conectado.store(true);
         d_->telaAtual = Tela::AoVivo;
+
+        // Chegamos numa sala que já tinha gente: nós é que oferecemos.
+        if (d_->transmitindo) {
+            for (const auto& p : pares) {
+                if (auto conexao = d_->abrirMidiaPara(p.id)) conexao->oferecer();
+            }
+        }
     };
     ouvintes.aoChegarAlguem = [this](const Participante& p) {
         {
             std::lock_guard trava(d_->travaPares);
             d_->pares.push_back(p);
         }
-        // Chegou no meio da transmissão: abre a mídia e oferece na hora, senão
-        // a pessoa fica olhando tela preta até alguém reiniciar a transmissão.
+        // Quem CHEGA é quem oferece — é o que o cliente web e o de Electron
+        // fazem, e seguir a mesma regra evita os dois lados oferecerem ao mesmo
+        // tempo. Aqui só preparamos a conexão com a faixa pronta, para poder
+        // responder à oferta que vem em seguida.
         if (d_->transmitindo) {
-            if (auto conexao = d_->abrirMidiaPara(p.id)) {
-                conexao->oferecer();
-                d_->encoder.pedirQuadroChave();
-            }
+            d_->abrirMidiaPara(p.id);
+            d_->encoder.pedirQuadroChave();
         }
     };
     ouvintes.aoSairAlguem = [this](const std::string& id) {
@@ -469,6 +484,9 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
         sinal.enviarPara(peerId, msg);
     });
 
+    // Quando o outro lado pede quadro-chave, quem produz é o encoder.
+    conexao->aoPedirChave([this] { encoder.pedirQuadroChave(); });
+
     conexao->aoCandidato([this, peerId](const std::string& candidato, const std::string& mid) {
         Json corpo = Json::objeto();
         corpo["candidate"] = Json{candidato};
@@ -481,6 +499,11 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
         sinal.enviarPara(peerId, msg);
     });
 
+    // A faixa NÃO é criada aqui de propósito. Quando somos nós que
+    // respondemos, ela nasce da oferta do outro lado (pelo onTrack) e já vem
+    // com o mid certo. Criar uma nossa antes fazia o onTrack ser ignorado, e a
+    // faixa com mid proprio nao casava com nenhuma m-line da oferta: a conexao
+    // ficava de pe e nenhum quadro saia.
     {
         std::lock_guard trava(travaConexoes);
         conexoes[peerId] = conexao;
@@ -496,6 +519,38 @@ void Aplicacao::Interno::tratarRepasse(const std::string& de, const Json& msg) {
         std::lock_guard trava(travaConexoes);
         auto achou = conexoes.find(de);
         if (achou != conexoes.end()) conexao = achou->second;
+    }
+
+    // Colisão: os dois lados ofereceram ao mesmo tempo. Aplicar a oferta do
+    // outro por cima da nossa dá "Incompatible roles" e a conexão morre ali.
+    //
+    // A regra é a mesma dos outros clientes: quem tem o id maior cede. Como o
+    // libdatachannel não desfaz uma descrição local, ceder significa recriar a
+    // conexão do zero — e é o que acontece aqui.
+    if (conexao && tipo == "offer" && conexao->ofertaPendente()) {
+        if (de < meuId) {
+            gl::aviso("colisao de ofertas com {}: cedendo", de.substr(0, 8));
+            {
+                std::lock_guard trava(travaConexoes);
+                conexoes.erase(de);
+            }
+            conexao = abrirMidiaPara(de);
+        } else {
+            gl::aviso("colisao de ofertas com {}: mantendo a nossa", de.substr(0, 8));
+            return;
+        }
+    }
+
+    // Oferta de alguém com quem ainda não há conexão: cria e responde.
+    //
+    // Sem isto o cliente só sabia falar, nunca ouvir - e quando o outro lado
+    // oferecia primeiro (o que acontece quando ele entra na sala depois de
+    // nós), a oferta era jogada fora em silêncio. Ele ficava esperando resposta
+    // que nunca vinha, e quando nós ofereciamos depois ele ignorava por
+    // colisão. Nenhum dos dois conectava, e o resultado era tela preta com
+    // "transmitindo" na interface.
+    if (!conexao && tipo == "offer") {
+        conexao = abrirMidiaPara(de);
     }
     if (!conexao) return;
 
@@ -522,7 +577,7 @@ void Aplicacao::Interno::enviarQuadroParaTodos(const PacoteCodificado& pacote) {
     // custo pelo tamanho da sala e derrubaria a maquina numa chamada grande.
     std::lock_guard trava(travaConexoes);
     for (auto& [id, conexao] : conexoes) {
-        conexao->enviarVideo(pacote.dados, pacote.tamanho, pacote.tempoUs);
+        conexao->enviarVideo(pacote.dados, pacote.tamanho, pacote.tempoUs, pacote.chave);
     }
 }
 
@@ -542,6 +597,11 @@ void Aplicacao::Interno::colar() {
     Campo* campo = campoFocado();
     if (!campo || !::OpenClipboard(janela)) return;
 
+    if (campo->tudoSelecionado) {
+        campo->valor.clear();
+        campo->tudoSelecionado = false;
+    }
+
     if (HANDLE dados = ::GetClipboardData(CF_UNICODETEXT)) {
         if (auto* texto = static_cast<const wchar_t*>(::GlobalLock(dados))) {
             for (const wchar_t* p = texto; *p && campo->valor.size() < 200; ++p) {
@@ -560,8 +620,22 @@ void Aplicacao::Interno::tecla(wchar_t c) {
         colar();
         return;
     }
+    if (c == 0x01) {  // Ctrl+A
+        if (Campo* campo = campoFocado()) campo->tudoSelecionado = !campo->valor.empty();
+        return;
+    }
     Campo* campo = campoFocado();
     if (!campo) return;
+
+    // Com tudo marcado, qualquer tecla que produza texto substitui o conteúdo -
+    // e Backspace apaga tudo de uma vez. É o comportamento que a pessoa espera
+    // depois de um Ctrl+A.
+    if (campo->tudoSelecionado && (c == L'\b' || c >= 32)) {
+        campo->valor.clear();
+        campo->tudoSelecionado = false;
+        if (c == L'\b') return;
+    }
+
     if (c == L'\b') {
         if (!campo->valor.empty()) campo->valor.pop_back();
     } else if (c == L'\t' || c == L'\r') {
@@ -588,9 +662,10 @@ void Aplicacao::Interno::clique(float x, float y) {
     }
 
     if (telaAtual == Tela::Entrada) {
-        campoNome.focado = dentro(campoNome.area, x, y);
-        campoServidor.focado = dentro(campoServidor.area, x, y);
-        campoSala.focado = dentro(campoSala.area, x, y);
+        for (Campo* campo : {&campoNome, &campoServidor, &campoSala}) {
+            campo->focado = dentro(campo->area, x, y);
+            if (!campo->focado) campo->tudoSelecionado = false;
+        }
         if (dentro(btEntrar, x, y)) conectar();
         return;
     }
@@ -668,7 +743,14 @@ void Aplicacao::Interno::desenharCampo(Campo& campo, const std::wstring& rotulo)
     } else {
         // Cursor piscando só no campo com foco: sem isso não dá para saber onde
         // a digitação vai cair.
-        const bool piscar = campo.focado &&
+        if (campo.tudoSelecionado) {
+            // Fundo verde no texto marcado, para o Ctrl+A ter efeito visível.
+            const float larguraTexto = render.larguraDoTexto(campo.valor, Fonte::Corpo);
+            render.retangulo(D2D1::RectF(interna.left - 3, interna.top + 9,
+                                         interna.left + larguraTexto + 3, interna.bottom - 9),
+                             tema::kVerdeSuave, 4);
+        }
+        const bool piscar = campo.focado && !campo.tudoSelecionado &&
                             (::GetTickCount64() / 500) % 2 == 0;
         render.texto(campo.valor + (piscar ? L"|" : L""), interna, tema::kTexto, Fonte::Corpo);
     }
@@ -679,9 +761,10 @@ void Aplicacao::Interno::desenharBarraTitulo() {
     render.retangulo(D2D1::RectF(0, 0, larg, tema::kAlturaTitulo), tema::kPainel);
     render.linha(0, tema::kAlturaTitulo, larg, tema::kAlturaTitulo, tema::kLinha);
 
-    render.texto(L"GreenLabs", D2D1::RectF(16, 0, 200, tema::kAlturaTitulo), tema::kTexto,
+    render.logo(D2D1::RectF(12, 7, 12 + 24, tema::kAlturaTitulo - 7));
+    render.texto(L"GreenLabs", D2D1::RectF(44, 0, 220, tema::kAlturaTitulo), tema::kTexto,
                  Fonte::Botao);
-    render.texto(L"v0.0.1  nativo", D2D1::RectF(96, 0, 260, tema::kAlturaTitulo), tema::kApagado,
+    render.texto(L"v0.0.1  nativo", D2D1::RectF(124, 0, 280, tema::kAlturaTitulo), tema::kApagado,
                  Fonte::Pequena);
 
     const float b = tema::kLarguraBotaoTitulo;
@@ -709,12 +792,13 @@ void Aplicacao::Interno::desenharEntrada() {
     render.contorno(D2D1::RectF(x, y, x + largCartao, y + altCartao), tema::kLinha,
                     tema::kRaioCartao);
 
+    render.logo(D2D1::RectF(x + 36, y + 26, x + 36 + 56, y + 82));
     render.texto(L"SEM CONTA · SEM LIMITE DE TEMPO",
-                 D2D1::RectF(x + 36, y + 34, x + largCartao - 36, y + 54), tema::kVerde,
+                 D2D1::RectF(x + 104, y + 34, x + largCartao - 36, y + 54), tema::kVerde,
                  Fonte::Pequena);
     render.texto(L"Entrar numa sala",
-                 D2D1::RectF(x + 36, y + 58, x + largCartao - 36, y + 100), tema::kTexto,
-                 Fonte::Titulo);
+                 D2D1::RectF(x + 104, y + 54, x + largCartao - 36, y + 92), tema::kTexto,
+                 Fonte::Subtitulo);
 
     const float larguraCampo = largCartao - 72;
     campoNome.area = D2D1::RectF(x + 36, y + 140, x + 36 + larguraCampo, y + 186);
@@ -889,15 +973,22 @@ void Aplicacao::Interno::desenharAoVivo() {
                   audio.ativo() ? tema::kVerde : tema::kApagado);
         size_t abertas = 0;
         uint64_t pacotes = 0;
+        std::wstring estadoMidia = L"sem ninguem";
         {
             std::lock_guard trava(travaConexoes);
             for (auto& [id, c] : conexoes) {
                 if (c->pronto()) ++abertas;
                 pacotes += c->pacotesEnviados();
             }
-            ::swprintf_s(buffer, L"%zu/%zu", abertas, conexoes.size());
+            if (!conexoes.empty()) {
+                // Mostrar o estado por extenso quando nada conectou: "0/1" nao
+                // diz se esta negociando, se falhou ou se nem comecou.
+                ::swprintf_s(buffer, L"%zu/%zu", abertas, conexoes.size());
+                estadoMidia = abertas > 0 ? buffer
+                                          : paraW(conexoes.begin()->second->estado());
+            }
         }
-        linhaInfo(L"midia", buffer, abertas > 0 ? tema::kVerde : tema::kApagado);
+        linhaInfo(L"midia", estadoMidia, abertas > 0 ? tema::kVerde : tema::kApagado);
         ::swprintf_s(buffer, L"%llu", static_cast<unsigned long long>(pacotes));
         linhaInfo(L"quadros enviados", buffer, tema::kTexto);
     } else {

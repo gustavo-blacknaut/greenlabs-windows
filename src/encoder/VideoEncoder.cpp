@@ -15,6 +15,7 @@
 #include <chrono>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "util/Log.h"
 
@@ -72,6 +73,14 @@ struct VideoEncoder::Interno {
     // Quando o hardware está assíncrono, um ProcessInput só é aceito depois de
     // um METransformNeedInput. Este contador guarda os pedidos pendentes.
     int entradasPedidas = 0;
+
+    // SPS e PPS, que o Media Foundation guarda num atributo do tipo de saída em
+    // vez de emitir junto com o quadro-chave. Sem eles antes do IDR, o
+    // decodificador do outro lado não sabe a resolução nem o perfil e nunca
+    // começa: o vídeo fica 0x0 para sempre, sem erro nenhum.
+    std::vector<uint8_t> cabecalhoSequencia;
+    std::vector<uint8_t> quadroComCabecalho;
+    void lerCabecalhoSequencia();
 
     bool configurarTipos();
     bool ajustarCodecApi();
@@ -407,6 +416,24 @@ void VideoEncoder::Interno::drenarEventos() {
     }
 }
 
+void VideoEncoder::Interno::lerCabecalhoSequencia() {
+    if (!cabecalhoSequencia.empty()) return;
+
+    ComPtr<IMFMediaType> tipo;
+    if (FAILED(transformador->GetOutputCurrentType(0, &tipo))) return;
+
+    UINT32 tamanho = 0;
+    if (FAILED(tipo->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &tamanho)) || tamanho == 0) return;
+
+    cabecalhoSequencia.resize(tamanho);
+    if (FAILED(tipo->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, cabecalhoSequencia.data(), tamanho,
+                             nullptr))) {
+        cabecalhoSequencia.clear();
+        return;
+    }
+    info("SPS/PPS do encoder: {} bytes", tamanho);
+}
+
 void VideoEncoder::Interno::colherSaida() {
     // Num MFT assincrono vale exatamente um ProcessOutput por METransformHaveOutput.
     // Chamar em laco ate MF_E_TRANSFORM_NEED_MORE_INPUT e o padrao dos sincronos,
@@ -469,7 +496,26 @@ void VideoEncoder::Interno::colherSaida() {
                 bytes.fetch_add(tamanho);
 
                 if (consumidor) {
-                    consumidor(PacoteCodificado{dados, tamanho, tempo / 10, pontoLimpo != 0});
+                    if (pontoLimpo) {
+                        // SPS e PPS vão colados na frente de todo quadro-chave.
+                        // É o que permite alguém que chegou agora começar a
+                        // decodificar no próximo IDR, sem precisar ter estado
+                        // presente desde o começo da transmissão.
+                        lerCabecalhoSequencia();
+                    }
+
+                    if (pontoLimpo && !cabecalhoSequencia.empty()) {
+                        quadroComCabecalho.clear();
+                        quadroComCabecalho.reserve(cabecalhoSequencia.size() + tamanho);
+                        quadroComCabecalho.insert(quadroComCabecalho.end(),
+                                                  cabecalhoSequencia.begin(),
+                                                  cabecalhoSequencia.end());
+                        quadroComCabecalho.insert(quadroComCabecalho.end(), dados, dados + tamanho);
+                        consumidor(PacoteCodificado{quadroComCabecalho.data(),
+                                                    quadroComCabecalho.size(), tempo / 10, true});
+                    } else {
+                        consumidor(PacoteCodificado{dados, tamanho, tempo / 10, pontoLimpo != 0});
+                    }
                 }
                 buffer->Unlock();
             }

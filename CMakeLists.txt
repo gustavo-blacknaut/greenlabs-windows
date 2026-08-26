@@ -109,6 +109,7 @@ add_library(greenlabs_core STATIC
     src/network/WebSocketClient.cpp
     src/network/Signaling.cpp
     src/network/Midia.cpp
+    src/config/Config.cpp
     ui/Renderizador.cpp
     ui/Aplicacao.cpp
 )
@@ -140,6 +141,7 @@ target_link_libraries(greenlabs_core PUBLIC
     d2d1          # interface: formas e imagem
     dwrite        # interface: texto
     shell32       # CommandLineToArgvW
+    windowscodecs # WIC: decodifica o PNG da logo
 )
 
 # ------------------------------------------------------------ nossos alvos
@@ -165,7 +167,7 @@ greenlabs_flags(greenlabs_core)
 # -------------------------------------------------------------- aplicativo
 #
 # WIN32 e o que faz o executavel abrir sem console atras da janela.
-add_executable(GreenLabs WIN32 src/main/main.cpp)
+add_executable(GreenLabs WIN32 src/main/main.cpp ui/recursos.rc)
 target_link_libraries(GreenLabs PRIVATE greenlabs_core)
 greenlabs_flags(GreenLabs)
 
