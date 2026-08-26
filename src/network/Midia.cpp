@@ -103,12 +103,14 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
     // O padrão do construtor é UDP. Pedir UDP na 443 - que é porta de TLS - não
     // funciona: o servidor não responde e o candidato nunca sai. Cada porta com
     // o transporte que ela realmente atende.
-    cfg.iceServers.emplace_back(rtc::IceServer("openrelay.metered.ca", uint16_t{80},
-                                               "openrelayproject", "openrelayproject",
-                                               rtc::IceServer::RelayType::TurnUdp));
-    cfg.iceServers.emplace_back(rtc::IceServer("openrelay.metered.ca", uint16_t{443},
-                                               "openrelayproject", "openrelayproject",
-                                               rtc::IceServer::RelayType::TurnTcp));
+    if (config.usarTurn) {
+        cfg.iceServers.emplace_back(rtc::IceServer("openrelay.metered.ca", uint16_t{80},
+                                                   "openrelayproject", "openrelayproject",
+                                                   rtc::IceServer::RelayType::TurnUdp));
+        cfg.iceServers.emplace_back(rtc::IceServer("openrelay.metered.ca", uint16_t{443},
+                                                   "openrelayproject", "openrelayproject",
+                                                   rtc::IceServer::RelayType::TurnTcp));
+    }
 
     // Negociação na mão. Com a automática, adicionar a faixa já disparava uma
     // oferta por conta própria — e como o outro lado também oferece ao entrar,

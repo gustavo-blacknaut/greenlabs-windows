@@ -515,6 +515,17 @@ void Aplicacao::Interno::conectar() {
     config.lembrarServidor(servidor);
     config.salvar();
 
+    // Conexões da sessão anterior não valem nada aqui, e uma delas atrapalha
+    // de verdade: o id do servidor é sempre "sfu", então na reconexão a
+    // conexão velha - já estável - continuava no mapa. A oferta nova caía nela
+    // e era recusada com "Unexpected local description type answer in
+    // signaling state stable". Com participante comum isso nunca aparecia,
+    // porque o id deles muda a cada entrada.
+    {
+        std::lock_guard trava(travaConexoes);
+        conexoes.clear();
+    }
+
     if (!sinal.entrar(servidor, paraUtf8(campoSala.valor), paraUtf8(campoNome.valor))) {
         aviso = L"Não foi possível conectar. Confira o endereço e se o servidor está no ar.";
         return;
@@ -537,6 +548,12 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
     cfg.altura = q.altura;
     cfg.fps = q.fps;
     cfg.bitrate = q.bitrate;
+
+    // O servidor em modo SFU tem endereço público: basta o nosso candidato
+    // refletido pelo STUN para o caminho fechar. Pedir TURN aqui só adiciona
+    // uma espera que já custou a conexão inteira - a coleta demorava 24
+    // segundos e o servidor desistia aos 30.
+    cfg.usarTurn = (peerId != kIdDoSFU);
 
     auto conexao = std::make_shared<ConexaoPar>(peerId, cfg);
 

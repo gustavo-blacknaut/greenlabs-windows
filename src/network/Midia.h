@@ -21,6 +21,13 @@ struct ConfigMidia {
     uint32_t altura = 1080;
     uint32_t fps = 30;
     uint32_t bitrate = 4'500'000;
+
+    // Quando o outro lado já tem endereço público — o caso do servidor em modo
+    // SFU — TURN não tem o que resolver e só atrasa: uma alocação que não
+    // responde segura a coleta de candidatos até estourar o próprio tempo. Foi
+    // o que aconteceu na prática: 24 segundos para juntar os candidatos, e o
+    // servidor já tinha desistido aos 30.
+    bool usarTurn = true;
 };
 
 // Uma conexão com um participante. Numa sala de N pessoas existem N-1 destas.
