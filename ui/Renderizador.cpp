@@ -6,6 +6,7 @@
 #include <d3d11.h>
 #include <dwrite.h>
 #include <dxgi1_2.h>
+#include <wincodec.h>  // WIC: decodifica o PNG da logo
 #include <wrl/client.h>
 
 #include <map>
@@ -58,6 +59,11 @@ struct Renderizador::Interno {
     ComPtr<ID2D1Bitmap1> bitmapVideo;
     uint32_t larguraVideo = 0;
     uint32_t alturaVideo = 0;
+
+    ComPtr<ID2D1Bitmap1> bitmapLogo;
+    bool tentouLogo = false;
+
+    void carregarLogo();
 
     HWND janela = nullptr;
     uint32_t largura = 0;
@@ -209,6 +215,83 @@ IDWriteTextFormat* Renderizador::Interno::formato(Fonte f) {
     novo->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     formatos[chave] = novo;
     return novo.Get();
+}
+
+// Carrega a logo do recurso embutido no .exe. Uma vez só: se falhar, a
+// interface segue sem ela em vez de tentar a cada quadro.
+void Renderizador::Interno::carregarLogo() {
+    if (tentouLogo) return;
+    tentouLogo = true;
+
+    HRSRC achado = ::FindResourceW(nullptr, MAKEINTRESOURCEW(100), RT_RCDATA);
+    if (!achado) return;
+
+    HGLOBAL recurso = ::LoadResource(nullptr, achado);
+    if (!recurso) return;
+
+    const void* dados = ::LockResource(recurso);
+    const DWORD tamanho = ::SizeofResource(nullptr, achado);
+    if (!dados || tamanho == 0) return;
+
+    ComPtr<IWICImagingFactory> wic;
+    if (FAILED(::CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&wic)))) {
+        return;
+    }
+
+    ComPtr<IWICStream> fluxo;
+    if (FAILED(wic->CreateStream(&fluxo))) return;
+    if (FAILED(fluxo->InitializeFromMemory(
+            reinterpret_cast<BYTE*>(const_cast<void*>(dados)), tamanho))) {
+        return;
+    }
+
+    ComPtr<IWICBitmapDecoder> decodificador;
+    if (FAILED(wic->CreateDecoderFromStream(fluxo.Get(), nullptr, WICDecodeMetadataCacheOnLoad,
+                                            &decodificador))) {
+        return;
+    }
+
+    ComPtr<IWICBitmapFrameDecode> quadro;
+    if (FAILED(decodificador->GetFrame(0, &quadro))) return;
+
+    // Converte para o formato que o Direct2D usa, preservando a transparência.
+    ComPtr<IWICFormatConverter> conversor;
+    if (FAILED(wic->CreateFormatConverter(&conversor))) return;
+    if (FAILED(conversor->Initialize(quadro.Get(), GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeMedianCut))) {
+        return;
+    }
+
+    if (FAILED(contexto2d->CreateBitmapFromWicBitmap(conversor.Get(), nullptr, &bitmapLogo))) {
+        aviso("nao foi possivel preparar a logo");
+    }
+}
+
+void Renderizador::logo(const D2D1_RECT_F& area, float opacidade) {
+    d_->carregarLogo();
+    if (!d_->bitmapLogo) return;
+
+    const auto tamanho = d_->bitmapLogo->GetSize();
+    if (tamanho.width <= 0 || tamanho.height <= 0) return;
+
+    const float larguraArea = area.right - area.left;
+    const float alturaArea = area.bottom - area.top;
+    if (larguraArea <= 0 || alturaArea <= 0) return;
+
+    const float proporcao = tamanho.width / tamanho.height;
+    float largura = larguraArea;
+    float altura = largura / proporcao;
+    if (altura > alturaArea) {
+        altura = alturaArea;
+        largura = altura * proporcao;
+    }
+    const float x = area.left + (larguraArea - largura) / 2.0f;
+    const float y = area.top + (alturaArea - altura) / 2.0f;
+
+    d_->contexto2d->DrawBitmap(d_->bitmapLogo.Get(), D2D1::RectF(x, y, x + largura, y + altura),
+                               opacidade, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
 }
 
 void Renderizador::comecarQuadro() { d_->contexto2d->BeginDraw(); }

@@ -64,6 +64,10 @@ public:
     // Houve algum quadro desde que a captura começou.
     bool temQuadro() const;
 
+    // Desenha a logo, que vem embutida no próprio executável. Encaixa na área
+    // mantendo a proporção.
+    void logo(const D2D1_RECT_F& area, float opacidade = 1.0f);
+
 private:
     void desenharUltimo(const D2D1_RECT_F& area);
 

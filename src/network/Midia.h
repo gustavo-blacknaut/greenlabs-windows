@@ -31,6 +31,10 @@ public:
     using AoCandidato = std::function<void(const std::string& candidato, const std::string& mid)>;
     using AoEstado = std::function<void(const std::string& estado)>;
 
+    // O outro lado pediu um quadro-chave (PLI). Acontece quando ele entra no
+    // meio da transmissão ou perde pacote demais para se recuperar sozinho.
+    using AoPedirChave = std::function<void()>;
+
     ConexaoPar(std::string idDoPar, const ConfigMidia& config);
     ~ConexaoPar();
 
@@ -40,16 +44,33 @@ public:
     void aoDescrever(AoDescrever cb);
     void aoCandidato(AoCandidato cb);
     void aoEstado(AoEstado cb);
+    void aoPedirChave(AoPedirChave cb);
 
-    // Cria a faixa de vídeo e dispara a oferta. Quem tem a tela chama isto.
+    // Cria a faixa de vídeo. Precisa vir antes de oferecer OU de responder:
+    // uma resposta SDP não pode inventar m-line que a oferta não trouxe, então
+    // a faixa tem que existir antes de a descrição remota chegar.
+    bool prepararFaixa();
+
+    // Dispara a oferta. Quem tem a tela para mostrar chama isto.
     bool oferecer();
+
+    // Estado da conexão, em uma palavra, para a interface mostrar.
+    std::string estado() const;
+
+    // Há uma oferta nossa esperando resposta. Serve para detectar colisão:
+    // dois lados oferecendo ao mesmo tempo não conseguem se entender.
+    bool ofertaPendente() const;
 
     void receberDescricao(const std::string& tipo, const std::string& sdp);
     void receberCandidato(const std::string& candidato, const std::string& mid);
 
     // Manda um quadro já codificado. O empacotamento em RTP (RFC 6184,
     // fragmentação FU-A quando não cabe num pacote) acontece aqui dentro.
-    void enviarVideo(const uint8_t* anexoB, size_t tamanho, int64_t tempoUs);
+    //
+    // Quadros antes do primeiro quadro-chave são descartados: o decodificador
+    // do outro lado não tem como começar sem um, e mandar fatia P sozinha só
+    // gasta banda enquanto ele espera.
+    void enviarVideo(const uint8_t* anexoB, size_t tamanho, int64_t tempoUs, bool chave);
 
     bool pronto() const;
     const std::string& idDoPar() const;
