@@ -107,6 +107,7 @@ add_library(greenlabs_core STATIC
     src/capture/Cursor.cpp
     src/video/ColorConverter.cpp
     src/encoder/VideoEncoder.cpp
+    src/decoder/VideoDecoder.cpp
     src/network/WebSocketClient.cpp
     src/network/Signaling.cpp
     src/network/Midia.cpp

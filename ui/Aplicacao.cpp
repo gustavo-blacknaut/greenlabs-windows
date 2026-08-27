@@ -1,4 +1,4 @@
-#include "ui/Aplicacao.h"
+﻿#include "ui/Aplicacao.h"
 
 #include <windows.h>
 
@@ -21,6 +21,7 @@
 #include "config/Config.h"
 #include "capture/ProcessTree.h"
 #include "capture/ScreenCapture.h"
+#include "decoder/VideoDecoder.h"
 #include "encoder/VideoEncoder.h"
 #include "network/Midia.h"
 #include "network/Signaling.h"
@@ -110,6 +111,17 @@ struct Aplicacao::Interno {
     bool cursorPronto = false;
     ColorConverter conversor;
     VideoEncoder encoder;
+
+    // Recepção. O decodificador entrega NV12, que o Direct2D não sabe desenhar,
+    // então o mesmo Video Processor faz a volta para BGRA.
+    VideoDecoder decodificador;
+    ColorConverter paraExibir;
+    bool exibicaoPronta = false;
+    std::mutex travaRecebido;
+    ID3D11Texture2D* quadroRecebido = nullptr;
+    uint32_t recebidoLargura = 0;
+    uint32_t recebidoAltura = 0;
+    std::string quemTransmite;
     AudioCapture audio;
     Signaling sinal;
 
@@ -167,6 +179,7 @@ struct Aplicacao::Interno {
     std::shared_ptr<ConexaoPar> abrirMidiaPara(const std::string& peerId);
     void tratarRepasse(const std::string& de, const Json& msg);
     void enviarQuadroParaTodos(const PacoteCodificado& pacote);
+    void exibirQuadroRecebido(ID3D11Texture2D* nv12, uint32_t largura, uint32_t altura);
 
     Campo* campoFocado();
     void desenharCampo(Campo& campo, const std::wstring& rotulo);
@@ -574,6 +587,25 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
     // Quando o outro lado pede quadro-chave, quem produz é o encoder.
     conexao->aoPedirChave([this] { encoder.pedirQuadroChave(); });
 
+    // Vídeo que chega. O decodificador é um só para a sala inteira: com o
+    // servidor retransmitindo, quem transmite por vez é uma pessoa, e abrir um
+    // decodificador por conexão gastaria GPU à toa.
+    conexao->aoReceberVideo([this, peerId](const std::byte* dados, size_t tamanho) {
+        if (!decodificador.ativo()) {
+            if (!decodificador.iniciar(tela.dispositivo(),
+                                       [this](ID3D11Texture2D* nv12, uint32_t l, uint32_t a) {
+                                           exibirQuadroRecebido(nv12, l, a);
+                                       })) {
+                return;
+            }
+        }
+        quemTransmite = peerId;
+        decodificador.decodificar(reinterpret_cast<const uint8_t*>(dados), tamanho,
+                                  std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count());
+    });
+
     conexao->aoCandidato([this, peerId](const std::string& candidato, const std::string& mid) {
         Json corpo = Json::objeto();
         corpo["candidate"] = Json{candidato};
@@ -662,6 +694,34 @@ void Aplicacao::Interno::tratarRepasse(const std::string& de, const Json& msg) {
         const std::string mid = corpo.ehObjeto() ? corpo.texto("sdpMid", "0") : "0";
         if (!candidato.empty()) conexao->receberCandidato(candidato, mid);
     }
+}
+
+// exibirQuadroRecebido converte o quadro decodado e guarda para o desenho.
+//
+// Chamado da thread da rede, e o desenho acontece na thread da janela - por
+// isso a trava. Guarda só o ponteiro: a textura pertence ao conversor e vale
+// até o próximo quadro, que é o comportamento que a interface quer de qualquer
+// forma (ela desenha o mais recente).
+void Aplicacao::Interno::exibirQuadroRecebido(ID3D11Texture2D* nv12, uint32_t largura,
+                                              uint32_t altura) {
+    if (!nv12 || largura == 0 || altura == 0) return;
+
+    if (!exibicaoPronta || paraExibir.largura() != largura || paraExibir.altura() != altura) {
+        if (!paraExibir.iniciar(tela.dispositivo(), tela.contexto(), largura, altura, largura,
+                                altura, ColorConverter::Saida::Bgra)) {
+            return;
+        }
+        exibicaoPronta = true;
+        info("recebendo video {}x{}", largura, altura);
+    }
+
+    ID3D11Texture2D* bgra = paraExibir.converter(nv12);
+    if (!bgra) return;
+
+    std::lock_guard trava(travaRecebido);
+    quadroRecebido = bgra;
+    recebidoLargura = largura;
+    recebidoAltura = altura;
 }
 
 void Aplicacao::Interno::enviarQuadroParaTodos(const PacoteCodificado& pacote) {
@@ -968,14 +1028,36 @@ void Aplicacao::Interno::desenharAoVivo() {
                                    alt - tema::kEspaco - 64);
     render.retangulo(palco, tema::kPainel, tema::kRaioCartao);
 
-    // Passar quadroAtual mesmo nulo é de propósito: sem quadro novo o
-    // renderizador repinta o último. Antes a prévia apagava a cada instante em
-    // que a tela não mudava, e o resultado era piscar sem parar.
-    render.video(quadroAtual, D2D1::RectF(palco.left + 6, palco.top + 6, palco.right - 6,
-                                          palco.bottom - 6));
+    // O palco mostra quem está transmitindo. Se alguém está mandando vídeo, é
+    // esse; senão, a própria prévia de quem transmite daqui.
+    ID3D11Texture2D* doOutro = nullptr;
+    uint32_t doOutroLargura = 0;
+    {
+        std::lock_guard trava(travaRecebido);
+        doOutro = quadroRecebido;
+        doOutroLargura = recebidoLargura;
+    }
+
+    // Passar textura nula é de propósito: sem quadro novo o renderizador
+    // repinta o último. Antes a prévia apagava a cada instante em que a tela
+    // não mudava, e o resultado era piscar sem parar.
+    render.video(doOutro ? doOutro : quadroAtual,
+                 D2D1::RectF(palco.left + 6, palco.top + 6, palco.right - 6, palco.bottom - 6));
+
     if (!render.temQuadro()) {
-        render.texto(L"Aguardando o primeiro quadro…", palco, tema::kApagado, Fonte::Subtitulo,
+        const wchar_t* recado = transmitindo ? L"Aguardando o primeiro quadro…"
+                                             : L"Ninguém transmitindo ainda";
+        render.texto(recado, palco, tema::kApagado, Fonte::Subtitulo,
                      DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
+    if (doOutro && doOutroLargura > 0) {
+        const auto etiqueta = D2D1::RectF(palco.left + 18, palco.bottom - 52, palco.left + 260,
+                                          palco.bottom - 18);
+        render.retangulo(etiqueta, tema::kPainel, 10);
+        render.texto(paraW(quemTransmite.substr(0, 8)) + L" · " +
+                         std::to_wstring(doOutroLargura) + L"p",
+                     etiqueta, tema::kTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     render.contorno(palco, tema::kLinha, tema::kRaioCartao);
 

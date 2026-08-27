@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "util/Log.h"
 
@@ -68,6 +69,12 @@ struct ConexaoPar::Interno {
     AoCandidato aoCandidato;
     AoEstado aoEstado;
     AoPedirChave aoPedirChave;
+    AoReceberVideo aoReceberVideo;
+
+    // Faixas que so recebem. Precisam ser guardadas: solta-las fecha a faixa e
+    // o video para de chegar.
+    std::vector<std::shared_ptr<rtc::Track>> faixasRecebendo;
+    void montarRecepcao(const std::shared_ptr<rtc::Track>& faixa);
 
     std::atomic<bool> aberta{false};
     std::atomic<uint64_t> pacotes{0};
@@ -173,10 +180,27 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
     // ficava "conectada" com zero quadro do outro lado.
     d_->conexao->onTrack([this](std::shared_ptr<rtc::Track> faixa) {
         if (!faixa || faixa->description().type() != "video") return;
-        if (d_->faixaVideo) return;
+
+        // Ja temos a faixa de saida: esta e outra, so para receber. E o caso do
+        // servidor em modo retransmissor, que abre uma faixa por pessoa que
+        // esta transmitindo.
+        if (d_->faixaVideo) {
+            info("faixa de video para receber de {} (mid {})", d_->par.substr(0, 8),
+                 faixa->mid());
+            d_->montarRecepcao(faixa);
+            d_->faixasRecebendo.push_back(std::move(faixa));
+            return;
+        }
+
         info("faixa de video recebida da oferta de {} (mid {})", d_->par.substr(0, 8),
              faixa->mid());
+
+        // O empacotador PRIMEIRO: ele usa setMediaHandler, que substitui a
+        // cadeia inteira. Ligar o remontador antes fazia ele ser apagado em
+        // seguida, e o video que chegava nunca virava quadro.
+        auto copia = faixa;
         d_->montarEmpacotador(std::move(faixa));
+        d_->montarRecepcao(copia);
     });
 
     d_->conexao->onStateChange([this](rtc::PeerConnection::State estado) {
@@ -207,6 +231,7 @@ void ConexaoPar::aoDescrever(AoDescrever cb) { d_->aoDescrever = std::move(cb); 
 void ConexaoPar::aoCandidato(AoCandidato cb) { d_->aoCandidato = std::move(cb); }
 void ConexaoPar::aoEstado(AoEstado cb) { d_->aoEstado = std::move(cb); }
 void ConexaoPar::aoPedirChave(AoPedirChave cb) { d_->aoPedirChave = std::move(cb); }
+void ConexaoPar::aoReceberVideo(AoReceberVideo cb) { d_->aoReceberVideo = std::move(cb); }
 
 bool ConexaoPar::pronto() const { return d_->aberta.load(); }
 bool ConexaoPar::ofertaPendente() const { return d_->esperandoResposta.load(); }
@@ -229,6 +254,22 @@ std::string ConexaoPar::caminhos() const {
         saida += tipo;
     }
     return saida;
+}
+
+// montarRecepcao liga o remontador e o consumidor do video que chega.
+//
+// Os pacotes RTP chegam picados: um quadro-chave de 200 KB vira umas 170
+// remessas de 1200 bytes. O H264RtpDepacketizer junta de volta e devolve o
+// quadro inteiro em Annex-B, que e exatamente o formato que o decodificador
+// espera.
+void ConexaoPar::Interno::montarRecepcao(const std::shared_ptr<rtc::Track>& faixa) {
+    auto remontador = std::make_shared<rtc::H264RtpDepacketizer>(
+        rtc::NalUnit::Separator::LongStartSequence);
+    faixa->chainMediaHandler(remontador);
+
+    faixa->onFrame([this](rtc::binary dados, rtc::FrameInfo) {
+        if (aoReceberVideo && !dados.empty()) aoReceberVideo(dados.data(), dados.size());
+    });
 }
 
 void ConexaoPar::Interno::montarEmpacotador(std::shared_ptr<rtc::Track> faixa) {

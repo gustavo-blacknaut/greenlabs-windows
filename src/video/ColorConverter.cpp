@@ -38,7 +38,8 @@ ColorConverter::~ColorConverter() = default;
 
 bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto,
                              uint32_t larguraEntrada, uint32_t alturaEntrada,
-                             uint32_t larguraSaida, uint32_t alturaSaida) {
+                             uint32_t larguraSaida, uint32_t alturaSaida,
+                             Saida formatoSaida) {
     d_->dispositivo = dispositivo;
     d_->contexto = contexto;
     d_->larguraEntrada = larguraEntrada;
@@ -87,7 +88,8 @@ bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* con
     saida.Height = d_->altura;
     saida.MipLevels = 1;
     saida.ArraySize = 1;
-    saida.Format = DXGI_FORMAT_NV12;
+    saida.Format = (formatoSaida == Saida::Bgra) ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                                 : DXGI_FORMAT_NV12;
     saida.SampleDesc.Count = 1;
     saida.Usage = D3D11_USAGE_DEFAULT;
     // SHADER_RESOURCE junto com VIDEO_ENCODER: o encoder por hardware lê como
