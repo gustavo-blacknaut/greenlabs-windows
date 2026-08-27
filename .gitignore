@@ -9,3 +9,5 @@ out/
 *.ilk
 .vs/
 CMakeUserPresets.json
+
+# Configuracao local de ferramenta; nao vai para o repositorio.

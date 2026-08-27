@@ -42,6 +42,10 @@ public:
     // meio da transmissão ou perde pacote demais para se recuperar sozinho.
     using AoPedirChave = std::function<void()>;
 
+    // Chegou vídeo do outro lado, já remontado em Annex-B - o mesmo formato que
+    // o encoder produz e que o decodificador consome.
+    using AoReceberVideo = std::function<void(const std::byte* dados, size_t tamanho)>;
+
     ConexaoPar(std::string idDoPar, const ConfigMidia& config);
     ~ConexaoPar();
 
@@ -52,6 +56,7 @@ public:
     void aoCandidato(AoCandidato cb);
     void aoEstado(AoEstado cb);
     void aoPedirChave(AoPedirChave cb);
+    void aoReceberVideo(AoReceberVideo cb);
 
     // Cria a faixa de vídeo. Precisa vir antes de oferecer OU de responder:
     // uma resposta SDP não pode inventar m-line que a oferta não trouxe, então

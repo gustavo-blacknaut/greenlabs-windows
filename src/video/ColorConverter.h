@@ -30,14 +30,19 @@ public:
 
     // largura e altura de saída podem diferir da entrada: o Video Processor
     // redimensiona de graça, no mesmo passo da conversão.
+    // formatoSaida escolhe entre NV12 (o que o encoder consome) e BGRA (o que
+    // o Direct2D sabe desenhar). O mesmo Video Processor faz os dois sentidos,
+    // e no caminho de exibição a conversão é de NV12 para BGRA.
+    enum class Saida { Nv12, Bgra };
+
     bool iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto,
                  uint32_t larguraEntrada, uint32_t alturaEntrada,
-                 uint32_t larguraSaida, uint32_t alturaSaida);
+                 uint32_t larguraSaida, uint32_t alturaSaida,
+                 Saida formatoSaida = Saida::Nv12);
 
-    // Converte para NV12. A textura devolvida pertence ao conversor e é
-    // reaproveitada a cada quadro — o encoder precisa consumi-la antes da
-    // próxima chamada.
-    ID3D11Texture2D* converter(ID3D11Texture2D* entradaBgra);
+    // A textura devolvida pertence ao conversor e é reaproveitada a cada
+    // quadro — quem consome precisa fazê-lo antes da próxima chamada.
+    ID3D11Texture2D* converter(ID3D11Texture2D* entrada);
 
     uint32_t largura() const;
     uint32_t altura() const;
