@@ -48,18 +48,22 @@ namespace {
 // Ele participa da sala, mas nao e uma pessoa.
 constexpr const char* kIdDoSFU = "sfu";
 
-// Áudio desligado.
+// A thread do WASAPI é de tempo real: ela não pode alocar, travar nem esperar
+// por ninguém. Cada uma dessas coisas estava acontecendo, e o efeito não ficava
+// contido no áudio - a captura atrasava, o transporte engasgava, e o ping
+// chegou a 679 ms com o servidor no mesmo país.
 //
-// Ele entrou nesta sessão e degradou tudo: com ele a imagem trava, o som
-// pica e o ping chega a 679 ms com o servidor no mesmo país. Tentei quatro
-// correções seguidas - trava compartilhada, alocação em thread de tempo real,
-// carimbo de sincronização, envio fora da thread do WASAPI - e cada uma
-// resolveu o que apontava sem devolver a fluidez.
-//
-// Com ele desligado o cliente volta ao comportamento da 0.1.x, que estava
-// liso. O código fica: o que falta é medir onde o tempo vai, e isso eu não
-// faço na chamada de quem está usando.
-constexpr bool kAudioLigado = false;
+// Daí o anel abaixo, de tamanho fixo e sem trava: a captura escreve num espaço
+// que já existe e segue adiante. Quem envia é outra thread.
+constexpr size_t kEspacosAudio = 32;
+constexpr size_t kMaxPacoteAudio = 1500;
+
+struct PacoteAudio {
+    uint8_t dados[kMaxPacoteAudio];
+    size_t tamanho = 0;
+    int64_t tempoUs = 0;
+};
+constexpr bool kAudioLigado = true;
 
 const wchar_t* kClasse = L"GreenLabsJanela";
 
@@ -157,10 +161,17 @@ struct Aplicacao::Interno {
     // o send faz criptografia e escrita no socket, e fazer isso ali trava a
     // captura (que sai como estalo) e ocupa o transporte (que atrasa o video).
     // A thread de captura so enfileira; quem envia e esta aqui.
-    std::mutex travaFilaAudio;
-    std::condition_variable temAudio;
-    std::vector<std::vector<uint8_t>> filaAudio;
-    std::vector<int64_t> temposAudio;
+    // Anel de tamanho fixo. Escrita e leitura andam sozinhas; quando a escrita
+    // alcança a leitura, o pacote mais velho é sobrescrito - áudio atrasado não
+    // serve, e esperar por espaço travaria a captura.
+    PacoteAudio anelAudio[kEspacosAudio];
+    std::atomic<uint64_t> escritaAudio{0};
+    std::atomic<uint64_t> leituraAudio{0};
+
+    std::atomic<int64_t> picoAudioUs{0};
+    std::atomic<int64_t> somaAudioUs{0};
+    std::atomic<uint64_t> chamadasAudio{0};
+    std::chrono::steady_clock::time_point marcaAudio = std::chrono::steady_clock::now();
     std::thread threadAudio;
     std::atomic<bool> enviandoAudio{false};
     void lacoEnvioAudio();
@@ -364,6 +375,14 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     }
 
     Signaling::Ouvintes ouvintes;
+    // Saida de audio e decodificador de pe antes de qualquer pacote chegar.
+    // Abrir COM e criar thread dentro do callback da rede e trabalho pesado no
+    // pior lugar possivel.
+    if (kAudioLigado) {
+        d_->audioDec.iniciar();
+        d_->alto.iniciar();
+    }
+
     ouvintes.aoSaberDoModo = [this](bool sfu) {
         d_->modoSfu.store(sfu);
         if (sfu) info("servidor retransmitindo: nao vou oferecer para os participantes");
@@ -504,6 +523,17 @@ void Aplicacao::Interno::bombearCaptura() {
             break;
     }
 
+    if (kAudioLigado && chamadasAudio.load() > 0) {
+        const auto agoraA = std::chrono::steady_clock::now();
+        if (agoraA - marcaAudio >= std::chrono::seconds(5)) {
+            marcaAudio = agoraA;
+            info("audio na thread de tempo real: pico {} us, media {} us, {} chamadas",
+                 picoAudioUs.load(),
+                 somaAudioUs.load() / static_cast<int64_t>(chamadasAudio.load()),
+                 chamadasAudio.load());
+        }
+    }
+
     const auto agora = std::chrono::steady_clock::now();
     const auto decorrido = std::chrono::duration<double>(agora - marcaFps).count();
     if (decorrido >= 1.0) {
@@ -549,6 +579,7 @@ bool Aplicacao::Interno::comecarTransmissao() {
     // reaproveita os proprios buffers justamente por isso.
     if (kAudioLigado) audioEnc.iniciar();
     if (kAudioLigado) audio.iniciar(excluir, [this](const float* pcm, uint32_t quadros) {
+        const auto t0 = std::chrono::steady_clock::now();
         const auto& pacote = audioEnc.codificar(pcm, quadros);
         if (pacote.empty()) return;  // ainda nao fechou 20 ms
 
@@ -560,7 +591,6 @@ bool Aplicacao::Interno::comecarTransmissao() {
             std::lock_guard trava(travaConexoes);
             if (destinosAudio.size() != conexoes.size()) {
                 enviandoAudio.store(false);
-    temAudio.notify_all();
     if (threadAudio.joinable()) threadAudio.join();
 
     decodificando.store(false);
@@ -570,11 +600,8 @@ bool Aplicacao::Interno::comecarTransmissao() {
         std::lock_guard t(travaFilaVideo);
         filaVideo.clear();
     }
-    {
-        std::lock_guard t(travaFilaAudio);
-        filaAudio.clear();
-        temposAudio.clear();
-    }
+    escritaAudio.store(0);
+    leituraAudio.store(0);
     destinosAudio.clear();
     destinosVideo.clear();
                 destinosAudio.reserve(conexoes.size());
@@ -610,6 +637,11 @@ bool Aplicacao::Interno::comecarTransmissao() {
 void Aplicacao::Interno::pararTransmissao() {
     if (!transmitindo) return;
     transmitindo = false;
+    if (kAudioLigado && chamadasAudio.load() > 0) {
+        info("audio na thread de tempo real: pico {} us, media {} us em {} chamadas",
+             picoAudioUs.load(), somaAudioUs.load() / static_cast<int64_t>(chamadasAudio.load()),
+             chamadasAudio.load());
+    }
     encoder.parar();
     audio.parar();
     audioEnc.parar();
@@ -715,9 +747,7 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
     // servidor retransmitindo, quem transmite por vez é uma pessoa, e abrir um
     // decodificador por conexão gastaria GPU à toa.
     conexao->aoReceberAudio([this](const std::byte* dados, size_t tamanho) {
-        if (!kAudioLigado) return;
-        if (!audioDec.ativo() && !audioDec.iniciar()) return;
-        if (!alto.ativo() && !alto.iniciar()) return;
+        if (!kAudioLigado || !audioDec.ativo() || !alto.ativo()) return;
 
         const auto& pcm = audioDec.decodificar(reinterpret_cast<const uint8_t*>(dados), tamanho);
         if (!pcm.empty()) alto.enfileirar(pcm.data(), static_cast<uint32_t>(pcm.size() / 2));
@@ -901,22 +931,30 @@ void Aplicacao::Interno::lacoDecodificacao() {
 }
 
 void Aplicacao::Interno::lacoEnvioAudio() {
-    std::vector<uint8_t> pacote;
+    uint8_t pacote[kMaxPacoteAudio];
+    size_t tamanho = 0;
     int64_t tempo = 0;
 
     while (enviandoAudio.load()) {
-        {
-            std::unique_lock t(travaFilaAudio);
-            temAudio.wait_for(t, std::chrono::milliseconds(100),
-                              [this] { return !filaAudio.empty() || !enviandoAudio.load(); });
-            if (!enviandoAudio.load()) return;
-            if (filaAudio.empty()) continue;
+        const uint64_t fim = escritaAudio.load(std::memory_order_acquire);
+        uint64_t inicio = leituraAudio.load(std::memory_order_relaxed);
 
-            pacote.swap(filaAudio.front());
-            tempo = temposAudio.front();
-            filaAudio.erase(filaAudio.begin());
-            temposAudio.erase(temposAudio.begin());
+        if (inicio == fim) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
         }
+
+        // Ficou para trás mais que o anel: pula para o mais recente. Mandar
+        // áudio velho só aumenta o atraso de quem ouve.
+        if (fim - inicio > kEspacosAudio) inicio = fim - 1;
+
+        {
+            const PacoteAudio& espaco = anelAudio[inicio % kEspacosAudio];
+            tamanho = espaco.tamanho;
+            tempo = espaco.tempoUs;
+            memcpy(pacote, espaco.dados, tamanho);
+        }
+        leituraAudio.store(inicio + 1, std::memory_order_relaxed);
 
         {
             std::lock_guard trava(travaConexoes);
@@ -929,7 +967,7 @@ void Aplicacao::Interno::lacoEnvioAudio() {
             }
         }
         for (auto& conexao : destinosAudio) {
-            conexao->enviarAudio(pacote.data(), pacote.size(), tempo);
+            conexao->enviarAudio(pacote, tamanho, tempo);
         }
     }
 }

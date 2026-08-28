@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <d3d10_1.h>
 #include <d3d11.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -60,6 +61,12 @@ struct VideoDecoder::Interno {
     std::string nome;
     bool iniciado = false;
     bool tipoSaidaPronto = false;
+    bool assincrono = false;
+    bool avisouCaminho = false;
+    bool hardware = false;
+    ComPtr<IMFMediaEventGenerator> eventos;
+    int entradasPedidas = 0;
+    void drenarEventos();
     UINT resetToken = 0;
 
     std::atomic<uint64_t> quadros{0};
@@ -99,8 +106,11 @@ bool VideoDecoder::iniciar(ID3D11Device* dispositivo, Consumidor consumidor) {
     // costuma devolver o de software antes, e a maquina decodifica na CPU sem
     // ninguem perceber.
     for (int passada = 0; passada < 2 && !d_->transformador; ++passada) {
+        // Todo decodificador de hardware e ASSINCRONO. Pedir so HARDWARE nao
+        // acha nenhum, a busca cai na segunda passada e a maquina decodifica na
+        // CPU com a placa parada do lado - foi o que aconteceu aqui.
         UINT32 flags = MFT_ENUM_FLAG_SORTANDFILTER;
-        flags |= (passada == 0) ? MFT_ENUM_FLAG_HARDWARE
+        flags |= (passada == 0) ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT)
                                 : (MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT);
 
         IMFActivate** ativadores = nullptr;
@@ -115,6 +125,7 @@ bool VideoDecoder::iniciar(ID3D11Device* dispositivo, Consumidor consumidor) {
             if (!d_->transformador &&
                 SUCCEEDED(ativadores[i]->ActivateObject(IID_PPV_ARGS(&d_->transformador)))) {
                 d_->nome = nomeDoAtivador(ativadores[i]);
+                d_->hardware = (passada == 0);
             }
             ativadores[i]->Release();
         }
@@ -124,6 +135,18 @@ bool VideoDecoder::iniciar(ID3D11Device* dispositivo, Consumidor consumidor) {
     if (!d_->transformador) {
         erro("nenhum decodificador de H.264 disponivel nesta maquina");
         return false;
+    }
+
+    // Protecao multithread no dispositivo D3D11. O Media Foundation usa o
+    // dispositivo de outra thread que nao a nossa; sem esta marca ele RECUSA a
+    // aceleracao e cai para software sem dizer nada - e por isso que o log
+    // mostrava "Microsoft H264 Video Decoder MFT" decodificando na CPU com uma
+    // RX 590 parada do lado.
+    {
+        ComPtr<ID3D10Multithread> multithread;
+        if (SUCCEEDED(d_->dispositivo.As(&multithread))) {
+            multithread->SetMultithreadProtected(TRUE);
+        }
     }
 
     // Compartilha o dispositivo D3D11 com o MFT: e o que faz a saida vir como
@@ -142,6 +165,15 @@ bool VideoDecoder::iniciar(ID3D11Device* dispositivo, Consumidor consumidor) {
     if (SUCCEEDED(d_->transformador->GetAttributes(&atributos))) {
         atributos->SetUINT32(MF_LOW_LATENCY, TRUE);
         atributos->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
+
+        // MFT de hardware nasce trancado: sem destravar, o ProcessInput
+        // devolve erro e nenhum quadro entra.
+        UINT32 assincrono = 0;
+        if (SUCCEEDED(atributos->GetUINT32(MF_TRANSFORM_ASYNC, &assincrono)) && assincrono) {
+            atributos->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+            d_->assincrono = true;
+            d_->transformador.As(&d_->eventos);
+        }
     }
 
     ComPtr<IMFMediaType> tipoEntrada;
@@ -160,11 +192,15 @@ bool VideoDecoder::iniciar(ID3D11Device* dispositivo, Consumidor consumidor) {
     // SPS e sabe a resolucao. Aqui a tentativa costuma falhar, e nao e erro.
     d_->escolherTipoSaida();
 
+    if (d_->assincrono) {
+        d_->transformador->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    }
     d_->transformador->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     d_->transformador->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
     d_->iniciado = true;
-    info("decodificador H.264: {}", d_->nome);
+    info("decodificador H.264: {} ({}, {})", d_->nome, d_->hardware ? "hardware" : "software",
+         d_->assincrono ? "assincrono" : "sincrono");
     return true;
 }
 
@@ -277,7 +313,12 @@ void VideoDecoder::Interno::colherSaida() {
         // software ser descartado em silencio - o decodificador subia, dizia o
         // nome no log, e nenhuma imagem aparecia.
         ComPtr<IMFDXGIBuffer> dxgi;
-        if (SUCCEEDED(buffer.As(&dxgi))) {
+        const bool naGpu = SUCCEEDED(buffer.As(&dxgi));
+        if (!avisouCaminho) {
+            avisouCaminho = true;
+            info("decodificacao {}", naGpu ? "na GPU" : "na CPU (sem aceleracao)");
+        }
+        if (naGpu) {
             ComPtr<ID3D11Texture2D> textura;
             if (FAILED(dxgi->GetResource(IID_PPV_ARGS(&textura)))) continue;
 
@@ -314,8 +355,39 @@ void VideoDecoder::Interno::colherSaida() {
     }
 }
 
+// drenarEventos le o que o MFT assincrono tem a dizer, sem bloquear.
+//
+// NO_WAIT e obrigatorio: sem ele o GetEvent espera indefinidamente e trava a
+// thread inteira. Foi assim que o encoder travou o processo antes.
+void VideoDecoder::Interno::drenarEventos() {
+    if (!assincrono || !eventos) return;
+
+    for (;;) {
+        ComPtr<IMFMediaEvent> evento;
+        if (FAILED(eventos->GetEvent(MF_EVENT_FLAG_NO_WAIT, &evento)) || !evento) return;
+
+        MediaEventType tipo = MEUnknown;
+        if (FAILED(evento->GetType(&tipo))) continue;
+
+        if (tipo == METransformNeedInput) {
+            ++entradasPedidas;
+        } else if (tipo == METransformHaveOutput) {
+            colherSaida();
+        }
+    }
+}
+
 void VideoDecoder::decodificar(const uint8_t* dados, size_t tamanho, int64_t tempoUs) {
     if (!d_->iniciado || !dados || tamanho == 0) return;
+
+    d_->drenarEventos();
+
+    // Assincrono so aceita entrada depois de pedir. Empurrar sem pedido devolve
+    // erro e o quadro se perde.
+    if (d_->assincrono) {
+        if (d_->entradasPedidas <= 0) return;
+        --d_->entradasPedidas;
+    }
 
     ComPtr<IMFMediaBuffer> buffer;
     if (FAILED(::MFCreateMemoryBuffer(static_cast<DWORD>(tamanho), &buffer))) return;
@@ -337,14 +409,15 @@ void VideoDecoder::decodificar(const uint8_t* dados, size_t tamanho, int64_t tem
     const HRESULT resultado = d_->transformador->ProcessInput(0, amostra.Get(), 0);
     if (resultado == MF_E_NOTACCEPTING) {
         d_->entradasRecusadas++;
-        // Ainda tem quadro pronto esperando: colhe e tenta de novo uma vez.
         d_->colherSaida();
         d_->transformador->ProcessInput(0, amostra.Get(), 0);
     } else if (FAILED(resultado)) {
         return;
     }
 
-    d_->colherSaida();
+    // No assincrono quem manda colher e o evento, nao nos.
+    if (d_->assincrono) d_->drenarEventos();
+    else d_->colherSaida();
     d_->relatar();
 }
 
