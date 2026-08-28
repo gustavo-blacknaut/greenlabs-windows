@@ -10,6 +10,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <cmath>
 #include <vector>
 
 #include "audio/AudioCodec.h"
@@ -43,6 +44,11 @@ struct AudioPlayer::Interno {
     std::mutex trava;
     std::vector<float> fila;
     bool enchendo = true;
+
+    // Última amostra tocada e se voltamos de um silêncio: é com isso que as
+    // emendas viram rampa em vez de degrau.
+    float ultimo = 0.0f;
+    bool retomando = true;
 
     std::atomic<bool> rodando{false};
     std::thread thread;
@@ -140,15 +146,54 @@ void AudioPlayer::Interno::laco() {
 
             copiadas = fila.size() < querem ? fila.size() : querem;
             if (copiadas > 0) {
-                memcpy(destino, fila.data(), copiadas * sizeof(float));
+                float* saida = reinterpret_cast<float*>(destino);
+                memcpy(saida, fila.data(), copiadas * sizeof(float));
                 fila.erase(fila.begin(), fila.begin() + copiadas);
+
+                // Continuidade: começar do zero depois de um silêncio é um
+                // degrau na onda, e degrau é estalo. Sobe do último valor
+                // tocado ao longo de 5 ms.
+                if (retomando) {
+                    const size_t rampa = (kAmostrasPorMs * 5 < copiadas) ? kAmostrasPorMs * 5
+                                                                         : copiadas;
+                    for (size_t i = 0; i < rampa; ++i) {
+                        const float f = static_cast<float>(i) / static_cast<float>(rampa);
+                        saida[i] = ultimo * (1.0f - f) + saida[i] * f;
+                    }
+                    retomando = false;
+                }
+
+                // O Opus pode devolver amostra além de 1.0, e o WASAPI corta
+                // seco no float - corte seco é distorção. Aqui a passagem é
+                // suave: só o que passa de 0,95 é comprimido.
+                for (size_t i = 0; i < copiadas; ++i) {
+                    const float v = saida[i];
+                    if (v > 0.95f) {
+                        saida[i] = 0.95f + (1.0f - 0.95f) * std::tanh((v - 0.95f) / 0.05f);
+                    } else if (v < -0.95f) {
+                        saida[i] = -0.95f - (1.0f - 0.95f) * std::tanh((-v - 0.95f) / 0.05f);
+                    }
+                }
+                ultimo = saida[copiadas - 1];
             }
         }
 
         // Faltou som para encher: o resto vai em silêncio. Melhor um instante
         // mudo que repetir o buffer anterior, que sai como zumbido.
         if (copiadas < querem) {
-            memset(destino + copiadas * sizeof(float), 0, (querem - copiadas) * sizeof(float));
+            // Desce até o silêncio em vez de cortar: um corte no meio da onda
+            // é exatamente o estalo que se ouve.
+            float* saida = reinterpret_cast<float*>(destino);
+            const size_t faltam = querem - copiadas;
+            const size_t rampa = (kAmostrasPorMs * 5 < faltam) ? kAmostrasPorMs * 5 : faltam;
+            for (size_t i = 0; i < rampa; ++i) {
+                const float f = 1.0f - static_cast<float>(i) / static_cast<float>(rampa);
+                saida[copiadas + i] = ultimo * f;
+            }
+            memset(destino + (copiadas + rampa) * sizeof(float), 0,
+                   (faltam - rampa) * sizeof(float));
+            ultimo = 0.0f;
+            retomando = true;
 
             // Secou: volta a encher antes de tocar de novo. Continuar tocando
             // uma fila vazia produz um estalo a cada ciclo.
@@ -175,6 +220,8 @@ void AudioPlayer::enfileirar(const float* intercalado, uint32_t quadros) {
         const size_t sobra = d_->fila.size() + entram - kMaxAmostras;
         const size_t tirar = sobra < d_->fila.size() ? sobra : d_->fila.size();
         d_->fila.erase(d_->fila.begin(), d_->fila.begin() + tirar);
+        // A emenda do descarte tambem precisa de rampa.
+        d_->retomando = true;
     }
     d_->fila.insert(d_->fila.end(), intercalado, intercalado + entram);
 }

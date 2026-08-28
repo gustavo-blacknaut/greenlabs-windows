@@ -13,7 +13,14 @@ struct AudioEncoder::Interno {
 
     // O WASAPI entrega o que tem, não múltiplos de 20 ms. Aqui se junta até
     // fechar um quadro; o que sobra fica para a próxima chamada.
-    std::vector<float> acumulado;
+    //
+    // Buffer fixo, e não vector: isto roda na thread de tempo real do áudio, e
+    // tanto o insert (que pode realocar) quanto o erase (que faz memmove do
+    // resto) custam caro num lugar que não pode custar nada. Cabem dois quadros
+    // com folga, que é mais do que o WASAPI entrega de uma vez.
+    static constexpr size_t kCapacidade = kQuadrosPorPacote * kCanaisAudio * 4;
+    float acumulado[kCapacidade];
+    size_t usado = 0;
     std::vector<uint8_t> saida;
 };
 
@@ -37,7 +44,7 @@ bool AudioEncoder::iniciar(uint32_t bitrate) {
     ::opus_encoder_ctl(d_->enc, OPUS_SET_COMPLEXITY(5));
     ::opus_encoder_ctl(d_->enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
 
-    d_->acumulado.reserve(kQuadrosPorPacote * kCanaisAudio * 2);
+    d_->usado = 0;
     d_->saida.resize(4000);
     info("audio: Opus {} kbps, {} Hz, {} canais", bitrate / 1000, kTaxaAudio, kCanaisAudio);
     return true;
@@ -47,7 +54,7 @@ void AudioEncoder::parar() {
     if (!d_->enc) return;
     ::opus_encoder_destroy(d_->enc);
     d_->enc = nullptr;
-    d_->acumulado.clear();
+    d_->usado = 0;
 }
 
 bool AudioEncoder::ativo() const { return d_->enc != nullptr; }
@@ -56,21 +63,29 @@ const std::vector<uint8_t>& AudioEncoder::codificar(const float* intercalado, ui
     static const std::vector<uint8_t> vazio;
     if (!d_->enc || !intercalado || quadros == 0) return vazio;
 
-    d_->acumulado.insert(d_->acumulado.end(), intercalado,
-                         intercalado + static_cast<size_t>(quadros) * kCanaisAudio);
+    const size_t entram = static_cast<size_t>(quadros) * kCanaisAudio;
+
+    // Não cabe: o consumidor está atrasado. Descartar o que já havia é melhor
+    // que crescer o buffer - som velho não interessa e atraso não se recupera.
+    if (d_->usado + entram > Interno::kCapacidade) d_->usado = 0;
+    if (entram > Interno::kCapacidade) return vazio;
+
+    memcpy(d_->acumulado + d_->usado, intercalado, entram * sizeof(float));
+    d_->usado += entram;
 
     const size_t precisa = static_cast<size_t>(kQuadrosPorPacote) * kCanaisAudio;
-    if (d_->acumulado.size() < precisa) return vazio;
+    if (d_->usado < precisa) return vazio;
 
     // O buffer de saída volta ao tamanho de trabalho antes de cada chamada: o
     // resize do fim da função encolhe, e opus_encode precisa do espaço todo.
     if (d_->saida.size() < 4000) d_->saida.resize(4000);
 
-    const int bytes = ::opus_encode_float(d_->enc, d_->acumulado.data(), kQuadrosPorPacote,
+    const int bytes = ::opus_encode_float(d_->enc, d_->acumulado, kQuadrosPorPacote,
                                           d_->saida.data(),
                                           static_cast<opus_int32>(d_->saida.size()));
 
-    d_->acumulado.erase(d_->acumulado.begin(), d_->acumulado.begin() + precisa);
+    d_->usado -= precisa;
+    if (d_->usado > 0) memmove(d_->acumulado, d_->acumulado + precisa, d_->usado * sizeof(float));
 
     if (bytes <= 0) return vazio;
 

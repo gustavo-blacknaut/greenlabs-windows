@@ -21,11 +21,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "GreenCodes"
             VALUE "FileDescription",  "GreenLabs Live Streaming"
-            VALUE "FileVersion",      "0.2.7"
+            VALUE "FileVersion",      "0.3.2"
             VALUE "InternalName",     "GreenLabs"
             VALUE "OriginalFilename", "GreenLabs.exe"
             VALUE "ProductName",      "GreenLabs"
-            VALUE "ProductVersion",   "0.2.7"
+            VALUE "ProductVersion",   "0.3.2"
         END
     END
     BLOCK "VarFileInfo"
