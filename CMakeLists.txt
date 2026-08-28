@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(GreenLabs
-    VERSION 0.0.1
+    VERSION 0.2.7
     DESCRIPTION "Cliente nativo do GreenLabs Live Streaming"
     LANGUAGES C CXX)
 
@@ -79,6 +79,17 @@ set(MbedX509_LIBRARY   "${_mbed_dir}/${_mbed_pre}mbedx509${_mbed_suf}"   CACHE F
 set(MbedTLS_VERSION    "3.6.2" CACHE STRING "" FORCE)
 set(MbedTLS_FOUND      TRUE     CACHE BOOL   "" FORCE)
 
+# Opus para o áudio. O Windows traz decodificador de Opus, mas não
+# codificador - e sem codificar não há o que mandar.
+set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(opus
+    GIT_REPOSITORY https://github.com/xiph/opus.git
+    GIT_TAG        v1.5.2
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(opus)
+
 FetchContent_Declare(libdatachannel
     GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
     GIT_TAG        v0.24.5
@@ -108,6 +119,8 @@ add_library(greenlabs_core STATIC
     src/video/ColorConverter.cpp
     src/encoder/VideoEncoder.cpp
     src/decoder/VideoDecoder.cpp
+    src/audio/AudioCodec.cpp
+    src/audio/AudioPlayer.cpp
     src/network/WebSocketClient.cpp
     src/network/Signaling.cpp
     src/network/Midia.cpp
@@ -119,6 +132,9 @@ add_library(greenlabs_core STATIC
 target_include_directories(greenlabs_core PUBLIC src ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_definitions(greenlabs_core PUBLIC
+    # A versao vinha escrita a mao no codigo e no .rc, e ficou em 0.0.1 por
+    # meses. Sai daqui agora, de um lugar so.
+    GREENLABS_VERSAO="${PROJECT_VERSION}"
     UNICODE
     _UNICODE
     NOMINMAX                # senao windows.h define min/max como macro
@@ -127,6 +143,7 @@ target_compile_definitions(greenlabs_core PUBLIC
 )
 
 target_link_libraries(greenlabs_core PUBLIC
+    opus
     LibDataChannel::LibDataChannelStatic  # ICE, DTLS, SRTP e empacotamento RTP
     d3d11         # dispositivo grafico da duplicacao
     dxgi          # Desktop Duplication

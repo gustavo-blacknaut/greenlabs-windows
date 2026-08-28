@@ -44,7 +44,15 @@ public:
 
     // Chegou vídeo do outro lado, já remontado em Annex-B - o mesmo formato que
     // o encoder produz e que o decodificador consome.
-    using AoReceberVideo = std::function<void(const std::byte* dados, size_t tamanho)>;
+    // O segundo argumento e o identificador da faixa, que o servidor monta
+    // como "greenlabs-<8 primeiros do dono>-video". E por ele que da para
+    // saber de QUEM e o video quando o servidor retransmite - o metadado com
+    // nome nao chega nesse modo, porque as pessoas nao falam entre si.
+    using AoReceberVideo =
+        std::function<void(const std::byte* dados, size_t tamanho, const std::string& faixaId)>;
+
+    // Áudio Opus que chega, um pacote de 20 ms por chamada.
+    using AoReceberAudio = std::function<void(const std::byte* dados, size_t tamanho)>;
 
     ConexaoPar(std::string idDoPar, const ConfigMidia& config);
     ~ConexaoPar();
@@ -57,6 +65,15 @@ public:
     void aoEstado(AoEstado cb);
     void aoPedirChave(AoPedirChave cb);
     void aoReceberVideo(AoReceberVideo cb);
+    void aoReceberAudio(AoReceberAudio cb);
+
+    // Manda um pacote Opus já codificado. Sem faixa de áudio negociada, não faz
+    // nada - o vídeo continua indo normalmente.
+    // tempoUs vem do MESMO relogio do video. Os dois carimbos precisam sair da
+    // mesma base: o receptor alinha audio e video pelos relatorios RTCP, e com
+    // bases diferentes ele segura o video esperando o audio - vira segundos de
+    // atraso sem erro nenhum aparecer.
+    void enviarAudio(const uint8_t* dados, size_t tamanho, int64_t tempoUs);
 
     // Cria a faixa de vídeo. Precisa vir antes de oferecer OU de responder:
     // uma resposta SDP não pode inventar m-line que a oferta não trouxe, então

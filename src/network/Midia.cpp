@@ -16,6 +16,8 @@ namespace {
 
 // Payload type que usamos quando somos nós que oferecemos. Quando respondemos,
 // o número vem da oferta do outro lado — ver escolherH264().
+constexpr int kPayloadOpus = 111;
+constexpr uint32_t kRelogioAudio = 48000;
 constexpr int kPayloadH264 = 96;
 constexpr uint32_t kRelogioVideo = 90000;  // o relógio de vídeo do RTP é sempre 90 kHz
 
@@ -70,6 +72,12 @@ struct ConexaoPar::Interno {
     AoEstado aoEstado;
     AoPedirChave aoPedirChave;
     AoReceberVideo aoReceberVideo;
+    AoReceberAudio aoReceberAudio;
+
+    std::shared_ptr<rtc::Track> faixaAudio;
+    std::shared_ptr<rtc::RtpPacketizationConfig> empacotamentoAudio;
+    uint32_t carimboAudio = 0;
+    void montarAudio(std::shared_ptr<rtc::Track> faixa);
 
     // Faixas que so recebem. Precisam ser guardadas: solta-las fecha a faixa e
     // o video para de chegar.
@@ -179,7 +187,13 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
     // nenhuma m-line da oferta e o vídeo simplesmente não sairia - a conexão
     // ficava "conectada" com zero quadro do outro lado.
     d_->conexao->onTrack([this](std::shared_ptr<rtc::Track> faixa) {
-        if (!faixa || faixa->description().type() != "video") return;
+        if (!faixa) return;
+
+        if (faixa->description().type() == "audio") {
+            d_->montarAudio(std::move(faixa));
+            return;
+        }
+        if (faixa->description().type() != "video") return;
 
         // Ja temos a faixa de saida: esta e outra, so para receber. E o caso do
         // servidor em modo retransmissor, que abre uma faixa por pessoa que
@@ -232,6 +246,30 @@ void ConexaoPar::aoCandidato(AoCandidato cb) { d_->aoCandidato = std::move(cb); 
 void ConexaoPar::aoEstado(AoEstado cb) { d_->aoEstado = std::move(cb); }
 void ConexaoPar::aoPedirChave(AoPedirChave cb) { d_->aoPedirChave = std::move(cb); }
 void ConexaoPar::aoReceberVideo(AoReceberVideo cb) { d_->aoReceberVideo = std::move(cb); }
+void ConexaoPar::aoReceberAudio(AoReceberAudio cb) { d_->aoReceberAudio = std::move(cb); }
+
+void ConexaoPar::enviarAudio(const uint8_t* dados, size_t tamanho, int64_t tempoUs) {
+    auto faixa = d_->faixaAudio;
+    if (!faixa || !faixa->isOpen() || !dados || tamanho == 0) return;
+
+    if (d_->primeiroTempoUs < 0) d_->primeiroTempoUs = tempoUs;
+
+    // Do mesmo relogio do video. Contar pacotes (960 em 960) parece certo e
+    // soa certo isolado, mas nao casa com a base do video: o receptor alinha os
+    // dois pelos relatorios RTCP e segura a imagem esperando o som. Foi o que
+    // produziu dois a tres segundos de atraso.
+    const double segundos = static_cast<double>(tempoUs - d_->primeiroTempoUs) / 1'000'000.0;
+    if (d_->empacotamentoAudio) {
+        d_->empacotamentoAudio->timestamp =
+            d_->empacotamentoAudio->startTimestamp +
+            static_cast<uint32_t>(segundos * static_cast<double>(kRelogioAudio));
+    }
+
+    try {
+        faixa->send(reinterpret_cast<const std::byte*>(dados), tamanho);
+    } catch (const std::exception&) {
+    }
+}
 
 bool ConexaoPar::pronto() const { return d_->aberta.load(); }
 bool ConexaoPar::ofertaPendente() const { return d_->esperandoResposta.load(); }
@@ -263,12 +301,11 @@ std::string ConexaoPar::caminhos() const {
 // quadro inteiro em Annex-B, que e exatamente o formato que o decodificador
 // espera.
 void ConexaoPar::Interno::montarRecepcao(const std::shared_ptr<rtc::Track>& faixa) {
-    auto remontador = std::make_shared<rtc::H264RtpDepacketizer>(
-        rtc::NalUnit::Separator::LongStartSequence);
-    faixa->chainMediaHandler(remontador);
-
-    faixa->onFrame([this](rtc::binary dados, rtc::FrameInfo) {
-        if (aoReceberVideo && !dados.empty()) aoReceberVideo(dados.data(), dados.size());
+    const std::string idDaFaixa = faixa->description().mid();
+    faixa->onFrame([this, idDaFaixa](rtc::binary dados, rtc::FrameInfo) {
+        if (aoReceberVideo && !dados.empty()) {
+            aoReceberVideo(dados.data(), dados.size(), idDaFaixa);
+        }
     });
 }
 
@@ -322,8 +359,53 @@ void ConexaoPar::Interno::montarEmpacotador(std::shared_ptr<rtc::Track> faixa) {
         if (aoPedirChave) aoPedirChave();
     }));
 
+    // O empacotador na raiz e o remontador encadeado atras. Ja tentei o
+    // contrario, achando que o video que chegava se perdia - nao se perdia: a
+    // taxa baixa era o navegador de teste, que em aba de fundo cai para um
+    // quadro por segundo. Com o remontador na raiz o ENVIO e que parava.
+    auto remontador = std::make_shared<rtc::H264RtpDepacketizer>(
+        rtc::NalUnit::Separator::LongStartSequence);
+    empacotador->addToChain(remontador);
     faixa->setMediaHandler(empacotador);
     faixaVideo = std::move(faixa);
+}
+
+// montarAudio liga o empacotador e o consumidor da faixa de audio.
+//
+// Opus nao precisa de fragmentacao: um quadro de 20 ms cabe folgado num pacote
+// RTP. Por isso o empacotador generico serve, sem nada especifico de codec.
+void ConexaoPar::Interno::montarAudio(std::shared_ptr<rtc::Track> faixa) {
+    if (faixaAudio) return;
+
+    // Declara o SSRC na nossa resposta. Sem isto o servidor recebe o RTP e nao
+    // sabe a quem entregar - ele registra "Incoming unhandled RTP ssrc(43),
+    // OnTrack will not be fired" e o audio some sem erro nenhum do nosso lado.
+    // Mesmo problema que o video ja teve; passei batido no audio.
+    try {
+        auto descricao = faixa->description();
+        descricao.addSSRC(43, "greenlabs-som", "greenlabs", "som");
+        faixa->setDescription(std::move(descricao));
+    } catch (const std::exception& e) {
+        erro("nao foi possivel declarar o SSRC do audio: {}", e.what());
+    }
+
+    empacotamentoAudio = std::make_shared<rtc::RtpPacketizationConfig>(
+        43, "greenlabs-som", kPayloadOpus, kRelogioAudio);
+
+    auto empacotador = std::make_shared<rtc::RtpPacketizer>(empacotamentoAudio);
+    empacotador->addToChain(std::make_shared<rtc::RtcpSrReporter>(empacotamentoAudio));
+    empacotador->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+    faixa->setMediaHandler(empacotador);
+
+    faixa->onMessage(
+        [this](rtc::binary dados) {
+            // O que chega e o payload do RTP: um quadro Opus inteiro.
+            if (aoReceberAudio && !dados.empty()) aoReceberAudio(dados.data(), dados.size());
+        },
+        nullptr);
+
+    faixaAudio = std::move(faixa);
+    info("faixa de audio pronta com {}", par.substr(0, 8));
 }
 
 bool ConexaoPar::prepararFaixa() {
@@ -337,6 +419,14 @@ bool ConexaoPar::prepararFaixa() {
         // aparecia para eles mesmo com tudo conectado e enviando.
         video.addSSRC(42, "greenlabs-tela", "greenlabs", "tela");
         d_->montarEmpacotador(d_->conexao->addTrack(video));
+
+        // Faixa de audio na mesma negociacao. Declarar depois exigiria uma
+        // segunda oferta, e duas negociacoes seguidas para a mesma conexao e
+        // exatamente o que costuma dar colisao.
+        rtc::Description::Audio som("audio", rtc::Description::Direction::SendRecv);
+        som.addOpusCodec(kPayloadOpus);
+        som.addSSRC(43, "greenlabs-som", "greenlabs", "som");
+        d_->montarAudio(d_->conexao->addTrack(som));
         return true;
     } catch (const std::exception& e) {
         erro("nao foi possivel preparar a faixa para {}: {}", d_->par.substr(0, 8), e.what());
