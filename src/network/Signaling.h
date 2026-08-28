@@ -38,6 +38,12 @@ public:
     struct Ouvintes {
         // Entramos na sala. `eu` é o id que o servidor deu.
         std::function<void(const std::string& eu, const std::vector<Participante>&)> aoEntrar;
+
+        // O servidor avisa na entrada que esta retransmitindo o video. Nesse
+        // modo a lista de participantes serve so para mostrar quem esta na
+        // sala: quem negocia midia e ele, e oferecer para as pessoas abre
+        // conexoes diretas que o retransmissor existe para evitar.
+        std::function<void(bool)> aoSaberDoModo;
         std::function<void(const Participante&)> aoChegarAlguem;
         std::function<void(const std::string& peerId)> aoSairAlguem;
         // Repasse ponto a ponto: offer, answer, ice, stream-meta, stream-ended.

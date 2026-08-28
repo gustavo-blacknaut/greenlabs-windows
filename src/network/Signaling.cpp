@@ -166,6 +166,7 @@ void Signaling::Interno::tratar(const std::string& bruto) {
             }
         }
         info("entrou na sala como {} ({} ja estavam)", msg.texto("peerId"), jaEstavam.size());
+        if (ouvintes.aoSaberDoModo) ouvintes.aoSaberDoModo(msg.booleano("sfu", false));
         if (ouvintes.aoEntrar) ouvintes.aoEntrar(msg.texto("peerId"), jaEstavam);
         return;
     }

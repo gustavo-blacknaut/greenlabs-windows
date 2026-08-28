@@ -135,6 +135,15 @@ bool VideoDecoder::iniciar(ID3D11Device* dispositivo, Consumidor consumidor) {
             reinterpret_cast<ULONG_PTR>(d_->gerenciador.Get()));
     }
 
+    // Baixa latencia: sem isto o decodificador segura varios quadros para
+    // reordenar antes de entregar o primeiro. Numa chamada ao vivo nao ha o que
+    // reordenar - o que chega ja esta em ordem - e a espera vira tela preta.
+    ComPtr<IMFAttributes> atributos;
+    if (SUCCEEDED(d_->transformador->GetAttributes(&atributos))) {
+        atributos->SetUINT32(MF_LOW_LATENCY, TRUE);
+        atributos->SetUINT32(MF_SA_D3D11_AWARE, TRUE);
+    }
+
     ComPtr<IMFMediaType> tipoEntrada;
     if (FAILED(::MFCreateMediaType(&tipoEntrada))) return false;
     tipoEntrada->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);

@@ -10,12 +10,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "audio/AudioCodec.h"
+#include "audio/AudioPlayer.h"
 #include "capture/AudioCapture.h"
 #include "capture/Cursor.h"
 #include "config/Config.h"
@@ -30,6 +34,11 @@
 #include "util/Log.h"
 #include "video/ColorConverter.h"
 
+// O define vem do CMake como texto comum; a interface desenha em wide.
+#define GL_W2(x) L##x
+#define GL_W(x) GL_W2(x)
+#define GREENLABS_VERSAO_W GL_W(GREENLABS_VERSAO)
+
 using Microsoft::WRL::ComPtr;
 
 namespace gl {
@@ -38,6 +47,19 @@ namespace {
 // O identificador que o servidor usa quando esta retransmitindo o video.
 // Ele participa da sala, mas nao e uma pessoa.
 constexpr const char* kIdDoSFU = "sfu";
+
+// Áudio desligado.
+//
+// Ele entrou nesta sessão e degradou tudo: com ele a imagem trava, o som
+// pica e o ping chega a 679 ms com o servidor no mesmo país. Tentei quatro
+// correções seguidas - trava compartilhada, alocação em thread de tempo real,
+// carimbo de sincronização, envio fora da thread do WASAPI - e cada uma
+// resolveu o que apontava sem devolver a fluidez.
+//
+// Com ele desligado o cliente volta ao comportamento da 0.1.x, que estava
+// liso. O código fica: o que falta é medir onde o tempo vai, e isso eu não
+// faço na chamada de quem está usando.
+constexpr bool kAudioLigado = false;
 
 const wchar_t* kClasse = L"GreenLabsJanela";
 
@@ -123,6 +145,37 @@ struct Aplicacao::Interno {
     uint32_t recebidoAltura = 0;
     std::string quemTransmite;
     AudioCapture audio;
+    AudioEncoder audioEnc;
+    AudioDecoder audioDec;
+    AudioPlayer alto;
+
+    // Reaproveitada a cada pacote de audio: alocar numa thread de tempo real e
+    // o tipo de coisa que sai como estalo.
+    std::vector<std::shared_ptr<ConexaoPar>> destinosAudio;
+
+    // O envio de audio NAO acontece na thread do WASAPI. Ela e de tempo real:
+    // o send faz criptografia e escrita no socket, e fazer isso ali trava a
+    // captura (que sai como estalo) e ocupa o transporte (que atrasa o video).
+    // A thread de captura so enfileira; quem envia e esta aqui.
+    std::mutex travaFilaAudio;
+    std::condition_variable temAudio;
+    std::vector<std::vector<uint8_t>> filaAudio;
+    std::vector<int64_t> temposAudio;
+    std::thread threadAudio;
+    std::atomic<bool> enviandoAudio{false};
+    void lacoEnvioAudio();
+
+    // O mesmo para o video que CHEGA. Decodificar dentro do callback da rede
+    // segura a thread que tambem responde ping e trata RTP - com decodificador
+    // de software a 1080p sao dezenas de milissegundos por quadro, e o ping
+    // aparecia em 679 ms com o servidor no mesmo pais.
+    std::mutex travaFilaVideo;
+    std::condition_variable temVideo;
+    std::vector<std::vector<uint8_t>> filaVideo;
+    std::thread threadVideo;
+    std::atomic<bool> decodificando{false};
+    void lacoDecodificacao();
+    std::vector<std::shared_ptr<ConexaoPar>> destinosVideo;
     Signaling sinal;
 
     Tela telaAtual = Tela::Entrada;
@@ -152,6 +205,7 @@ struct Aplicacao::Interno {
     std::mutex travaConexoes;
     std::map<std::string, std::shared_ptr<ConexaoPar>> conexoes;
     std::string meuId;
+    std::atomic<bool> modoSfu{false};
     std::atomic<bool> conectado{false};
 
     // Botões, guardados entre o desenho e o clique.
@@ -310,6 +364,10 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     }
 
     Signaling::Ouvintes ouvintes;
+    ouvintes.aoSaberDoModo = [this](bool sfu) {
+        d_->modoSfu.store(sfu);
+        if (sfu) info("servidor retransmitindo: nao vou oferecer para os participantes");
+    };
     ouvintes.aoEntrar = [this](const std::string& eu, const std::vector<Participante>& pares) {
         {
             std::lock_guard trava(d_->travaPares);
@@ -319,8 +377,11 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
         d_->conectado.store(true);
         d_->telaAtual = Tela::AoVivo;
 
-        // Chegamos numa sala que já tinha gente: nós é que oferecemos.
-        if (d_->transmitindo) {
+        // Chegamos numa sala que já tinha gente: nós é que oferecemos. Em modo
+        // retransmissor, não: quem negocia mídia é o servidor, e oferecer
+        // direto fazia a mesma tela chegar duas vezes do outro lado - uma pelo
+        // servidor, que funciona, e outra direta, que falha e fica preta.
+        if (d_->transmitindo && !d_->modoSfu.load()) {
             for (const auto& p : pares) {
                 if (auto conexao = d_->abrirMidiaPara(p.id)) conexao->oferecer();
             }
@@ -335,7 +396,7 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
         // fazem, e seguir a mesma regra evita os dois lados oferecerem ao mesmo
         // tempo. Aqui só preparamos a conexão com a faixa pronta, para poder
         // responder à oferta que vem em seguida.
-        if (d_->transmitindo) {
+        if (d_->transmitindo && !d_->modoSfu.load()) {
             d_->abrirMidiaPara(p.id);
             d_->encoder.pedirQuadroChave();
         }
@@ -483,7 +544,52 @@ bool Aplicacao::Interno::comecarTransmissao() {
     // Áudio: tudo menos o Discord.
     const uint32_t excluir = acharRaizParaExcluir(
         {"discord", "discordptb", "discordcanary", "discorddevelopment"});
-    audio.iniciar(excluir, [](const float*, uint32_t) {});
+    // O som do sistema, sem o Discord, vira Opus e sai junto do video. Roda em
+    // thread de tempo real: nada de alocar nem travar aqui - o codificador
+    // reaproveita os proprios buffers justamente por isso.
+    if (kAudioLigado) audioEnc.iniciar();
+    if (kAudioLigado) audio.iniciar(excluir, [this](const float* pcm, uint32_t quadros) {
+        const auto& pacote = audioEnc.codificar(pcm, quadros);
+        if (pacote.empty()) return;  // ainda nao fechou 20 ms
+
+        // A lista sai sob trava; o envio acontece FORA dela. Segurar
+        // travaConexoes durante o envio - 50 vezes por segundo, numa thread de
+        // tempo real - fazia o laco de video esperar por ela e a imagem
+        // engasgar. A copia dos ponteiros e barata; o envio nao.
+        {
+            std::lock_guard trava(travaConexoes);
+            if (destinosAudio.size() != conexoes.size()) {
+                enviandoAudio.store(false);
+    temAudio.notify_all();
+    if (threadAudio.joinable()) threadAudio.join();
+
+    decodificando.store(false);
+    temVideo.notify_all();
+    if (threadVideo.joinable()) threadVideo.join();
+    {
+        std::lock_guard t(travaFilaVideo);
+        filaVideo.clear();
+    }
+    {
+        std::lock_guard t(travaFilaAudio);
+        filaAudio.clear();
+        temposAudio.clear();
+    }
+    destinosAudio.clear();
+    destinosVideo.clear();
+                destinosAudio.reserve(conexoes.size());
+                for (auto& [id, conexao] : conexoes) {
+                    if (conexao) destinosAudio.push_back(conexao);
+                }
+            }
+        }
+        const int64_t agora = std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count();
+        for (auto& conexao : destinosAudio) {
+            conexao->enviarAudio(pacote.data(), pacote.size(), agora);
+        }
+    });
 
     // Quem já está na sala precisa receber a oferta agora; quem chegar depois
     // recebe no aoChegarAlguem.
@@ -506,6 +612,13 @@ void Aplicacao::Interno::pararTransmissao() {
     transmitindo = false;
     encoder.parar();
     audio.parar();
+    audioEnc.parar();
+    // As duas listas TAMBEM: elas guardam shared_ptr das conexoes, entao
+    // limpar so o mapa deixava tudo vivo por causa delas - o servidor nunca via
+    // a transmissao terminar. Foi efeito do cache que eu criei para tirar o
+    // envio de dentro da trava.
+    destinosAudio.clear();
+    destinosVideo.clear();
     {
         std::lock_guard trava(travaConexoes);
         conexoes.clear();
@@ -549,6 +662,13 @@ void Aplicacao::Interno::conectar() {
 // ---------------------------------------------------------------- midia
 
 std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string& peerId) {
+    // Em modo retransmissor existe UMA conexao de midia: a do servidor.
+    // Abrir conexao direta com as pessoas fazia a mesma tela chegar duas vezes
+    // do outro lado - uma pelo servidor, que funciona, e outra direta, que
+    // costuma falhar e fica preta. A guarda fica aqui, no funil por onde toda
+    // conexao nasce, e nao em cada chamador: espalhada, sempre escapa uma.
+    if (modoSfu.load() && peerId != kIdDoSFU) return nullptr;
+
     {
         std::lock_guard trava(travaConexoes);
         auto achou = conexoes.find(peerId);
@@ -566,6 +686,10 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
     // refletido pelo STUN para o caminho fechar. Pedir TURN aqui só adiciona
     // uma espera que já custou a conexão inteira - a coleta demorava 24
     // segundos e o servidor desistia aos 30.
+    // TURN ligado tambem contra o servidor. Desliguei achando que so
+    // atrasava - e atrasa mesmo a coleta - mas no br-02 o caminho direto nao
+    // fecha, e o relay e o unico que funciona: o Electron conecta la porque
+    // tem TURN, e o C++ nao conectava porque eu tinha tirado.
     cfg.usarTurn = (peerId != kIdDoSFU);
 
     auto conexao = std::make_shared<ConexaoPar>(peerId, cfg);
@@ -590,20 +714,44 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
     // Vídeo que chega. O decodificador é um só para a sala inteira: com o
     // servidor retransmitindo, quem transmite por vez é uma pessoa, e abrir um
     // decodificador por conexão gastaria GPU à toa.
-    conexao->aoReceberVideo([this, peerId](const std::byte* dados, size_t tamanho) {
-        if (!decodificador.ativo()) {
-            if (!decodificador.iniciar(tela.dispositivo(),
-                                       [this](ID3D11Texture2D* nv12, uint32_t l, uint32_t a) {
-                                           exibirQuadroRecebido(nv12, l, a);
-                                       })) {
-                return;
-            }
+    conexao->aoReceberAudio([this](const std::byte* dados, size_t tamanho) {
+        if (!kAudioLigado) return;
+        if (!audioDec.ativo() && !audioDec.iniciar()) return;
+        if (!alto.ativo() && !alto.iniciar()) return;
+
+        const auto& pcm = audioDec.decodificar(reinterpret_cast<const uint8_t*>(dados), tamanho);
+        if (!pcm.empty()) alto.enfileirar(pcm.data(), static_cast<uint32_t>(pcm.size() / 2));
+    });
+
+    conexao->aoReceberVideo([this, peerId](const std::byte* dados, size_t tamanho,
+                                           const std::string& faixaId) {
+        if (!decodificando.load()) {
+            decodificando.store(true);
+            threadVideo = std::thread([this] { lacoDecodificacao(); });
         }
-        quemTransmite = peerId;
-        decodificador.decodificar(reinterpret_cast<const uint8_t*>(dados), tamanho,
-                                  std::chrono::duration_cast<std::chrono::microseconds>(
-                                      std::chrono::steady_clock::now().time_since_epoch())
-                                      .count());
+        // Em modo retransmissor o peerId e sempre "sfu". Quem esta na tela sai
+        // da lista de participantes: com uma pessoa transmitindo - o caso
+        // normal - e a unica que nao somos nos.
+        if (peerId == kIdDoSFU) {
+            std::lock_guard trava(travaPares);
+            quemTransmite.clear();
+            for (const auto& p : pares) {
+                if (p.id != meuId) { quemTransmite = p.nome; break; }
+            }
+            if (quemTransmite.empty()) quemTransmite = "Alguem na sala";
+        } else {
+            quemTransmite = peerId;
+        }
+        (void)faixaId;
+        {
+            std::lock_guard t(travaFilaVideo);
+            // Dois quadros de teto. Vídeo atrasado não interessa a ninguém: se
+            // o decodificador não vence, o certo é pular para o mais recente.
+            if (filaVideo.size() >= 2) filaVideo.erase(filaVideo.begin());
+            filaVideo.emplace_back(reinterpret_cast<const uint8_t*>(dados),
+                                   reinterpret_cast<const uint8_t*>(dados) + tamanho);
+        }
+        temVideo.notify_one();
     });
 
     conexao->aoCandidato([this, peerId](const std::string& candidato, const std::string& mid) {
@@ -724,11 +872,84 @@ void Aplicacao::Interno::exibirQuadroRecebido(ID3D11Texture2D* nv12, uint32_t la
     recebidoAltura = altura;
 }
 
+void Aplicacao::Interno::lacoDecodificacao() {
+    if (!decodificador.iniciar(tela.dispositivo(),
+                               [this](ID3D11Texture2D* nv12, uint32_t l, uint32_t a) {
+                                   exibirQuadroRecebido(nv12, l, a);
+                               })) {
+        decodificando.store(false);
+        return;
+    }
+
+    std::vector<uint8_t> quadro;
+    while (decodificando.load()) {
+        {
+            std::unique_lock t(travaFilaVideo);
+            temVideo.wait_for(t, std::chrono::milliseconds(100),
+                              [this] { return !filaVideo.empty() || !decodificando.load(); });
+            if (!decodificando.load()) return;
+            if (filaVideo.empty()) continue;
+            quadro.swap(filaVideo.front());
+            filaVideo.erase(filaVideo.begin());
+        }
+
+        decodificador.decodificar(quadro.data(), quadro.size(),
+                                  std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count());
+    }
+}
+
+void Aplicacao::Interno::lacoEnvioAudio() {
+    std::vector<uint8_t> pacote;
+    int64_t tempo = 0;
+
+    while (enviandoAudio.load()) {
+        {
+            std::unique_lock t(travaFilaAudio);
+            temAudio.wait_for(t, std::chrono::milliseconds(100),
+                              [this] { return !filaAudio.empty() || !enviandoAudio.load(); });
+            if (!enviandoAudio.load()) return;
+            if (filaAudio.empty()) continue;
+
+            pacote.swap(filaAudio.front());
+            tempo = temposAudio.front();
+            filaAudio.erase(filaAudio.begin());
+            temposAudio.erase(temposAudio.begin());
+        }
+
+        {
+            std::lock_guard trava(travaConexoes);
+            if (destinosAudio.size() != conexoes.size()) {
+                destinosAudio.clear();
+                destinosAudio.reserve(conexoes.size());
+                for (auto& [id, conexao] : conexoes) {
+                    if (conexao) destinosAudio.push_back(conexao);
+                }
+            }
+        }
+        for (auto& conexao : destinosAudio) {
+            conexao->enviarAudio(pacote.data(), pacote.size(), tempo);
+        }
+    }
+}
+
 void Aplicacao::Interno::enviarQuadroParaTodos(const PacoteCodificado& pacote) {
     // Um encoder, N transportes. Codificar por destinatario multiplicaria o
     // custo pelo tamanho da sala e derrubaria a maquina numa chamada grande.
-    std::lock_guard trava(travaConexoes);
-    for (auto& [id, conexao] : conexoes) {
+    // Envio FORA da trava, pelo mesmo motivo do audio: segurar travaConexoes
+    // durante o envio poe as duas midias uma na frente da outra.
+    {
+        std::lock_guard trava(travaConexoes);
+        if (destinosVideo.size() != conexoes.size()) {
+            destinosVideo.clear();
+            destinosVideo.reserve(conexoes.size());
+            for (auto& [id, conexao] : conexoes) {
+                if (conexao) destinosVideo.push_back(conexao);
+            }
+        }
+    }
+    for (auto& conexao : destinosVideo) {
         conexao->enviarVideo(pacote.dados, pacote.tamanho, pacote.tempoUs, pacote.chave);
     }
 }
@@ -939,7 +1160,7 @@ void Aplicacao::Interno::desenharBarraTitulo() {
     render.logo(D2D1::RectF(12, 7, 12 + 24, tema::kAlturaTitulo - 7));
     render.texto(L"GreenLabs", D2D1::RectF(44, 0, 220, tema::kAlturaTitulo), tema::kTexto,
                  Fonte::Botao);
-    render.texto(L"v0.0.1  nativo", D2D1::RectF(124, 0, 280, tema::kAlturaTitulo), tema::kApagado,
+    render.texto(L"v" GREENLABS_VERSAO_W L"  nativo", D2D1::RectF(124, 0, 280, tema::kAlturaTitulo), tema::kApagado,
                  Fonte::Pequena);
 
     const float b = tema::kLarguraBotaoTitulo;
@@ -1055,8 +1276,7 @@ void Aplicacao::Interno::desenharAoVivo() {
         const auto etiqueta = D2D1::RectF(palco.left + 18, palco.bottom - 52, palco.left + 260,
                                           palco.bottom - 18);
         render.retangulo(etiqueta, tema::kPainel, 10);
-        render.texto(paraW(quemTransmite.substr(0, 8)) + L" · " +
-                         std::to_wstring(doOutroLargura) + L"p",
+        render.texto(paraW(quemTransmite) + L" · " + std::to_wstring(doOutroLargura) + L"p",
                      etiqueta, tema::kTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     render.contorno(palco, tema::kLinha, tema::kRaioCartao);
