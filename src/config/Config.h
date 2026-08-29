@@ -24,6 +24,10 @@ struct Config {
     // mostrar a tela — e gasta menos banda e menos máquina.
     bool audio = true;
 
+    // Volume do que CHEGA da chamada, de 0 a 100. Nao mexe no volume do
+    // Windows: abaixa so a chamada, deixando jogo e musica como estao.
+    int volume = 100;
+
     // Servidores já usados, do mais recente para o mais antigo. Quem entra numa
     // sala hoje volta nela amanhã, e digitar o endereço de novo toda vez é o
     // tipo de atrito que faz a pessoa desistir.

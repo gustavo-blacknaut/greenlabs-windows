@@ -30,6 +30,12 @@ public:
     bool ativo() const;
     Estatisticas estatisticas() const;
 
+    /// Volume de 0 a 1, aplicado na saida.
+    ///
+    /// Mexer no volume do Windows abaixaria tudo; isto abaixa so o que chega
+    /// da chamada, deixando jogo e musica no volume de sempre.
+    void definirVolume(float volume);
+
     // Enfileira float32 intercalado a 48 kHz. Chamado da thread da rede; a
     // thread de áudio consome por conta própria.
     void enfileirar(const float* intercalado, uint32_t quadros);

@@ -237,7 +237,14 @@ bool VideoDecoder::Interno::prepararCopia(uint32_t novaLargura, uint32_t novaAlt
     descricao.Format = DXGI_FORMAT_NV12;
     descricao.SampleDesc.Count = 1;
     descricao.Usage = D3D11_USAGE_DEFAULT;
-    descricao.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    // Sem flag de ligacao nenhuma.
+    //
+    // Esta textura so e destino de copia e entrada do Video Processor - nada
+    // aqui a le como recurso de shader. E o SHADER_RESOURCE que estava aqui era
+    // justamente o que fazia o CreateVideoProcessorInputView recusar a textura
+    // com E_INVALIDARG na placa da AMD, quadro após quadro.
+    descricao.BindFlags = 0;
 
     quadro.Reset();
     if (FAILED(dispositivo->CreateTexture2D(&descricao, nullptr, &quadro))) {
