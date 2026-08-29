@@ -141,6 +141,44 @@ struct Aplicacao::Interno {
 
     // Recepção. O decodificador entrega NV12, que o Direct2D não sabe desenhar,
     // então o mesmo Video Processor faz a volta para BGRA.
+    // Uma transmissão que está chegando. Uma por pessoa que transmite.
+    //
+    // Cada uma tem decodificador próprio porque um decodificador H.264 guarda
+    // estado entre quadros - a cadeia de referências. Alimentar o mesmo com
+    // dois fluxos diferentes produz lixo, e era por isso que só dava para ver
+    // uma pessoa por vez.
+    struct Transmissao {
+        std::string id;
+        std::string nome;
+        VideoDecoder decodificador;
+        bool decodificadorPronto = false;
+
+        // Rodízio de três, pelo mesmo motivo de sempre: aquele em que o Video
+        // Processor escreve nunca é o que a interface está desenhando.
+        static constexpr int kBuffers = 3;
+        ColorConverter exibicao[kBuffers];
+        bool exibicaoPronta[kBuffers] = {false, false, false};
+        int exibicaoAtual = 0;
+
+        std::mutex travaQuadro;
+        ID3D11Texture2D* quadro = nullptr;
+        uint32_t largura = 0;
+        uint32_t altura = 0;
+
+        std::mutex travaFila;
+        std::vector<std::vector<uint8_t>> fila;
+
+        // Última vez que chegou pacote. Serve para tirar da lista quem parou de
+        // transmitir: o servidor não avisa fim de faixa, o fluxo só seca.
+        std::chrono::steady_clock::time_point visto{};
+    };
+
+    std::mutex travaTransmissoes;
+    std::map<std::string, std::unique_ptr<Transmissao>> transmissoes;
+
+    // Qual está no palco. Vazio significa "a primeira que houver".
+    std::string noPalco;
+
     VideoDecoder decodificador;
 
     // Três conversores em rodízio, e não um.
@@ -154,15 +192,6 @@ struct Aplicacao::Interno {
     //
     // Em rodízio, aquele em que o decodificador escreve nunca é o que a
     // interface está lendo. São 8 MB por textura em 1080p; três é barato.
-    static constexpr int kBuffersExibicao = 3;
-    ColorConverter paraExibir[kBuffersExibicao];
-    bool exibicaoPronta[kBuffersExibicao] = {false, false, false};
-    int exibicaoAtual = 0;
-    std::mutex travaRecebido;
-    ID3D11Texture2D* quadroRecebido = nullptr;
-    uint32_t recebidoLargura = 0;
-    uint32_t recebidoAltura = 0;
-    std::string quemTransmite;
 
     // Medição do caminho de recepção. Sem isto, "está travando" não diz onde.
     std::atomic<uint64_t> videoChegou{0};
@@ -206,7 +235,6 @@ struct Aplicacao::Interno {
     // aparecia em 679 ms com o servidor no mesmo pais.
     std::mutex travaFilaVideo;
     std::condition_variable temVideo;
-    std::vector<std::vector<uint8_t>> filaVideo;
     std::thread threadVideo;
     std::atomic<bool> decodificando{false};
     void lacoDecodificacao();
@@ -285,6 +313,8 @@ struct Aplicacao::Interno {
     D2D1_RECT_F btEntrar{}, btTransmitir{}, btSair{};
     std::vector<D2D1_RECT_F> btMonitores;
     std::vector<D2D1_RECT_F> btQualidades;
+    std::vector<D2D1_RECT_F> btTransmissoes;
+    std::vector<std::string> idsTransmissoes;
 
     double fps = 0;
     int64_t quadrosNoSegundo = 0;
@@ -307,7 +337,8 @@ struct Aplicacao::Interno {
     std::shared_ptr<ConexaoPar> abrirMidiaPara(const std::string& peerId);
     void tratarRepasse(const std::string& de, const Json& msg);
     void enviarQuadroParaTodos(const PacoteCodificado& pacote);
-    void exibirQuadroRecebido(ID3D11Texture2D* nv12, uint32_t largura, uint32_t altura);
+    void exibirQuadroDe(Transmissao& quem, ID3D11Texture2D* nv12, uint32_t largura,
+                        uint32_t altura);
 
     Campo* campoFocado();
     void desenharCampo(Campo& campo, const std::wstring& rotulo);
@@ -329,6 +360,60 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
         case WM_DESTROY:
             ::PostQuitMessage(0);
             return 0;
+
+        // A moldura que o Windows desenha por cima da janela.
+        //
+        // A janela é WS_POPUP | WS_THICKFRAME: o THICKFRAME dá o
+        // redimensionamento, mas junto vem uma moldura que o DWM pinta - e é
+        // dela a linha clara no topo. Dizer que a área de cliente ocupa a
+        // janela inteira faz a moldura sumir; o preço é que o
+        // redimensionamento passa a ser nosso, no WM_NCHITTEST abaixo.
+        case WM_NCCALCSIZE:
+            if (w) {
+                // Maximizada é o caso especial: sem descontar a borda, a janela
+                // avança por cima da barra de tarefas.
+                if (::IsZoomed(janela)) {
+                    auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(l);
+                    const int bx = ::GetSystemMetrics(SM_CXSIZEFRAME) +
+                                   ::GetSystemMetrics(SM_CXPADDEDBORDER);
+                    const int by = ::GetSystemMetrics(SM_CYSIZEFRAME) +
+                                   ::GetSystemMetrics(SM_CXPADDEDBORDER);
+                    p->rgrc[0].left += bx;
+                    p->rgrc[0].right -= bx;
+                    p->rgrc[0].top += by;
+                    p->rgrc[0].bottom -= by;
+                }
+                return 0;
+            }
+            return ::DefWindowProcW(janela, msg, w, l);
+
+        // Redimensionamento por conta própria, já que não há mais moldura para
+        // o Windows testar. Só as bordas: o miolo continua sendo cliente, e a
+        // faixa do título continua arrastando pelo WM_LBUTTONDOWN.
+        case WM_NCHITTEST: {
+            if (::IsZoomed(janela)) return HTCLIENT;
+
+            RECT r{};
+            ::GetWindowRect(janela, &r);
+            const int x = GET_X_LPARAM(l);
+            const int y = GET_Y_LPARAM(l);
+            const int m = 6;  // margem de agarre, em pixels
+
+            const bool esq = x < r.left + m;
+            const bool dir = x >= r.right - m;
+            const bool cima = y < r.top + m;
+            const bool baixo = y >= r.bottom - m;
+
+            if (cima && esq) return HTTOPLEFT;
+            if (cima && dir) return HTTOPRIGHT;
+            if (baixo && esq) return HTBOTTOMLEFT;
+            if (baixo && dir) return HTBOTTOMRIGHT;
+            if (cima) return HTTOP;
+            if (baixo) return HTBOTTOM;
+            if (esq) return HTLEFT;
+            if (dir) return HTRIGHT;
+            return HTCLIENT;
+        }
 
         case WM_SIZE:
             if (d && w != SIZE_MINIMIZED) {
@@ -548,10 +633,10 @@ void Aplicacao::Interno::refazerDispositivo() {
         decodificador.parar();
 
         {
-            std::lock_guard t(travaRecebido);
-            quadroRecebido = nullptr;
+            std::lock_guard t(travaTransmissoes);
+            transmissoes.clear();
+            noPalco.clear();
         }
-        for (bool& p : exibicaoPronta) p = false;
 
         render.liberar();
         if (!tela.iniciar(static_cast<uint32_t>(monitorEscolhido))) {
@@ -1105,43 +1190,61 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
             decodificando.store(true);
             threadVideo = std::thread([this] { lacoDecodificacao(); });
         }
-        // Em modo retransmissor o peerId e sempre "sfu". Quem esta na tela sai
-        // da lista de participantes: com uma pessoa transmitindo - o caso
-        // normal - e a unica que nao somos nos.
-        if (peerId == kIdDoSFU) {
-            std::lock_guard trava(travaPares);
-            quemTransmite.clear();
-            for (const auto& p : pares) {
-                if (p.id != meuId) { quemTransmite = p.nome; break; }
-            }
-            if (quemTransmite.empty()) quemTransmite = "Alguem na sala";
-        } else {
-            quemTransmite = peerId;
-        }
-        (void)faixaId;
+
+        // Uma transmissão por faixa.
+        //
+        // O faixaId sempre chegou aqui e era jogado fora com um (void). Era por
+        // isso que só dava para ver uma pessoa: tudo caía numa fila só e num
+        // decodificador só, e duas pessoas transmitindo viravam um fluxo
+        // embaralhado. Com uma entrada por faixa, cada uma tem a sua fila, o
+        // seu decodificador e a sua imagem.
+        Transmissao* t = nullptr;
         {
-            std::lock_guard t(travaFilaVideo);
+            std::lock_guard trava(travaTransmissoes);
+            auto& espaco = transmissoes[faixaId];
+            if (!espaco) {
+                espaco = std::make_unique<Transmissao>();
+                espaco->id = faixaId;
+                info("nova transmissao na sala: faixa {}", faixaId.substr(0, 24));
+            }
+            t = espaco.get();
+
+            // Em modo retransmissor o peerId é sempre "sfu", então o nome vem
+            // da lista de participantes: quem está na sala e não somos nós.
+            if (peerId == kIdDoSFU) {
+                std::lock_guard tp(travaPares);
+                if (t->nome.empty()) {
+                    for (const auto& p : pares) {
+                        if (p.id != meuId) { t->nome = p.nome; break; }
+                    }
+                    if (t->nome.empty()) t->nome = "Alguem na sala";
+                }
+            } else if (t->nome.empty()) {
+                t->nome = peerId;
+            }
+            t->visto = std::chrono::steady_clock::now();
+        }
+
+        {
+            std::lock_guard tf(t->travaFila);
             // H.264 não admite descarte no meio. Cada quadro P só faz sentido
             // a partir do anterior, então jogar fora o mais antigo corrompe
             // tudo até o próximo keyframe — e é exatamente isso que se via
-            // como a tela congelando. Antes o teto era 2 quadros e o descarte
-            // acontecia o tempo todo.
+            // como a tela congelando.
             //
-            // A fila é generosa porque são bytes comprimidos: 60 quadros de
-            // 1080p somam alguns megabytes, e nunca se chega perto disso com o
-            // decodificador na GPU. Se chegar, o decodificador parou de valer,
-            // e aí se limpa tudo de uma vez e se espera o próximo keyframe —
-            // um corte só, em vez de corrupção contínua.
-            if (filaVideo.size() >= 60) {
-                filaVideo.clear();
+            // Se a fila enche, o decodificador parou de valer: limpa tudo de
+            // uma vez e espera o próximo keyframe — um corte só, em vez de
+            // corrupção contínua.
+            if (t->fila.size() >= 30) {
+                t->fila.clear();
                 videoDescartes.fetch_add(1, std::memory_order_relaxed);
             }
             videoChegou.fetch_add(1, std::memory_order_relaxed);
-            if (filaVideo.size() > videoPicoFila.load(std::memory_order_relaxed)) {
-                videoPicoFila.store(filaVideo.size(), std::memory_order_relaxed);
+            if (t->fila.size() > videoPicoFila.load(std::memory_order_relaxed)) {
+                videoPicoFila.store(t->fila.size(), std::memory_order_relaxed);
             }
-            filaVideo.emplace_back(reinterpret_cast<const uint8_t*>(dados),
-                                   reinterpret_cast<const uint8_t*>(dados) + tamanho);
+            t->fila.emplace_back(reinterpret_cast<const uint8_t*>(dados),
+                                 reinterpret_cast<const uint8_t*>(dados) + tamanho);
         }
         temVideo.notify_one();
     });
@@ -1242,15 +1345,15 @@ void Aplicacao::Interno::tratarRepasse(const std::string& de, const Json& msg) {
 // isso a trava. Guarda só o ponteiro: a textura pertence ao conversor e vale
 // até o próximo quadro, que é o comportamento que a interface quer de qualquer
 // forma (ela desenha o mais recente).
-void Aplicacao::Interno::exibirQuadroRecebido(ID3D11Texture2D* nv12, uint32_t largura,
-                                              uint32_t altura) {
+void Aplicacao::Interno::exibirQuadroDe(Transmissao& quem, ID3D11Texture2D* nv12,
+                                        uint32_t largura, uint32_t altura) {
     if (!nv12 || largura == 0 || altura == 0) return;
 
     // Passa para o próximo do rodízio antes de escrever: assim o Video
     // Processor nunca escreve na textura que a interface está desenhando.
-    exibicaoAtual = (exibicaoAtual + 1) % kBuffersExibicao;
-    ColorConverter& conversor = paraExibir[exibicaoAtual];
-    bool& pronto = exibicaoPronta[exibicaoAtual];
+    quem.exibicaoAtual = (quem.exibicaoAtual + 1) % Transmissao::kBuffers;
+    ColorConverter& conversor = quem.exibicao[quem.exibicaoAtual];
+    bool& pronto = quem.exibicaoPronta[quem.exibicaoAtual];
 
     if (!pronto || conversor.largura() != largura || conversor.altura() != altura) {
         if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), largura, altura, largura,
@@ -1258,51 +1361,107 @@ void Aplicacao::Interno::exibirQuadroRecebido(ID3D11Texture2D* nv12, uint32_t la
             return;
         }
         pronto = true;
-        if (exibicaoAtual == 0) info("recebendo video {}x{}", largura, altura);
+        if (quem.exibicaoAtual == 0) {
+            info("recebendo video de {}: {}x{}", quem.nome, largura, altura);
+        }
     }
 
     ID3D11Texture2D* bgra = conversor.converter(nv12);
     if (!bgra) return;
 
-    std::lock_guard trava(travaRecebido);
-    quadroRecebido = bgra;
-    recebidoLargura = largura;
-    recebidoAltura = altura;
+    std::lock_guard trava(quem.travaQuadro);
+    quem.quadro = bgra;
+    quem.largura = largura;
+    quem.altura = altura;
 }
 
+// Uma thread só, servindo todas as transmissões por vez.
+//
+// Uma thread por transmissão seria o desenho óbvio, e é o errado aqui: todas
+// usariam o mesmo dispositivo D3D11, e já custou caro descobrir que sequências
+// D3D de threads diferentes se intercalam e penduram a GPU. Com uma thread só,
+// a concorrência sobre o dispositivo continua sendo a mesma de sempre - esta
+// thread e a da interface - por mais gente que entre na sala.
 void Aplicacao::Interno::lacoDecodificacao() {
-    if (!decodificador.iniciar(tela.dispositivo(),
-                               [this](ID3D11Texture2D* nv12, uint32_t l, uint32_t a) {
-                                   exibirQuadroRecebido(nv12, l, a);
-                               })) {
-        decodificando.store(false);
-        return;
-    }
-
     std::vector<uint8_t> quadro;
+    std::vector<Transmissao*> lista;
+
     while (decodificando.load()) {
         {
             std::unique_lock t(travaFilaVideo);
-            temVideo.wait_for(t, std::chrono::milliseconds(100),
-                              [this] { return !filaVideo.empty() || !decodificando.load(); });
-            if (!decodificando.load()) return;
-            if (filaVideo.empty()) continue;
-            quadro.swap(filaVideo.front());
-            filaVideo.erase(filaVideo.begin());
+            temVideo.wait_for(t, std::chrono::milliseconds(20),
+                              [this] { return !decodificando.load(); });
+        }
+        if (!decodificando.load()) break;
+
+        lista.clear();
+        {
+            std::lock_guard t(travaTransmissoes);
+            for (auto& [id, quem] : transmissoes) lista.push_back(quem.get());
         }
 
-        const auto antes = std::chrono::steady_clock::now();
-        decodificador.decodificar(quadro.data(), quadro.size(),
-                                  std::chrono::duration_cast<std::chrono::microseconds>(
-                                      antes.time_since_epoch())
-                                      .count());
-        const auto gasto = std::chrono::duration_cast<std::chrono::microseconds>(
-                               std::chrono::steady_clock::now() - antes)
-                               .count();
-        videoDecodado.fetch_add(1, std::memory_order_relaxed);
-        videoDecodeUsSoma.fetch_add(static_cast<uint64_t>(gasto), std::memory_order_relaxed);
-        if (static_cast<uint64_t>(gasto) > videoDecodeUsPico.load(std::memory_order_relaxed)) {
-            videoDecodeUsPico.store(static_cast<uint64_t>(gasto), std::memory_order_relaxed);
+        bool fezAlgo = false;
+        for (Transmissao* quem : lista) {
+            // O decodificador nasce na primeira vez que esta transmissão tem
+            // quadro. Criar antes gastaria GPU por alguém que talvez nunca
+            // transmita.
+            if (!quem->decodificadorPronto) {
+                if (!quem->decodificador.iniciar(
+                        tela.dispositivo(),
+                        [this, quem](ID3D11Texture2D* nv12, uint32_t l, uint32_t a) {
+                            exibirQuadroDe(*quem, nv12, l, a);
+                        })) {
+                    continue;
+                }
+                quem->decodificadorPronto = true;
+            }
+
+            // No máximo alguns quadros por volta, para uma transmissão atrasada
+            // não deixar as outras paradas.
+            for (int i = 0; i < 4; ++i) {
+                {
+                    std::lock_guard tf(quem->travaFila);
+                    if (quem->fila.empty()) break;
+                    quadro.swap(quem->fila.front());
+                    quem->fila.erase(quem->fila.begin());
+                }
+                fezAlgo = true;
+
+                const auto antes = std::chrono::steady_clock::now();
+                quem->decodificador.decodificar(
+                    quadro.data(), quadro.size(),
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        antes.time_since_epoch())
+                        .count());
+                const auto gasto = std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - antes)
+                                       .count();
+                videoDecodado.fetch_add(1, std::memory_order_relaxed);
+                videoDecodeUsSoma.fetch_add(static_cast<uint64_t>(gasto),
+                                            std::memory_order_relaxed);
+                if (static_cast<uint64_t>(gasto) >
+                    videoDecodeUsPico.load(std::memory_order_relaxed)) {
+                    videoDecodeUsPico.store(static_cast<uint64_t>(gasto),
+                                            std::memory_order_relaxed);
+                }
+            }
+        }
+        (void)fezAlgo;
+
+        // Quem parou de mandar sai da lista. O servidor não avisa fim de faixa;
+        // o fluxo simplesmente seca, e sem isto o cartão ficaria para sempre na
+        // tela mostrando o último quadro de alguém que já saiu.
+        const auto agora = std::chrono::steady_clock::now();
+        std::lock_guard t(travaTransmissoes);
+        for (auto it = transmissoes.begin(); it != transmissoes.end();) {
+            if (it->second && agora - it->second->visto > std::chrono::seconds(5)) {
+                info("transmissao encerrada: {}", it->second->nome);
+                render.esquecerVideo(it->first);
+                if (noPalco == it->first) noPalco.clear();
+                it = transmissoes.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 }
@@ -1513,10 +1672,10 @@ void Aplicacao::Interno::clique(float x, float y) {
                     if (threadVideo.joinable()) threadVideo.join();
                     decodificador.parar();
                     {
-                        std::lock_guard t(travaRecebido);
-                        quadroRecebido = nullptr;
+                        std::lock_guard t(travaTransmissoes);
+                        transmissoes.clear();
+                        noPalco.clear();
                     }
-                    for (bool& p : exibicaoPronta) p = false;
 
                     if (!tela.iniciar(static_cast<uint32_t>(novo))) {
                         aviso = L"Não foi possível capturar esse monitor.";
@@ -1530,6 +1689,15 @@ void Aplicacao::Interno::clique(float x, float y) {
                 }
                 if (estavaTransmitindo) comecarTransmissao();
             }
+            return;
+        }
+    }
+
+    // Cartao de transmissao: poe aquela no palco.
+    for (size_t i = 0; i < btTransmissoes.size() && i < idsTransmissoes.size(); ++i) {
+        if (dentro(btTransmissoes[i], x, y)) {
+            std::lock_guard t(travaTransmissoes);
+            noPalco = idsTransmissoes[i];
             return;
         }
     }
@@ -1715,13 +1883,39 @@ void Aplicacao::Interno::desenharAoVivo() {
     const float topo = tema::kAlturaTitulo + tema::kEspaco;
     const float painelX = larg - tema::kLarguraPainelLateral - tema::kEspaco;
 
-    ID3D11Texture2D* doOutro = nullptr;
-    uint32_t doOutroLargura = 0;
+    // Fotografia das transmissões deste quadro. Copiar o essencial sob trava e
+    // desenhar fora dela: o desenho é longo e a trava é disputada com a thread
+    // que decodifica.
+    struct NaTela {
+        std::string id;
+        std::wstring nome;
+        ID3D11Texture2D* quadro;
+        uint32_t largura;
+    };
+    std::vector<NaTela> aoVivo;
     {
-        std::lock_guard trava(travaRecebido);
-        doOutro = quadroRecebido;
-        doOutroLargura = recebidoLargura;
+        std::lock_guard trava(travaTransmissoes);
+        for (auto& [id, quem] : transmissoes) {
+            if (!quem) continue;
+            std::lock_guard tq(quem->travaQuadro);
+            aoVivo.push_back({id, paraW(quem->nome), quem->quadro, quem->largura});
+        }
+        // Palco vazio ou apontando para quem saiu: fica com a primeira que há.
+        if (!aoVivo.empty()) {
+            const bool valido = std::any_of(aoVivo.begin(), aoVivo.end(),
+                                            [&](const NaTela& n) { return n.id == noPalco; });
+            if (!valido) noPalco = aoVivo.front().id;
+        } else {
+            noPalco.clear();
+        }
     }
+
+    const NaTela* escolhida = nullptr;
+    for (const auto& n : aoVivo) {
+        if (n.id == noPalco) { escolhida = &n; break; }
+    }
+    ID3D11Texture2D* doOutro = escolhida ? escolhida->quadro : nullptr;
+    const uint32_t doOutroLargura = escolhida ? escolhida->largura : 0;
 
     // ---- palco
     //
@@ -1730,15 +1924,25 @@ void Aplicacao::Interno::desenharAoVivo() {
     // conteúdo e botão é moldura.
     const auto palco = D2D1::RectF(tema::kEspaco, topo, painelX - tema::kEspaco,
                                    alt - tema::kEspaco);
-    render.retangulo(palco, tema::kPainel, tema::kRaioCartao);
+    // Palco mais escuro que o painel, e não igual.
+    //
+    // A imagem entra com a proporção dela, então sobra faixa em volta. Com o
+    // palco na mesma cor do painel lateral, essa faixa lia como "a interface
+    // está quebrada aqui". Escuro, ela lê como moldura - que é o que é.
+    render.retangulo(palco, tema::kFundo, tema::kRaioCartao);
 
     // Passar textura nula é de propósito: sem quadro novo o renderizador
     // repinta o último. Antes a prévia apagava a cada instante em que a tela
     // não mudava, e o resultado era piscar sem parar.
-    render.video(doOutro ? doOutro : previaDaTela(),
-                 D2D1::RectF(palco.left + 5, palco.top + 5, palco.right - 5, palco.bottom - 5));
+    const auto dentroDoPalco =
+        D2D1::RectF(palco.left + 5, palco.top + 5, palco.right - 5, palco.bottom - 5);
+    if (escolhida) {
+        render.video(escolhida->id, escolhida->quadro, dentroDoPalco);
+    } else {
+        render.video("previa", previaDaTela(), dentroDoPalco);
+    }
 
-    if (!render.temQuadro()) {
+    if (!render.temQuadro(escolhida ? escolhida->id : std::string("previa"))) {
         render.texto(transmitindo ? L"Aguardando o primeiro quadro…"
                                   : L"Ninguém está transmitindo",
                      palco, tema::kApagado, Fonte::Subtitulo, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1754,7 +1958,7 @@ void Aplicacao::Interno::desenharAoVivo() {
         D2D1_COLOR_F corTexto = tema::kApagado;
 
         if (vendoOutro) {
-            texto = L"●  " + paraW(quemTransmite);
+            texto = L"●  " + (escolhida ? escolhida->nome : L"Alguem na sala");
             if (doOutroLargura > 0) texto += L"  ·  " + std::to_wstring(doOutroLargura) + L"p";
             corTexto = tema::kVerde;
         } else if (transmitindo) {
@@ -1764,10 +1968,21 @@ void Aplicacao::Interno::desenharAoVivo() {
             texto = L"sua tela";
         }
 
+        // Ancorada no VÍDEO, não no palco.
+        //
+        // A imagem quase nunca preenche o palco: ela entra com a proporção
+        // certa e sobra faixa preta dos lados ou em cima. Ancorando no palco, a
+        // etiqueta ia parar no meio dessa faixa, solta, longe da imagem que ela
+        // descreve. Ancorada no vídeo, ela senta no canto da imagem.
+        const std::string chave = escolhida ? escolhida->id : std::string("previa");
+        const D2D1_RECT_F v = render.areaDoVideo(chave);
+        const bool temVideoNaTela = render.temQuadro(chave) && v.right > v.left;
+        const float ancoraX = (temVideoNaTela ? v.left : palco.left) + 14;
+        const float ancoraY = (temVideoNaTela ? v.top : palco.top) + 14;
+
         const float largura = render.larguraDoTexto(texto, Fonte::Pequena) + 28;
         const auto etiqueta =
-            D2D1::RectF(palco.left + 14, palco.top + 14, palco.left + 14 + largura,
-                        palco.top + 44);
+            D2D1::RectF(ancoraX, ancoraY, ancoraX + largura, ancoraY + 30);
         render.retangulo(etiqueta, tema::kFundo, 15);
         if (corTexto.g > 0.5f) render.contorno(etiqueta, tema::kVerdeLinha, 15);
         render.texto(texto, etiqueta, corTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1876,11 +2091,58 @@ void Aplicacao::Interno::desenharAoVivo() {
     };
 
     const std::wstring meuNome = campoNome.valor.empty() ? L"Você" : campoNome.valor + L"  (você)";
-    pessoa(meuNome, sinal.pingMs(), true, transmitindo && !doOutro);
+    pessoa(meuNome, sinal.pingMs(), true, transmitindo && !escolhida);
 
-    const std::wstring noPalcoAgora = paraW(quemTransmite);
     for (const auto& p : copia) {
-        pessoa(paraW(p.nome), p.pingMs, false, doOutro && paraW(p.nome) == noPalcoAgora);
+        const std::wstring nome = paraW(p.nome);
+        const bool estaNoPalco = escolhida && escolhida->nome == nome;
+        pessoa(nome, p.pingMs, false, estaNoPalco);
+    }
+
+    // ---- transmissões: um cartão com miniatura por pessoa transmitindo
+    //
+    // É o que faltava para ver a tela de quem está na chamada. Antes o palco
+    // trocava sozinho e não havia como escolher nem saber quantas transmissões
+    // existiam - com duas pessoas transmitindo, uma delas simplesmente não
+    // aparecia em lugar nenhum.
+    //
+    // Cada cartão desenha a miniatura ao vivo daquela transmissão, e clicar põe
+    // no palco. É o mesmo desenho da coluna de cartões do cliente em Electron.
+    btTransmissoes.clear();
+    idsTransmissoes.clear();
+
+    if (!aoVivo.empty()) {
+        y += 10;
+        render.linha(esq, y, dir, y, tema::kLinha);
+        y += 16;
+        secao((L"TRANSMITINDO  (" + std::to_wstring(aoVivo.size()) + L")").c_str());
+
+        for (const auto& n : aoVivo) {
+            // 16:9 na largura disponível, mais uma faixa para o nome.
+            const float larguraCartao = dir - esq;
+            const float alturaMini = larguraCartao * 9.0f / 16.0f;
+            const auto cartao = D2D1::RectF(esq, y, dir, y + alturaMini + 26);
+
+            const bool ativo = n.id == noPalco;
+            render.retangulo(cartao, ativo ? tema::kVerdeSuave : tema::kPainel2, 10);
+
+            // A miniatura é a mesma imagem do palco, desenhada pequena. A chave
+            // do renderizador é a mesma da transmissão, então palco e miniatura
+            // compartilham a cópia - não custa uma segunda.
+            const auto areaMini =
+                D2D1::RectF(cartao.left + 4, cartao.top + 4, cartao.right - 4, cartao.top + alturaMini);
+            render.retangulo(areaMini, tema::kFundo, 7);
+            render.video(n.id, ativo ? nullptr : n.quadro, areaMini);
+
+            render.texto(ativo ? (L"● " + n.nome + L"  ·  no palco") : n.nome,
+                         D2D1::RectF(cartao.left + 10, cartao.top + alturaMini,
+                                     cartao.right - 10, cartao.bottom),
+                         ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+
+            btTransmissoes.push_back(cartao);
+            idsTransmissoes.push_back(n.id);
+            y += alturaMini + 32;
+        }
     }
 
     // ---- pé do painel: botões e, abaixo deles, o diagnóstico

@@ -74,17 +74,28 @@ public:
     // trabalho só entrega quadro quando a tela muda, então na maior parte dos
     // instantes não há nada novo — e apagar a imagem nesses instantes fazia a
     // prévia piscar sem parar.
-    void video(ID3D11Texture2D* textura, const D2D1_RECT_F& area);
+    // A chave separa as imagens: "previa" para a propria tela, e o id da faixa
+    // para cada pessoa transmitindo. Sem ela havia um cache so, e mostrar duas
+    // telas ao mesmo tempo era impossivel - a segunda sobrescrevia a primeira a
+    // cada quadro.
+    void video(const std::string& chave, ID3D11Texture2D* textura, const D2D1_RECT_F& area);
 
-    // Houve algum quadro desde que a captura começou.
-    bool temQuadro() const;
+    // Houve algum quadro para esta chave.
+    bool temQuadro(const std::string& chave) const;
+
+    // Onde o video foi desenhado de fato, ja com a proporcao encaixada. Vazio
+    // enquanto nao houver quadro nenhum.
+    D2D1_RECT_F areaDoVideo(const std::string& chave) const;
 
     // Desenha a logo, que vem embutida no próprio executável. Encaixa na área
     // mantendo a proporção.
     void logo(const D2D1_RECT_F& area, float opacidade = 1.0f);
 
+    // Solta a imagem de uma chave que nao existe mais - alguem que parou de
+    // transmitir. Sem isto a textura e o bitmap ficariam vivos para sempre.
+    void esquecerVideo(const std::string& chave);
+
 private:
-    void desenharUltimo(const D2D1_RECT_F& area);
 
     struct Interno;
     std::unique_ptr<Interno> d_;

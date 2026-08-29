@@ -25,8 +25,8 @@ e os riscos.
 
 ### Medido nesta máquina
 
-Ryzen 5 1600, monitor 1920x1080 a 60 Hz, com tela em movimento e som tocando,
-10 segundos:
+Ryzen 5 1600, Radeon RX 590, captura de um monitor 1920x1080, com tela em
+movimento e som tocando, 10 segundos:
 
 ```
 VIDEO  (DXGI Desktop Duplication, 1920x1080)
@@ -42,9 +42,19 @@ AUDIO  (WASAPI process loopback, modo EXCLUDE)
   reproducao         : 99.8% de audio real
 ```
 
-59,1 quadros por segundo num monitor de 60 Hz é praticamente todo quadro
-apresentado. A latência que a captura acrescenta fica abaixo de **0,2 ms no pior
-caso** — a duplicação entrega a textura que já está na GPU, sem passar pela CPU.
+O que importa nesses números não é a taxa — ela acompanha o refresh do monitor
+usado no teste — e sim as duas linhas seguintes: **zero quadros coalescidos** e
+latência abaixo de **0,2 ms no pior caso**. Coalescido zero significa que nenhum
+quadro apresentado foi perdido entre uma leitura e outra; a latência baixa vem
+de a duplicação entregar a textura que já está na GPU, sem passar pela memória
+principal.
+
+No áudio, o par que interessa é **zero descontinuidades** com a árvore do
+Discord excluída: o processo é ignorado sem abrir buraco no que sobra.
+
+A taxa que o GreenLabs realmente transmite é a escolhida na interface (30 ou
+60 quadros por segundo), não a da captura — o que a duplicação entrega além
+disso é descartado antes de custar codificação.
 
 ---
 

@@ -10,6 +10,7 @@
 #include <wrl/client.h>
 
 #include <map>
+#include <string>
 
 #include "ui/Tema.h"
 #include "util/Log.h"
@@ -53,13 +54,19 @@ struct Renderizador::Interno {
     ComPtr<IDWriteFactory> fabricaTexto;
     std::map<int, ComPtr<IDWriteTextFormat>> formatos;
 
-    // O vídeo é copiado para esta textura antes de virar bitmap do D2D: a
-    // textura da duplicação vem sem a flag de recurso compartilhável que o
-    // Direct2D exige.
-    ComPtr<ID3D11Texture2D> copiaVideo;
-    ComPtr<ID2D1Bitmap1> bitmapVideo;
-    uint32_t larguraVideo = 0;
-    uint32_t alturaVideo = 0;
+    // Uma entrada por imagem na tela. A textura da duplicacao vem sem a flag
+    // de recurso compartilhavel que o Direct2D exige, entao cada uma tem a sua
+    // copia e o seu bitmap.
+    struct Video {
+        ComPtr<ID3D11Texture2D> copia;
+        ComPtr<ID2D1Bitmap1> bitmap;
+        uint32_t largura = 0;
+        uint32_t altura = 0;
+        D2D1_RECT_F destino{};
+    };
+    std::map<std::string, Video> videos;
+    Video& videoDe(const std::string& chave);
+    void desenhar(Video& v, const D2D1_RECT_F& area);
 
     ComPtr<ID2D1Bitmap1> bitmapLogo;
     bool tentouLogo = false;
@@ -84,8 +91,7 @@ void Renderizador::liberar() {
     // cadeia. Soltar fora de ordem deixa referência pendurada e a próxima
     // criação falha.
     if (d_->contexto2d) d_->contexto2d->SetTarget(nullptr);
-    d_->bitmapVideo.Reset();
-    d_->copiaVideo.Reset();
+    d_->videos.clear();
     d_->bitmapLogo.Reset();
     d_->tentouLogo = false;
     d_->formatos.clear();
@@ -107,8 +113,6 @@ void Renderizador::liberar() {
     d_->contexto.Reset();
     d_->dispositivo.Reset();
     d_->dispositivoPerdido = false;
-    d_->larguraVideo = 0;
-    d_->alturaVideo = 0;
 }
 
 float Renderizador::largura() const { return static_cast<float>(d_->largura); }
@@ -420,12 +424,35 @@ float Renderizador::larguraDoTexto(const std::wstring& conteudo, Fonte fonte) {
     return medidas.widthIncludingTrailingWhitespace;
 }
 
-bool Renderizador::temQuadro() const { return d_->bitmapVideo != nullptr; }
+// Cada imagem tem a sua entrada, achada pela chave.
+//
+// Antes havia um cache só - uma cópia e um bitmap. Isso bastava enquanto a tela
+// mostrava uma imagem por vez, e tornava impossível mostrar duas: a segunda
+// sobrescrevia a primeira a cada quadro, e as duas piscavam uma na outra.
+//
+// Com uma entrada por chave, a prévia da própria tela e a tela de cada pessoa
+// transmitindo convivem, e dá para desenhar miniatura de todas ao mesmo tempo.
+Renderizador::Interno::Video& Renderizador::Interno::videoDe(const std::string& chave) {
+    return videos[chave];
+}
 
-void Renderizador::video(ID3D11Texture2D* textura, const D2D1_RECT_F& area) {
+D2D1_RECT_F Renderizador::areaDoVideo(const std::string& chave) const {
+    const auto achou = d_->videos.find(chave);
+    return achou == d_->videos.end() ? D2D1_RECT_F{} : achou->second.destino;
+}
+
+bool Renderizador::temQuadro(const std::string& chave) const {
+    const auto achou = d_->videos.find(chave);
+    return achou != d_->videos.end() && achou->second.bitmap != nullptr;
+}
+
+void Renderizador::video(const std::string& chave, ID3D11Texture2D* textura,
+                         const D2D1_RECT_F& area) {
+    Interno::Video& v = d_->videoDe(chave);
+
     // Sem textura nova: repinta a última. Ver o comentário no cabeçalho.
     if (!textura) {
-        if (d_->bitmapVideo) desenharUltimo(area);
+        if (v.bitmap) d_->desenhar(v, area);
         return;
     }
 
@@ -436,10 +463,9 @@ void Renderizador::video(ID3D11Texture2D* textura, const D2D1_RECT_F& area) {
     // A textura da duplicação não pode ser compartilhada com o Direct2D
     // diretamente, então vai para uma cópia criada com as flags certas. É uma
     // cópia dentro da própria GPU: nada volta para a memória principal.
-    if (!d_->copiaVideo || d_->larguraVideo != descricao.Width ||
-        d_->alturaVideo != descricao.Height) {
-        d_->bitmapVideo.Reset();
-        d_->copiaVideo.Reset();
+    if (!v.copia || v.largura != descricao.Width || v.altura != descricao.Height) {
+        v.bitmap.Reset();
+        v.copia.Reset();
 
         D3D11_TEXTURE2D_DESC nova = descricao;
         nova.Usage = D3D11_USAGE_DEFAULT;
@@ -449,28 +475,30 @@ void Renderizador::video(ID3D11Texture2D* textura, const D2D1_RECT_F& area) {
         nova.MipLevels = 1;
         nova.ArraySize = 1;
 
-        if (FAILED(d_->dispositivo->CreateTexture2D(&nova, nullptr, &d_->copiaVideo))) return;
+        if (FAILED(d_->dispositivo->CreateTexture2D(&nova, nullptr, &v.copia))) return;
 
         ComPtr<IDXGISurface> superficie;
-        if (FAILED(d_->copiaVideo.As(&superficie))) return;
+        if (FAILED(v.copia.As(&superficie))) return;
 
         const auto propriedades = D2D1::BitmapProperties1(
             D2D1_BITMAP_OPTIONS_NONE,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
         if (FAILED(d_->contexto2d->CreateBitmapFromDxgiSurface(superficie.Get(), &propriedades,
-                                                                &d_->bitmapVideo))) {
+                                                                &v.bitmap))) {
             return;
         }
-        d_->larguraVideo = descricao.Width;
-        d_->alturaVideo = descricao.Height;
+        v.largura = descricao.Width;
+        v.altura = descricao.Height;
     }
 
-    d_->contexto->CopyResource(d_->copiaVideo.Get(), textura);
-    desenharUltimo(area);
+    d_->contexto->CopyResource(v.copia.Get(), textura);
+    d_->desenhar(v, area);
 }
 
-void Renderizador::desenharUltimo(const D2D1_RECT_F& area) {
-    if (!d_->bitmapVideo || d_->larguraVideo == 0 || d_->alturaVideo == 0) return;
+void Renderizador::esquecerVideo(const std::string& chave) { d_->videos.erase(chave); }
+
+void Renderizador::Interno::desenhar(Video& v, const D2D1_RECT_F& area) {
+    if (!v.bitmap || v.largura == 0 || v.altura == 0) return;
 
     // Encaixa mantendo a proporção: esticar a tela de alguém é feio e engana
     // sobre o que está sendo transmitido.
@@ -478,8 +506,7 @@ void Renderizador::desenharUltimo(const D2D1_RECT_F& area) {
     const float alturaArea = area.bottom - area.top;
     if (larguraArea <= 0 || alturaArea <= 0) return;
 
-    const float proporcao =
-        static_cast<float>(d_->larguraVideo) / static_cast<float>(d_->alturaVideo);
+    const float proporcao = static_cast<float>(v.largura) / static_cast<float>(v.altura);
     float largura = larguraArea;
     float altura = largura / proporcao;
     if (altura > alturaArea) {
@@ -489,8 +516,13 @@ void Renderizador::desenharUltimo(const D2D1_RECT_F& area) {
     const float x = area.left + (larguraArea - largura) / 2.0f;
     const float y = area.top + (alturaArea - altura) / 2.0f;
 
-    d_->contexto2d->DrawBitmap(d_->bitmapVideo.Get(), D2D1::RectF(x, y, x + largura, y + altura),
-                               1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
+    // Guarda onde a imagem REALMENTE caiu. A área pedida é o palco inteiro; a
+    // imagem ocupa só o retângulo com a proporção certa dentro dela. Quem
+    // desenha etiqueta em cima do vídeo precisa deste retângulo, não do palco -
+    // senão a etiqueta fica boiando na faixa preta ao lado da imagem.
+    v.destino = D2D1::RectF(x, y, x + largura, y + altura);
+
+    contexto2d->DrawBitmap(v.bitmap.Get(), v.destino, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR);
 }
 
 }  // namespace gl
