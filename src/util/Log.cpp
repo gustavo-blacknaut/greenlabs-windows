@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <shlobj.h>  // SHGetKnownFolderPath
+#include <share.h>   // _SH_DENYNO
 
 #include <chrono>
 #include <mutex>
@@ -66,10 +67,12 @@ std::string abrirArquivoDeLog() {
         modo = L"w";
     }
 
-    if (::_wfopen_s(&g_arquivo, caminho.c_str(), modo) != 0 || !g_arquivo) {
-        g_arquivo = nullptr;
-        return {};
-    }
+    // _wfsopen com _SH_DENYNO, e não _wfopen_s: o fopen normal abre o arquivo
+    // em exclusivo, e aí ninguém consegue ler o log enquanto o programa roda -
+    // que é justamente quando ele interessa. Com o compartilhamento liberado dá
+    // para acompanhar ao vivo com qualquer visualizador.
+    g_arquivo = ::_wfsopen(caminho.c_str(), modo, _SH_DENYNO);
+    if (!g_arquivo) return {};
 
     g_caminho = paraUtf8(caminho.c_str());
     return g_caminho;

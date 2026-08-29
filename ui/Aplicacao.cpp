@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <thread>
@@ -63,7 +64,7 @@ struct PacoteAudio {
     size_t tamanho = 0;
     int64_t tempoUs = 0;
 };
-constexpr bool kAudioLigado = true;
+
 
 const wchar_t* kClasse = L"GreenLabsJanela";
 
@@ -141,13 +142,36 @@ struct Aplicacao::Interno {
     // Recepção. O decodificador entrega NV12, que o Direct2D não sabe desenhar,
     // então o mesmo Video Processor faz a volta para BGRA.
     VideoDecoder decodificador;
-    ColorConverter paraExibir;
-    bool exibicaoPronta = false;
+
+    // Três conversores em rodízio, e não um.
+    //
+    // O conversor reaproveita a mesma textura de saída a cada quadro. Com um
+    // só, a thread do decodificador escrevia nela com o Video Processor
+    // enquanto a thread da interface desenhava a partir dela - o Direct2D
+    // então precisa esperar o Blt terminar, e essa espera é uma parada de GPU
+    // dentro do laço da interface. Era boa parte do "a tela trava quando os
+    // dois rodam juntos": sozinho não havia com quem esperar.
+    //
+    // Em rodízio, aquele em que o decodificador escreve nunca é o que a
+    // interface está lendo. São 8 MB por textura em 1080p; três é barato.
+    static constexpr int kBuffersExibicao = 3;
+    ColorConverter paraExibir[kBuffersExibicao];
+    bool exibicaoPronta[kBuffersExibicao] = {false, false, false};
+    int exibicaoAtual = 0;
     std::mutex travaRecebido;
     ID3D11Texture2D* quadroRecebido = nullptr;
     uint32_t recebidoLargura = 0;
     uint32_t recebidoAltura = 0;
     std::string quemTransmite;
+
+    // Medição do caminho de recepção. Sem isto, "está travando" não diz onde.
+    std::atomic<uint64_t> videoChegou{0};
+    std::atomic<uint64_t> videoDescartes{0};
+    std::atomic<uint64_t> videoPicoFila{0};
+    std::atomic<uint64_t> videoDecodado{0};
+    std::atomic<uint64_t> videoDecodeUsPico{0};
+    std::atomic<uint64_t> videoDecodeUsSoma{0};
+    std::chrono::steady_clock::time_point marcaVideo = std::chrono::steady_clock::now();
     AudioCapture audio;
     AudioEncoder audioEnc;
     AudioDecoder audioDec;
@@ -201,12 +225,49 @@ struct Aplicacao::Interno {
     std::vector<MonitorInfo> monitores;
     int monitorEscolhido = 0;
     int qualidadeEscolhida = 1;  // 1080p 30fps
+
+    // Mandar o som do sistema junto com a tela. Só vale para o que sai daqui:
+    // o que chega dos outros toca sempre.
+    bool audioLigado = true;
+    D2D1_RECT_F btAudio{};
     bool transmitindo = false;
     std::wstring aviso;
 
     // O quadro mais recente da captura, para a prévia. A textura é da própria
     // duplicação e vale só até o próximo liberarQuadro().
+    // Só a thread de captura toca isto. Ela é dona do quadro da duplicação, e
+    // é ela que o libera - por isso a interface nunca desenha a partir daqui.
     ID3D11Texture2D* quadroAtual = nullptr;
+
+    // A prévia que a interface desenha é uma CÓPIA publicada pela thread de
+    // captura, em rodízio de dois. Sem a cópia, a interface leria a textura da
+    // duplicação enquanto a captura a devolve ao sistema no quadro seguinte -
+    // que é ler memória que já não é nossa.
+    //
+    // CopyResource, e não o ColorConverter: BGRA para BGRA não é conversão
+    // nenhuma, e o Video Processor da AMD recusa esse par - o
+    // CreateVideoProcessorInputView devolvia E_INVALIDARG a cada quadro e a
+    // prévia ficava preta. Cópia é trabalho de CopyResource.
+    static constexpr int kBuffersPrevia = 2;
+    ComPtr<ID3D11Texture2D> previaTex[kBuffersPrevia];
+    uint32_t previaLargura = 0;
+    uint32_t previaAltura = 0;
+    int previaAtual = 0;
+    std::mutex travaPrevia;
+    ID3D11Texture2D* quadroPrevia = nullptr;
+
+    // Captura e desenho compartilham a thread da interface - ver o comentário
+    // em rodar(). A trava fica porque a recuperação de reset da GPU refaz a
+    // captura, e nada pode estar dentro dela nesse momento.
+    std::mutex travaCaptura;
+    void refazerDispositivo();
+    void reiniciarEncode();
+    void pararEncodeSomente();
+
+    ID3D11Texture2D* previaDaTela() {
+        std::lock_guard t(travaPrevia);
+        return quadroPrevia;
+    }
 
     std::mutex travaPares;
     std::vector<Participante> pares;
@@ -229,6 +290,8 @@ struct Aplicacao::Interno {
     int64_t quadrosNoSegundo = 0;
     std::chrono::steady_clock::time_point marcaFps = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point ultimoEncode = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point ultimoDesenho = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point proximaCaptura = std::chrono::steady_clock::now();
 
     void desenhar();
     void desenharBarraTitulo();
@@ -347,6 +410,7 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     d_->campoServidor.valor = paraW(d_->config.servidor);
     d_->qualidadeEscolhida =
         (d_->config.qualidade >= 0 && d_->config.qualidade < 3) ? d_->config.qualidade : 1;
+    d_->audioLigado = d_->config.audio;
 
     d_->monitores = ScreenCapture::listarMonitores();
     if (d_->monitores.empty()) {
@@ -378,10 +442,12 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     // Saida de audio e decodificador de pe antes de qualquer pacote chegar.
     // Abrir COM e criar thread dentro do callback da rede e trabalho pesado no
     // pior lugar possivel.
-    if (kAudioLigado) {
-        d_->audioDec.iniciar();
-        d_->alto.iniciar();
-    }
+    //
+    // Sem condicao: o botao de audio decide o que EU mando, nao o que eu ouco.
+    // Desligar o proprio microfone do sistema e uma escolha; deixar de ouvir
+    // quem esta do outro lado nunca foi pedido por ninguem.
+    d_->audioDec.iniciar();
+    d_->alto.iniciar();
 
     ouvintes.aoSaberDoModo = [this](bool sfu) {
         d_->modoSfu.store(sfu);
@@ -451,6 +517,59 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     return true;
 }
 
+// Refaz tudo que estava preso ao dispositivo D3D11 depois de um reset da GPU.
+//
+// Roda na thread da interface, com a captura travada: nada pode estar dentro do
+// encoder ou da duplicação enquanto os dois são recriados.
+void Aplicacao::Interno::refazerDispositivo() {
+    gl::aviso("a GPU foi reiniciada; refazendo o video");
+
+    const bool estavaTransmitindo = transmitindo;
+    pararEncodeSomente();
+
+    {
+        std::lock_guard travaTela(travaCaptura);
+
+        // Tudo que guarda ponteiro do dispositivo velho some primeiro. Deixar
+        // qualquer um vivo faz a recriação falhar por referência pendurada.
+        quadroAtual = nullptr;
+        {
+            std::lock_guard t(travaPrevia);
+            quadroPrevia = nullptr;
+        }
+        for (auto& t : previaTex) t.Reset();
+        previaLargura = 0;
+        previaAltura = 0;
+        cursorPronto = false;
+
+        decodificando.store(false);
+        temVideo.notify_all();
+        if (threadVideo.joinable()) threadVideo.join();
+        decodificador.parar();
+
+        {
+            std::lock_guard t(travaRecebido);
+            quadroRecebido = nullptr;
+        }
+        for (bool& p : exibicaoPronta) p = false;
+
+        render.liberar();
+        if (!tela.iniciar(static_cast<uint32_t>(monitorEscolhido))) {
+            erro("nao foi possivel refazer a captura depois do reset da GPU");
+            return;
+        }
+        if (!render.iniciar(janela, tela.dispositivo())) {
+            erro("nao foi possivel refazer a interface depois do reset da GPU");
+            return;
+        }
+    }
+
+    // A thread do decodificador renasce sozinha no próximo quadro que chegar:
+    // é o mesmo caminho da primeira vez.
+    if (estavaTransmitindo) comecarTransmissao();
+    info("video refeito depois do reset da GPU");
+}
+
 int Aplicacao::rodar() {
     MSG msg{};
     for (;;) {
@@ -464,14 +583,91 @@ int Aplicacao::rodar() {
             ::DispatchMessageW(&msg);
         }
 
+        // Captura na thread da interface, e é de propósito.
+        //
+        // Já tentei numa thread separada, que é o desenho mais bonito. Não
+        // funciona aqui: SetMultithreadProtected torna cada CHAMADA D3D
+        // atômica, mas não torna uma SEQUÊNCIA atômica. O compositor do cursor
+        // faz OMSetRenderTargets seguido de Draw; o Direct2D faz a sequência
+        // dele. Em threads diferentes sobre o mesmo contexto imediato as duas
+        // se intercalam, o estado do pipeline vira lixo, e o driver pendura a
+        // GPU - DXGI_ERROR_DEVICE_HUNG em poucos segundos, sem nem haver
+        // conexão aberta.
+        //
+        // Fazer certo com thread separada exigiria contexto próprio para cada
+        // uma, ou uma trava em volta de cada sequência. Enquanto isso não
+        // existe, as duas ficam aqui: bombearCaptura já respeita o fps
+        // escolhido, então isto custa 30 passagens por segundo, não mais.
         d_->bombearCaptura();
-        d_->desenhar();
+
+        // A GPU pode ser reiniciada pelo Windows a qualquer momento - driver
+        // que trava, atualização, jogo pesado abrindo. Quando isso acontece,
+        // TODO objeto preso ao dispositivo antigo morre junto, e antes o
+        // programa ficava batendo num dispositivo que não existia mais,
+        // enchendo o log e mostrando uma tela parada. Refazer é o certo, e é o
+        // que o navegador faz.
+        if (d_->render.dispositivoPerdido()) d_->refazerDispositivo();
+
+        // Redesenho limitado a 60 por segundo.
+        //
+        // Antes o laço desenhava tudo de novo a cada volta, e como o Present
+        // espera o vsync, num monitor de 144 Hz isso eram 144 repinturas
+        // completas da interface por segundo. Fora de gastar GPU à toa, cada
+        // volta é uma volta que o decodificador de vídeo e a thread de áudio
+        // não têm — é boa parte do que se via como tela e som travando.
+        //
+        // 60 Hz é o teto do que o olho aproveita numa interface, e o vídeo
+        // recebido vem a 30. O resto era desperdício.
+        const auto agora = std::chrono::steady_clock::now();
+        if (agora - d_->ultimoDesenho >= std::chrono::microseconds(1'000'000 / 60)) {
+            d_->ultimoDesenho = agora;
+            d_->desenhar();
+        } else {
+            // Sem nada a desenhar, devolve a fatia em vez de girar em falso.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
 }
 
 // ---------------------------------------------------------------- captura
 
 void Aplicacao::Interno::bombearCaptura() {
+    // Ritmo fixo, e o ritmo vale para a captura inteira - não só para o encode.
+    //
+    // Aqui estava o pior gargalo do programa. Esta função era chamada a cada
+    // volta do laço principal, e só o encode respeitava o fps escolhido: o
+    // AcquireNextFrame e a composição do cursor rodavam sempre. Com a tela
+    // mudando, a duplicação devolve quadro na hora, então o laço girava solto
+    // martelando o dispositivo D3D centenas de vezes por segundo para produzir
+    // 30 quadros úteis.
+    //
+    // E o dispositivo é um só: a captura, o conversor, o encoder, o
+    // decodificador do vídeo que chega e o desenho da interface compartilham
+    // ele. Com a proteção multithread ligada (que o decodificador exige para
+    // usar a GPU), toda chamada D3D passa por uma trava única. Transmitir
+    // sozinho ia bem, receber sozinho ia bem, e os dois juntos se atropelavam
+    // nessa trava - que é exatamente o que se via como tela e áudio travando.
+    //
+    // Capturando no ritmo certo, o dispositivo fica livre o resto do tempo.
+    //
+    // Cadência agendada, e não "tempo decorrido desde a última". A diferença
+    // decide o fps: este laço roda a cada ~16,6 ms porque o desenho espera o
+    // vsync, e perguntar "já passaram 33,3 ms?" a cada 16,6 ms responde 33,3 ou
+    // 50 conforme a fase - o que dava os 17 quadros por segundo em vez de 30.
+    //
+    // Somando o intervalo ao alvo anterior, a cadência não escorrega. O ajuste
+    // no fim é para quando a máquina atrasa de verdade: sem ele, o alvo ficaria
+    // no passado e a captura tentaria recuperar em rajada.
+    const int alvoFps = transmitindo ? kQualidades[qualidadeEscolhida].fps : 30;
+    const auto intervalo = std::chrono::microseconds(1'000'000 / alvoFps);
+    const auto agoraCaptura = std::chrono::steady_clock::now();
+
+    if (agoraCaptura < proximaCaptura) return;
+    proximaCaptura += intervalo;
+    if (proximaCaptura < agoraCaptura) proximaCaptura = agoraCaptura + intervalo;
+
+    std::lock_guard travaTela(travaCaptura);
+
     if (quadroAtual) {
         tela.liberarQuadro();
         quadroAtual = nullptr;
@@ -489,8 +685,8 @@ void Aplicacao::Interno::bombearCaptura() {
             // precisa se perguntar por que a seta some do outro lado.
             if (!cursorPronto) {
                 const auto& m = tela.monitor();
-                cursorPronto = cursor.iniciar(tela.dispositivo(), tela.contexto(), m.largura,
-                                              m.altura);
+                cursorPronto = cursor.iniciar(tela.dispositivo(), tela.contexto(),
+                                              m.larguraFisica(), m.alturaFisica());
             }
             if (cursorPronto && quadro.formaMudou) cursor.definirForma(tela.formaDoCursor());
 
@@ -498,20 +694,54 @@ void Aplicacao::Interno::bombearCaptura() {
                                                        quadro.cursorX, quadro.cursorY)
                                        : quadro.textura;
 
-            if (transmitindo) {
-                // Taxa fixa: a duplicação entrega quadro sempre que a tela muda,
-                // o que num jogo passa fácil de 100 por segundo. Codificar todos
-                // gastaria GPU e banda para nada — o alvo é o fps escolhido, e o
-                // que passar disso é descartado aqui, antes de custar encode.
-                const auto agora = std::chrono::steady_clock::now();
-                const auto intervalo =
-                    std::chrono::microseconds(1'000'000 / kQualidades[qualidadeEscolhida].fps);
-                if (agora - ultimoEncode >= intervalo) {
-                    ultimoEncode = agora;
-                    if (auto* nv12 = conversor.converter(quadroAtual)) {
-                        encoder.codificar(nv12, std::chrono::duration_cast<std::chrono::microseconds>(
-                                                    agora.time_since_epoch()).count());
+            // Publica a cópia para a interface desenhar. Rodízio de dois pelo
+            // mesmo motivo do vídeo recebido: aquele em que se escreve nunca é
+            // o que está sendo lido.
+            if (quadroAtual) {
+                D3D11_TEXTURE2D_DESC origem{};
+                quadroAtual->GetDesc(&origem);
+
+                if (previaLargura != origem.Width || previaAltura != origem.Height) {
+                    for (auto& t : previaTex) t.Reset();
+                    {
+                        std::lock_guard t(travaPrevia);
+                        quadroPrevia = nullptr;
                     }
+                    previaLargura = origem.Width;
+                    previaAltura = origem.Height;
+                }
+
+                previaAtual = (previaAtual + 1) % kBuffersPrevia;
+                ComPtr<ID3D11Texture2D>& destino = previaTex[previaAtual];
+
+                if (!destino) {
+                    D3D11_TEXTURE2D_DESC nova = origem;
+                    nova.Usage = D3D11_USAGE_DEFAULT;
+                    nova.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                    nova.CPUAccessFlags = 0;
+                    nova.MiscFlags = 0;
+                    nova.MipLevels = 1;
+                    nova.ArraySize = 1;
+                    tela.dispositivo()->CreateTexture2D(&nova, nullptr, &destino);
+                }
+
+                if (destino) {
+                    tela.contexto()->CopyResource(destino.Get(), quadroAtual);
+                    std::lock_guard t(travaPrevia);
+                    quadroPrevia = destino.Get();
+                }
+            }
+
+            if (transmitindo) {
+                // Sem segundo limitador: a função inteira já entra no ritmo do
+                // fps escolhido. Limitar de novo aqui, com o mesmo intervalo,
+                // só faria perder um quadro sim outro não por arredondamento.
+                ultimoEncode = agoraCaptura;
+                if (auto* nv12 = conversor.converter(quadroAtual)) {
+                    encoder.codificar(nv12,
+                                      std::chrono::duration_cast<std::chrono::microseconds>(
+                                          agoraCaptura.time_since_epoch())
+                                          .count());
                 }
             }
             break;
@@ -523,7 +753,7 @@ void Aplicacao::Interno::bombearCaptura() {
             break;
     }
 
-    if (kAudioLigado && chamadasAudio.load() > 0) {
+    if (audioLigado && chamadasAudio.load() > 0) {
         const auto agoraA = std::chrono::steady_clock::now();
         if (agoraA - marcaAudio >= std::chrono::seconds(5)) {
             marcaAudio = agoraA;
@@ -531,6 +761,28 @@ void Aplicacao::Interno::bombearCaptura() {
                  picoAudioUs.load(),
                  somaAudioUs.load() / static_cast<int64_t>(chamadasAudio.load()),
                  chamadasAudio.load());
+        }
+    }
+
+    // Relatório do caminho de recepção, de dois em dois segundos enquanto
+    // chega vídeo. "Está travando" não diz onde trava; isto diz.
+    const auto agoraVideo = std::chrono::steady_clock::now();
+    if (videoChegou.load() > 0 && agoraVideo - marcaVideo >= std::chrono::seconds(2)) {
+        const double seg = std::chrono::duration<double>(agoraVideo - marcaVideo).count();
+        const uint64_t chegou = videoChegou.exchange(0);
+        const uint64_t decodou = videoDecodado.exchange(0);
+        const uint64_t soma = videoDecodeUsSoma.exchange(0);
+        info("video recebido: {:.1f}/s chegando, {:.1f}/s decodando | fila pico {} | "
+             "decode media {} us, pico {} us | descartes {}",
+             chegou / seg, decodou / seg, videoPicoFila.exchange(0),
+             decodou ? soma / decodou : 0, videoDecodeUsPico.exchange(0),
+             videoDescartes.exchange(0));
+        marcaVideo = agoraVideo;
+
+        if (alto.ativo()) {
+            const auto a = alto.estatisticas();
+            info("audio recebido: fila {} ms | velocidade {:.4f} | faltas {} | recargas {}",
+                 a.filaMs, a.velocidade, a.faltas, a.recargas);
         }
     }
 
@@ -544,14 +796,39 @@ void Aplicacao::Interno::bombearCaptura() {
 }
 
 bool Aplicacao::Interno::comecarTransmissao() {
+    // A trava da captura vale para tudo que a thread de captura usa - e ela usa
+    // o conversor e o encoder, não só a duplicação. Sem isto, clicar em entrar
+    // recriava o encoder enquanto a outra thread estava dentro dele, e o
+    // aplicativo parava ali mesmo.
+    //
+    // Só a thread da interface chama esta função, e nenhuma chamada vem de
+    // dentro da própria trava: a troca de monitor solta antes de chegar aqui.
+    std::lock_guard travaTela(travaCaptura);
+
     const auto& m = tela.monitor();
     const Qualidade& q = kQualidades[qualidadeEscolhida];
 
-    // O Video Processor redimensiona de graça no mesmo passo da conversão de
-    // cor, então a tela vai para o encoder já no tamanho escolhido: menos
-    // pixels para codificar e menos banda, sem custo extra de CPU.
-    if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), m.largura, m.altura, q.largura,
-                           q.altura)) {
+    // A ENTRADA é o tamanho físico da textura, não o lógico.
+    //
+    // Num monitor girado para retrato o DXGI diz 1080x1920 (o que a pessoa vê),
+    // mas entrega uma textura 1920x1080 com o conteúdo deitado. Passar o lógico
+    // aqui era pedir ao Video Processor para ler algo que não existe - e o
+    // resultado era a tela chegando virada do outro lado.
+    const uint32_t entradaL = m.larguraFisica();
+    const uint32_t entradaA = m.alturaFisica();
+
+    // A SAÍDA respeita a proporção da tela, dentro do que a qualidade permite.
+    //
+    // Antes eu esticava qualquer tela para o tamanho fixo do preset, então um
+    // monitor em pé era espremido para 16:9 e chegava achatado. Aqui a escala é
+    // a mesma nos dois eixos, e o que sobra é resolução, não deformação.
+    const double escala = std::min(static_cast<double>(q.largura) / m.largura,
+                                   static_cast<double>(q.altura) / m.altura);
+    const uint32_t saidaL = static_cast<uint32_t>(m.largura * escala) & ~1u;
+    const uint32_t saidaA = static_cast<uint32_t>(m.altura * escala) & ~1u;
+
+    if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), entradaL, entradaA, saidaL, saidaA,
+                           ColorConverter::Saida::Nv12, m.graus)) {
         aviso = L"Não foi possível preparar a conversão de cor.";
         return false;
     }
@@ -577,46 +854,60 @@ bool Aplicacao::Interno::comecarTransmissao() {
     // O som do sistema, sem o Discord, vira Opus e sai junto do video. Roda em
     // thread de tempo real: nada de alocar nem travar aqui - o codificador
     // reaproveita os proprios buffers justamente por isso.
-    if (kAudioLigado) audioEnc.iniciar();
-    if (kAudioLigado) audio.iniciar(excluir, [this](const float* pcm, uint32_t quadros) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto& pacote = audioEnc.codificar(pcm, quadros);
-        if (pacote.empty()) return;  // ainda nao fechou 20 ms
+    if (audioLigado) audioEnc.iniciar();
+    if (audioLigado) {
+        audio.iniciar(excluir, [this](const float* pcm, uint32_t quadros) {
+            const auto t0 = std::chrono::steady_clock::now();
 
-        // A lista sai sob trava; o envio acontece FORA dela. Segurar
-        // travaConexoes durante o envio - 50 vezes por segundo, numa thread de
-        // tempo real - fazia o laco de video esperar por ela e a imagem
-        // engasgar. A copia dos ponteiros e barata; o envio nao.
-        {
-            std::lock_guard trava(travaConexoes);
-            if (destinosAudio.size() != conexoes.size()) {
-                enviandoAudio.store(false);
-    if (threadAudio.joinable()) threadAudio.join();
+            // Drena TODOS os quadros fechados, não só um.
+            //
+            // O WASAPI não entrega em fatias de 20 ms: numa volta ele pode
+            // trazer 40 ou 60. Emitindo um pacote por chamada, o resto ficava
+            // acumulado e a captura ia ficando para trás um quadro por vez, até
+            // o acumulador estourar e descartar tudo de uma vez. Era isso o
+            // "está perdendo áudio quando manda", e piorava justamente sob
+            // carga - que é quando se está transmitindo vídeo.
+            audioEnc.acumular(pcm, quadros);
 
-    decodificando.store(false);
-    temVideo.notify_all();
-    if (threadVideo.joinable()) threadVideo.join();
-    {
-        std::lock_guard t(travaFilaVideo);
-        filaVideo.clear();
-    }
-    escritaAudio.store(0);
-    leituraAudio.store(0);
-    destinosAudio.clear();
-    destinosVideo.clear();
-                destinosAudio.reserve(conexoes.size());
-                for (auto& [id, conexao] : conexoes) {
-                    if (conexao) destinosAudio.push_back(conexao);
-                }
+            const int64_t agora = std::chrono::duration_cast<std::chrono::microseconds>(
+                                      t0.time_since_epoch())
+                                      .count();
+
+            for (;;) {
+                const auto& pacote = audioEnc.proximo();
+                if (pacote.empty()) break;
+
+                // Só copiar para o anel e publicar o índice. Enviar daqui -
+                // SRTP mais socket - é trabalho pesado numa thread de tempo
+                // real, e era o que fazia a captura engasgar. Quem envia é a
+                // threadAudio, que existe para isso.
+                const uint64_t w = escritaAudio.load(std::memory_order_relaxed);
+                PacoteAudio& espaco = anelAudio[w % kEspacosAudio];
+                const size_t cabem =
+                    pacote.size() < kMaxPacoteAudio ? pacote.size() : kMaxPacoteAudio;
+                memcpy(espaco.dados, pacote.data(), cabem);
+                espaco.tamanho = cabem;
+                espaco.tempoUs = agora;
+                escritaAudio.store(w + 1, std::memory_order_release);
             }
-        }
-        const int64_t agora = std::chrono::duration_cast<std::chrono::microseconds>(
-                                  std::chrono::steady_clock::now().time_since_epoch())
-                                  .count();
-        for (auto& conexao : destinosAudio) {
-            conexao->enviarAudio(pacote.data(), pacote.size(), agora);
-        }
-    });
+
+            const auto gasto = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count();
+            somaAudioUs.fetch_add(gasto, std::memory_order_relaxed);
+            chamadasAudio.fetch_add(1, std::memory_order_relaxed);
+            if (gasto > picoAudioUs.load(std::memory_order_relaxed)) {
+                picoAudioUs.store(gasto, std::memory_order_relaxed);
+            }
+        });
+
+        // A thread que realmente envia. Ela existia e nunca era iniciada: o
+        // anel inteiro era código morto e o áudio saía da thread de tempo real.
+        escritaAudio.store(0);
+        leituraAudio.store(0);
+        enviandoAudio.store(true);
+        threadAudio = std::thread([this] { lacoEnvioAudio(); });
+    }
 
     // Quem já está na sala precisa receber a oferta agora; quem chegar depois
     // recebe no aoChegarAlguem.
@@ -635,15 +926,26 @@ bool Aplicacao::Interno::comecarTransmissao() {
 }
 
 void Aplicacao::Interno::pararTransmissao() {
+    // Mesma trava do comecarTransmissao, e pela mesma razão: encoder.parar()
+    // enquanto a thread de captura está codificando é destruir o objeto debaixo
+    // de quem o usa. A ordem é sempre travaCaptura antes de travaConexoes, aqui
+    // e na thread de captura - por isso não há como travar uma na outra.
+    std::lock_guard travaTela(travaCaptura);
+
     if (!transmitindo) return;
     transmitindo = false;
-    if (kAudioLigado && chamadasAudio.load() > 0) {
+    if (audioLigado && chamadasAudio.load() > 0) {
         info("audio na thread de tempo real: pico {} us, media {} us em {} chamadas",
              picoAudioUs.load(), somaAudioUs.load() / static_cast<int64_t>(chamadasAudio.load()),
              chamadasAudio.load());
     }
-    encoder.parar();
     audio.parar();
+    enviandoAudio.store(false);
+    if (threadAudio.joinable()) threadAudio.join();
+    escritaAudio.store(0);
+    leituraAudio.store(0);
+
+    encoder.parar();
     audioEnc.parar();
     // As duas listas TAMBEM: elas guardam shared_ptr das conexoes, entao
     // limpar so o mapa deixava tudo vivo por causa delas - o servidor nunca via
@@ -655,6 +957,49 @@ void Aplicacao::Interno::pararTransmissao() {
         std::lock_guard trava(travaConexoes);
         conexoes.clear();
     }
+}
+
+// Troca a fonte da imagem SEM derrubar a conexão.
+//
+// Trocar de monitor, de qualidade ou o som ligado/desligado só precisa refazer
+// o encoder e o conversor. Antes tudo isso passava por pararTransmissao, que
+// também limpa o mapa de conexões - ou seja, mudar de monitor destruía a
+// conexão com o servidor e obrigava uma renegociação inteira. Cruzando os dois
+// logs dava para ver: "midia com sfu: fechado" no instante da troca, e
+// "falhou" um minuto depois, quando a renegociação não completava. O
+// travamento que parecia do servidor era isto.
+//
+// Resolução nova não precisa de renegociação: o H.264 anuncia o tamanho no
+// próprio fluxo, pelo SPS, e o decodificador do outro lado se reconfigura
+// sozinho. Só é preciso mandar um quadro-chave logo em seguida.
+void Aplicacao::Interno::pararEncodeSomente() {
+    if (!transmitindo) return;
+
+    // Este bloco vivia, por engano, dentro do callback de tempo real do áudio -
+    // dava para ver no commit be30630. Lá ele derrubava a thread de envio e a
+    // de decodificação no primeiro pacote depois de conectar, e aqui não havia
+    // desmonte nenhum: as threads vazavam a cada transmissão.
+    //
+    // A captura de som para PRIMEIRO. Enquanto ela roda, o callback continua
+    // escrevendo no anel, e parar o consumidor antes do produtor deixaria o
+    // anel enchendo sozinho.
+    audio.parar();
+
+    enviandoAudio.store(false);
+    if (threadAudio.joinable()) threadAudio.join();
+
+    std::lock_guard travaTela(travaCaptura);
+    encoder.parar();
+    audioEnc.parar();
+    escritaAudio.store(0);
+    leituraAudio.store(0);
+    transmitindo = false;
+}
+
+void Aplicacao::Interno::reiniciarEncode() {
+    if (!transmitindo) return;
+    pararEncodeSomente();
+    comecarTransmissao();
 }
 
 void Aplicacao::Interno::conectar() {
@@ -669,6 +1014,7 @@ void Aplicacao::Interno::conectar() {
     config.sala = paraUtf8(campoSala.valor);
     config.nome = paraUtf8(campoNome.valor);
     config.qualidade = qualidadeEscolhida;
+    config.audio = audioLigado;
     config.monitor = monitorEscolhido;
     config.lembrarServidor(servidor);
     config.salvar();
@@ -747,7 +1093,7 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
     // servidor retransmitindo, quem transmite por vez é uma pessoa, e abrir um
     // decodificador por conexão gastaria GPU à toa.
     conexao->aoReceberAudio([this](const std::byte* dados, size_t tamanho) {
-        if (!kAudioLigado || !audioDec.ativo() || !alto.ativo()) return;
+        if (!audioDec.ativo() || !alto.ativo()) return;
 
         const auto& pcm = audioDec.decodificar(reinterpret_cast<const uint8_t*>(dados), tamanho);
         if (!pcm.empty()) alto.enfileirar(pcm.data(), static_cast<uint32_t>(pcm.size() / 2));
@@ -775,9 +1121,25 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
         (void)faixaId;
         {
             std::lock_guard t(travaFilaVideo);
-            // Dois quadros de teto. Vídeo atrasado não interessa a ninguém: se
-            // o decodificador não vence, o certo é pular para o mais recente.
-            if (filaVideo.size() >= 2) filaVideo.erase(filaVideo.begin());
+            // H.264 não admite descarte no meio. Cada quadro P só faz sentido
+            // a partir do anterior, então jogar fora o mais antigo corrompe
+            // tudo até o próximo keyframe — e é exatamente isso que se via
+            // como a tela congelando. Antes o teto era 2 quadros e o descarte
+            // acontecia o tempo todo.
+            //
+            // A fila é generosa porque são bytes comprimidos: 60 quadros de
+            // 1080p somam alguns megabytes, e nunca se chega perto disso com o
+            // decodificador na GPU. Se chegar, o decodificador parou de valer,
+            // e aí se limpa tudo de uma vez e se espera o próximo keyframe —
+            // um corte só, em vez de corrupção contínua.
+            if (filaVideo.size() >= 60) {
+                filaVideo.clear();
+                videoDescartes.fetch_add(1, std::memory_order_relaxed);
+            }
+            videoChegou.fetch_add(1, std::memory_order_relaxed);
+            if (filaVideo.size() > videoPicoFila.load(std::memory_order_relaxed)) {
+                videoPicoFila.store(filaVideo.size(), std::memory_order_relaxed);
+            }
             filaVideo.emplace_back(reinterpret_cast<const uint8_t*>(dados),
                                    reinterpret_cast<const uint8_t*>(dados) + tamanho);
         }
@@ -884,16 +1246,22 @@ void Aplicacao::Interno::exibirQuadroRecebido(ID3D11Texture2D* nv12, uint32_t la
                                               uint32_t altura) {
     if (!nv12 || largura == 0 || altura == 0) return;
 
-    if (!exibicaoPronta || paraExibir.largura() != largura || paraExibir.altura() != altura) {
-        if (!paraExibir.iniciar(tela.dispositivo(), tela.contexto(), largura, altura, largura,
-                                altura, ColorConverter::Saida::Bgra)) {
+    // Passa para o próximo do rodízio antes de escrever: assim o Video
+    // Processor nunca escreve na textura que a interface está desenhando.
+    exibicaoAtual = (exibicaoAtual + 1) % kBuffersExibicao;
+    ColorConverter& conversor = paraExibir[exibicaoAtual];
+    bool& pronto = exibicaoPronta[exibicaoAtual];
+
+    if (!pronto || conversor.largura() != largura || conversor.altura() != altura) {
+        if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), largura, altura, largura,
+                               altura, ColorConverter::Saida::Bgra)) {
             return;
         }
-        exibicaoPronta = true;
-        info("recebendo video {}x{}", largura, altura);
+        pronto = true;
+        if (exibicaoAtual == 0) info("recebendo video {}x{}", largura, altura);
     }
 
-    ID3D11Texture2D* bgra = paraExibir.converter(nv12);
+    ID3D11Texture2D* bgra = conversor.converter(nv12);
     if (!bgra) return;
 
     std::lock_guard trava(travaRecebido);
@@ -923,10 +1291,19 @@ void Aplicacao::Interno::lacoDecodificacao() {
             filaVideo.erase(filaVideo.begin());
         }
 
+        const auto antes = std::chrono::steady_clock::now();
         decodificador.decodificar(quadro.data(), quadro.size(),
                                   std::chrono::duration_cast<std::chrono::microseconds>(
-                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      antes.time_since_epoch())
                                       .count());
+        const auto gasto = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - antes)
+                               .count();
+        videoDecodado.fetch_add(1, std::memory_order_relaxed);
+        videoDecodeUsSoma.fetch_add(static_cast<uint64_t>(gasto), std::memory_order_relaxed);
+        if (static_cast<uint64_t>(gasto) > videoDecodeUsPico.load(std::memory_order_relaxed)) {
+            videoDecodeUsPico.store(static_cast<uint64_t>(gasto), std::memory_order_relaxed);
+        }
     }
 }
 
@@ -1093,7 +1470,11 @@ void Aplicacao::Interno::clique(float x, float y) {
             const int novo = static_cast<int>(i);
             if (novo != monitorEscolhido) {
                 const bool estavaTransmitindo = transmitindo;
-                pararTransmissao();
+                // So o encode: a conexao com o servidor continua de pe. Antes
+                // isto chamava pararTransmissao, que limpa o mapa de conexoes -
+                // trocar de monitor derrubava a chamada inteira e a
+                // renegociacao seguinte falhava.
+                pararEncodeSomente();
 
                 // O renderizador vive no dispositivo D3D11 da captura. Trocar de
                 // monitor destrói esse dispositivo, então ele precisa soltar
@@ -1104,10 +1485,44 @@ void Aplicacao::Interno::clique(float x, float y) {
                 cursorPronto = false;
 
                 monitorEscolhido = novo;
-                if (!tela.iniciar(static_cast<uint32_t>(novo))) {
-                    aviso = L"Não foi possível capturar esse monitor.";
-                    tela.iniciar(0);
-                    monitorEscolhido = 0;
+                // Trocar o monitor troca o objeto de duplicação por baixo da
+                // thread de captura. Sem esta trava ela estaria adquirindo
+                // quadro de um objeto que deixou de existir no meio da chamada.
+                {
+                    std::lock_guard travaTela(travaCaptura);
+                    if (quadroAtual) {
+                        tela.liberarQuadro();
+                        quadroAtual = nullptr;
+                    }
+                    {
+                        std::lock_guard t(travaPrevia);
+                        quadroPrevia = nullptr;
+                    }
+                    for (auto& t : previaTex) t.Reset();
+                    previaLargura = 0;
+                    previaAltura = 0;
+                    cursorPronto = false;
+
+                    // O decodificador também: ele nasceu amarrado ao dispositivo
+                    // D3D antigo, e trocar de monitor cria um novo. Sem derrubar
+                    // aqui, ele seguia decodificando para uma GPU que não é mais
+                    // a nossa - e a tela de quem estava transmitindo
+                    // simplesmente não aparecia mais depois da troca.
+                    decodificando.store(false);
+                    temVideo.notify_all();
+                    if (threadVideo.joinable()) threadVideo.join();
+                    decodificador.parar();
+                    {
+                        std::lock_guard t(travaRecebido);
+                        quadroRecebido = nullptr;
+                    }
+                    for (bool& p : exibicaoPronta) p = false;
+
+                    if (!tela.iniciar(static_cast<uint32_t>(novo))) {
+                        aviso = L"Não foi possível capturar esse monitor.";
+                        tela.iniciar(0);
+                        monitorEscolhido = 0;
+                    }
                 }
                 if (!render.iniciar(janela, tela.dispositivo())) {
                     aviso = L"A troca de monitor falhou. Reabra o aplicativo.";
@@ -1123,16 +1538,23 @@ void Aplicacao::Interno::clique(float x, float y) {
         if (dentro(btQualidades[i], x, y)) {
             const int novo = static_cast<int>(i);
             if (novo != qualidadeEscolhida) {
-                const bool estava = transmitindo;
-                pararTransmissao();
                 qualidadeEscolhida = novo;
-                // Trocar de qualidade refaz encoder e conversor, então a
-                // transmissão precisa recomeçar - e recomeça sozinha para a
-                // pessoa não achar que caiu.
-                if (estava) comecarTransmissao();
+                // Refaz só o encoder: a conexão continua de pé. Ver
+                // reiniciarEncode().
+                reiniciarEncode();
             }
             return;
         }
+    }
+
+    if (dentro(btAudio, x, y)) {
+        audioLigado = !audioLigado;
+        config.audio = audioLigado;
+        config.salvar();
+        // Mesma regra da qualidade: a captura de som nasce junto com a
+        // transmissão, então trocar no meio recomeça - sem derrubar a conexão.
+        reiniciarEncode();
+        return;
     }
 
     if (dentro(btTransmitir, x, y)) {
@@ -1276,19 +1698,23 @@ void Aplicacao::Interno::desenharEntrada() {
     }
 }
 
+// A tela ao vivo.
+//
+// Regras do desenho, para as próximas mudanças não desfazerem o que já foi
+// resolvido aqui:
+//
+// - O palco manda. Ele fica com toda a largura e altura que sobrarem; controle
+//   nenhum rouba espaço dele.
+// - Um item selecionado tem fundo verde OU contorno, nunca os dois. Ter os dois
+//   em cada linha era o que deixava o painel visualmente barulhento.
+// - Medida de linha é 30 px, não 40. Cabe mais coisa sem apertar nada.
+// - O que é diagnóstico fica embaixo, discreto, e só aparece transmitindo.
 void Aplicacao::Interno::desenharAoVivo() {
     const float larg = render.largura();
     const float alt = render.altura();
     const float topo = tema::kAlturaTitulo + tema::kEspaco;
     const float painelX = larg - tema::kLarguraPainelLateral - tema::kEspaco;
 
-    // ---- palco
-    const auto palco = D2D1::RectF(tema::kEspaco, topo, painelX - tema::kEspaco,
-                                   alt - tema::kEspaco - 64);
-    render.retangulo(palco, tema::kPainel, tema::kRaioCartao);
-
-    // O palco mostra quem está transmitindo. Se alguém está mandando vídeo, é
-    // esse; senão, a própria prévia de quem transmite daqui.
     ID3D11Texture2D* doOutro = nullptr;
     uint32_t doOutroLargura = 0;
     {
@@ -1297,189 +1723,224 @@ void Aplicacao::Interno::desenharAoVivo() {
         doOutroLargura = recebidoLargura;
     }
 
+    // ---- palco
+    //
+    // Sem barra inferior: os botões foram para o pé do painel lateral, e o
+    // palco herdou os 64 px que ela ocupava. Numa tela de chamada, imagem é o
+    // conteúdo e botão é moldura.
+    const auto palco = D2D1::RectF(tema::kEspaco, topo, painelX - tema::kEspaco,
+                                   alt - tema::kEspaco);
+    render.retangulo(palco, tema::kPainel, tema::kRaioCartao);
+
     // Passar textura nula é de propósito: sem quadro novo o renderizador
     // repinta o último. Antes a prévia apagava a cada instante em que a tela
     // não mudava, e o resultado era piscar sem parar.
-    render.video(doOutro ? doOutro : quadroAtual,
-                 D2D1::RectF(palco.left + 6, palco.top + 6, palco.right - 6, palco.bottom - 6));
+    render.video(doOutro ? doOutro : previaDaTela(),
+                 D2D1::RectF(palco.left + 5, palco.top + 5, palco.right - 5, palco.bottom - 5));
 
     if (!render.temQuadro()) {
-        const wchar_t* recado = transmitindo ? L"Aguardando o primeiro quadro…"
-                                             : L"Ninguém transmitindo ainda";
-        render.texto(recado, palco, tema::kApagado, Fonte::Subtitulo,
-                     DWRITE_TEXT_ALIGNMENT_CENTER);
-    }
-
-    if (doOutro && doOutroLargura > 0) {
-        const auto etiqueta = D2D1::RectF(palco.left + 18, palco.bottom - 52, palco.left + 260,
-                                          palco.bottom - 18);
-        render.retangulo(etiqueta, tema::kPainel, 10);
-        render.texto(paraW(quemTransmite) + L" · " + std::to_wstring(doOutroLargura) + L"p",
-                     etiqueta, tema::kTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+        render.texto(transmitindo ? L"Aguardando o primeiro quadro…"
+                                  : L"Ninguém está transmitindo",
+                     palco, tema::kApagado, Fonte::Subtitulo, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     render.contorno(palco, tema::kLinha, tema::kRaioCartao);
 
-    // Selo de ao vivo por cima do vídeo, como no cliente em Electron.
-    if (transmitindo) {
-        const auto selo = D2D1::RectF(palco.left + 18, palco.top + 18, palco.left + 132,
-                                      palco.top + 50);
-        render.retangulo(selo, tema::kVerdeSuave, 10);
-        render.contorno(selo, tema::kVerdeLinha, 10);
-        render.texto(L"●  AO VIVO", selo, tema::kVerde, Fonte::Pequena,
-                     DWRITE_TEXT_ALIGNMENT_CENTER);
+    // Uma etiqueta só, no alto à esquerda, dizendo o que se está vendo. Antes
+    // havia duas - selo de ao vivo em cima e nome embaixo - e as duas competiam
+    // com a imagem.
+    {
+        const bool vendoOutro = doOutro && doOutroLargura > 0;
+        std::wstring texto;
+        D2D1_COLOR_F corTexto = tema::kApagado;
+
+        if (vendoOutro) {
+            texto = L"●  " + paraW(quemTransmite);
+            if (doOutroLargura > 0) texto += L"  ·  " + std::to_wstring(doOutroLargura) + L"p";
+            corTexto = tema::kVerde;
+        } else if (transmitindo) {
+            texto = L"●  AO VIVO  ·  sua tela";
+            corTexto = tema::kVerde;
+        } else {
+            texto = L"sua tela";
+        }
+
+        const float largura = render.larguraDoTexto(texto, Fonte::Pequena) + 28;
+        const auto etiqueta =
+            D2D1::RectF(palco.left + 14, palco.top + 14, palco.left + 14 + largura,
+                        palco.top + 44);
+        render.retangulo(etiqueta, tema::kFundo, 15);
+        if (corTexto.g > 0.5f) render.contorno(etiqueta, tema::kVerdeLinha, 15);
+        render.texto(texto, etiqueta, corTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
-
-    // ---- barra inferior
-    const float barraY = alt - tema::kEspaco - 52;
-    btTransmitir = D2D1::RectF(tema::kEspaco, barraY, tema::kEspaco + 210, barraY + 44);
-    desenharBotao(btTransmitir, transmitindo ? L"PARAR DE TRANSMITIR" : L"TRANSMITIR TELA",
-                  transmitindo);
-
-    btSair = D2D1::RectF(painelX - tema::kEspaco - 120, barraY, painelX - tema::kEspaco,
-                         barraY + 44);
-    desenharBotao(btSair, L"SAIR", false);
 
     // ---- painel lateral
     const auto painel = D2D1::RectF(painelX, topo, larg - tema::kEspaco, alt - tema::kEspaco);
     render.retangulo(painel, tema::kPainel, tema::kRaioCartao);
     render.contorno(painel, tema::kLinha, tema::kRaioCartao);
 
-    float linhaY = painel.top + 20;
-    render.texto(L"MONITOR", D2D1::RectF(painel.left + 20, linhaY, painel.right - 20, linhaY + 18),
-                 tema::kApagado, Fonte::Pequena);
-    linhaY += 26;
+    const float esq = painel.left + 16;
+    const float dir = painel.right - 16;
+    float y = painel.top + 16;
 
+    auto secao = [&](const wchar_t* titulo) {
+        render.texto(titulo, D2D1::RectF(esq, y, dir, y + 14), tema::kApagado, Fonte::Pequena);
+        y += 20;
+    };
+
+    // Item de lista: fundo quando escolhido, nada quando não. Sem contorno em
+    // cima do fundo - é o que tirava o ar do painel.
+    auto item = [&](const std::wstring& esquerda, const std::wstring& direita, bool ativo) {
+        const auto area = D2D1::RectF(esq, y, dir, y + 30);
+        render.retangulo(area, ativo ? tema::kVerdeSuave : tema::kPainel2, 8);
+        render.texto(esquerda, D2D1::RectF(area.left + 11, area.top, area.right - 70, area.bottom),
+                     ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+        if (!direita.empty()) {
+            render.texto(direita,
+                         D2D1::RectF(area.left, area.top, area.right - 11, area.bottom),
+                         tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        y += 34;
+        return area;
+    };
+
+    secao(L"MONITOR");
     btMonitores.clear();
     for (size_t i = 0; i < monitores.size(); ++i) {
-        const auto area = D2D1::RectF(painel.left + 20, linhaY, painel.right - 20, linhaY + 40);
-        btMonitores.push_back(area);
-
-        const bool ativo = static_cast<int>(i) == monitorEscolhido;
-        render.retangulo(area, ativo ? tema::kVerdeSuave : tema::kPainel2, tema::kRaioBotao);
-        render.contorno(area, ativo ? tema::kVerdeLinha : tema::kLinha, tema::kRaioBotao);
-
-        const std::wstring rotulo = paraW(monitores[i].nome) + L"   " +
-                                    std::to_wstring(monitores[i].largura) + L"×" +
-                                    std::to_wstring(monitores[i].altura);
-        render.texto(rotulo, D2D1::RectF(area.left + 14, area.top, area.right - 14, area.bottom),
-                     ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
-        linhaY += 48;
+        // "Monitor 1" em vez de "\\.\DISPLAY2": o caminho do dispositivo não
+        // diz nada a quem está escolhendo onde a tela vai ser capturada.
+        const std::wstring nome = L"Monitor " + std::to_wstring(i + 1);
+        const std::wstring tamanho = std::to_wstring(monitores[i].largura) + L"×" +
+                                     std::to_wstring(monitores[i].altura);
+        btMonitores.push_back(item(nome, tamanho, static_cast<int>(i) == monitorEscolhido));
     }
 
-    linhaY += 4;
-    render.texto(L"QUALIDADE", D2D1::RectF(painel.left + 20, linhaY, painel.right - 20, linhaY + 18),
-                 tema::kApagado, Fonte::Pequena);
-    linhaY += 26;
-
+    y += 6;
+    secao(L"QUALIDADE");
     btQualidades.clear();
     for (size_t i = 0; i < std::size(kQualidades); ++i) {
-        const auto area = D2D1::RectF(painel.left + 20, linhaY, painel.right - 20, linhaY + 36);
-        btQualidades.push_back(area);
-
-        const bool ativo = static_cast<int>(i) == qualidadeEscolhida;
-        render.retangulo(area, ativo ? tema::kVerdeSuave : tema::kPainel2, tema::kRaioBotao);
-        render.contorno(area, ativo ? tema::kVerdeLinha : tema::kLinha, tema::kRaioBotao);
-        render.texto(kQualidades[i].rotulo,
-                     D2D1::RectF(area.left + 14, area.top, area.right - 60, area.bottom),
-                     ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
-        render.texto(std::to_wstring(kQualidades[i].bitrate / 1000) + L" kbps",
-                     D2D1::RectF(area.left, area.top, area.right - 14, area.bottom),
-                     tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        linhaY += 42;
+        btQualidades.push_back(item(kQualidades[i].rotulo,
+                                    std::to_wstring(kQualidades[i].bitrate / 1000) + L" kbps",
+                                    static_cast<int>(i) == qualidadeEscolhida));
     }
 
-    linhaY += 6;
-    render.linha(painel.left + 20, linhaY, painel.right - 20, linhaY, tema::kLinha);
-    linhaY += 20;
+    // Interruptor do som. Fica logo abaixo da qualidade porque é a mesma
+    // decisão - o que sai daqui - mas com forma diferente, porque é liga/desliga
+    // e não escolha entre opções.
+    y += 6;
+    btAudio = D2D1::RectF(esq, y, dir, y + 34);
+    render.retangulo(btAudio, audioLigado ? tema::kVerdeSuave : tema::kPainel2, 8);
+    render.texto(audioLigado ? L"Som do sistema" : L"Sem som",
+                 D2D1::RectF(btAudio.left + 11, btAudio.top, btAudio.right - 64, btAudio.bottom),
+                 audioLigado ? tema::kVerde : tema::kApagado, Fonte::Pequena);
+    {
+        const float tl = btAudio.right - 51;
+        const float tt = btAudio.top + 9;
+        render.retangulo(D2D1::RectF(tl, tt, tl + 36, tt + 16),
+                         audioLigado ? tema::kVerde : tema::kLinha, 8);
+        const float bola = audioLigado ? tl + 22 : tl + 2;
+        render.retangulo(D2D1::RectF(bola, tt + 2, bola + 12, tt + 14), tema::kPainel, 6);
+    }
+    y += 44;
 
+    // ---- quem está na sala
     std::vector<Participante> copia;
-    std::string eu;
     {
         std::lock_guard trava(travaPares);
         copia = pares;
-        eu = meuId;
     }
 
-    render.texto(L"NA SALA  (" + std::to_wstring(copia.size() + 1) + L")",
-                 D2D1::RectF(painel.left + 20, linhaY, painel.right - 20, linhaY + 18),
-                 tema::kApagado, Fonte::Pequena);
-    linhaY += 28;
+    render.linha(esq, y, dir, y, tema::kLinha);
+    y += 16;
+    secao((L"NA SALA  (" + std::to_wstring(copia.size() + 1) + L")").c_str());
 
-    const std::wstring meuNome =
-        campoNome.valor.empty() ? L"Você" : campoNome.valor + L"  (você)";
-    render.texto(meuNome, D2D1::RectF(painel.left + 20, linhaY, painel.right - 80, linhaY + 22),
-                 tema::kVerde, Fonte::Corpo);
-    render.texto(std::to_wstring(sinal.pingMs()) + L" ms",
-                 D2D1::RectF(painel.right - 90, linhaY, painel.right - 20, linhaY + 22),
-                 tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    linhaY += 28;
+    // Uma pessoa por linha, com marca de quem está no palco.
+    //
+    // Isto responde à pergunta que a tela antiga deixava no ar: o palco troca
+    // sozinho para quem transmite, e nada dizia que aquilo tinha acontecido nem
+    // de quem era a tela. Agora o ponto verde diz.
+    auto pessoa = [&](const std::wstring& nome, int ping, bool souEu, bool noPalco) {
+        const auto area = D2D1::RectF(esq, y, dir, y + 26);
+        if (noPalco) render.retangulo(area, tema::kVerdeSuave, 7);
 
-    for (const auto& p : copia) {
-        render.texto(paraW(p.nome),
-                     D2D1::RectF(painel.left + 20, linhaY, painel.right - 80, linhaY + 22),
-                     tema::kTexto, Fonte::Corpo);
-        render.texto(std::to_wstring(p.pingMs) + L" ms",
-                     D2D1::RectF(painel.right - 90, linhaY, painel.right - 20, linhaY + 22),
+        float x = area.left + (noPalco ? 10.0f : 2.0f);
+        if (noPalco) {
+            render.retangulo(D2D1::RectF(x, area.top + 11, x + 5, area.top + 16), tema::kVerde, 3);
+            x += 12;
+        }
+        render.texto(nome, D2D1::RectF(x, area.top, area.right - 62, area.bottom),
+                     souEu ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+        render.texto(std::to_wstring(ping) + L" ms",
+                     D2D1::RectF(area.left, area.top, area.right - 8, area.bottom),
                      tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        linhaY += 28;
-    }
-
-    // ---- rodapé do painel: o que está realmente acontecendo
-    float rodape = painel.bottom - 118;
-    render.linha(painel.left + 20, rodape - 12, painel.right - 20, rodape - 12, tema::kLinha);
-
-    auto linhaInfo = [&](const std::wstring& rotulo, const std::wstring& valor,
-                         const D2D1_COLOR_F& cor) {
-        render.texto(rotulo, D2D1::RectF(painel.left + 20, rodape, painel.right - 20, rodape + 20),
-                     tema::kApagado, Fonte::Pequena);
-        render.texto(valor, D2D1::RectF(painel.left + 20, rodape, painel.right - 20, rodape + 20),
-                     cor, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        rodape += 22;
+        y += 28;
     };
 
-    wchar_t buffer[32];
-    ::swprintf_s(buffer, L"%.0f/s", fps);
-    linhaInfo(L"captura", buffer, tema::kTexto);
+    const std::wstring meuNome = campoNome.valor.empty() ? L"Você" : campoNome.valor + L"  (você)";
+    pessoa(meuNome, sinal.pingMs(), true, transmitindo && !doOutro);
 
-    if (transmitindo) {
-        linhaInfo(L"encoder", paraW(encoder.nomeDoEncoder()).substr(0, 18),
-                  encoder.porHardware() ? tema::kVerde : tema::kApagado);
-        ::swprintf_s(buffer, L"%llu", static_cast<unsigned long long>(encoder.quadrosCodificados()));
-        linhaInfo(L"codificados", buffer, tema::kTexto);
-        linhaInfo(L"audio",
-                  audio.pidExcluido() ? L"sem o Discord" : L"tudo",
-                  audio.ativo() ? tema::kVerde : tema::kApagado);
-        size_t abertas = 0;
-        uint64_t pacotes = 0;
-        std::wstring estadoMidia = L"sem ninguem";
-        std::wstring caminhosMidia;
-        {
-            std::lock_guard trava(travaConexoes);
-            for (auto& [id, c] : conexoes) {
-                if (c->pronto()) ++abertas;
-                pacotes += c->pacotesEnviados();
-            }
-            if (!conexoes.empty()) {
-                // Estado por extenso quando nada conectou: "0/1" nao diz se esta
-                // negociando, se falhou ou se nem comecou.
-                ::swprintf_s(buffer, L"%zu/%zu", abertas, conexoes.size());
-                estadoMidia = abertas > 0 ? buffer
-                                          : paraW(conexoes.begin()->second->estado());
-                caminhosMidia = paraW(conexoes.begin()->second->caminhos());
-            }
+    const std::wstring noPalcoAgora = paraW(quemTransmite);
+    for (const auto& p : copia) {
+        pessoa(paraW(p.nome), p.pingMs, false, doOutro && paraW(p.nome) == noPalcoAgora);
+    }
+
+    // ---- pé do painel: botões e, abaixo deles, o diagnóstico
+    //
+    // Ancorados na base em vez de seguirem a lista. Com a sala cheia, o rodapé
+    // calculado por posição fixa se sobrepunha aos nomes.
+    const float alturaDiagnostico = transmitindo ? 74.0f : 0.0f;
+    float base = painel.bottom - 16 - alturaDiagnostico;
+
+    btSair = D2D1::RectF(esq, base - 38, esq + 84, base);
+    desenharBotao(btSair, L"SAIR", false);
+    btTransmitir = D2D1::RectF(esq + 92, base - 38, dir, base);
+    desenharBotao(btTransmitir, transmitindo ? L"PARAR" : L"TRANSMITIR", transmitindo);
+
+    if (!transmitindo) return;
+
+    // Diagnóstico: três linhas, e só o que muda de verdade enquanto se
+    // transmite. A versão anterior tinha oito linhas de rótulo e valor - era
+    // mais alta que a lista de participantes e ninguém lia.
+    float d = painel.bottom - 62;
+    auto info = [&](const std::wstring& rotulo, const std::wstring& valor,
+                    const D2D1_COLOR_F& cor) {
+        render.texto(rotulo, D2D1::RectF(esq, d, dir, d + 16), tema::kApagado, Fonte::Pequena);
+        render.texto(valor, D2D1::RectF(esq, d, dir, d + 16), cor, Fonte::Pequena,
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+        d += 17;
+    };
+
+    render.linha(esq, painel.bottom - 74, dir, painel.bottom - 74, tema::kLinha);
+
+    wchar_t buffer[64];
+    ::swprintf_s(buffer, L"%.0f/s  ·  %s", fps,
+                 encoder.porHardware() ? L"GPU" : L"CPU");
+    info(L"captura", buffer, encoder.porHardware() ? tema::kVerde : tema::kApagado);
+
+    size_t abertas = 0;
+    std::wstring estadoMidia = L"sem ninguem";
+    std::wstring caminhosMidia;
+    {
+        std::lock_guard trava(travaConexoes);
+        for (auto& [id, c] : conexoes) {
+            if (c->pronto()) ++abertas;
         }
-        linhaInfo(L"midia", estadoMidia, abertas > 0 ? tema::kVerde : tema::kApagado);
-        if (!caminhosMidia.empty()) {
-            // Sem caminho público nem retransmitido, quem está fora da sua rede
-            // não recebe nada - e essa é a informação que faltava quando a
-            // conexão ficava presa "procurando caminho".
-            const bool soLocal = caminhosMidia == L"local";
-            linhaInfo(L"caminho", caminhosMidia, soLocal ? tema::kVermelho : tema::kTexto);
+        if (!conexoes.empty()) {
+            ::swprintf_s(buffer, L"%zu/%zu", abertas, conexoes.size());
+            estadoMidia = abertas > 0 ? buffer : paraW(conexoes.begin()->second->estado());
+            caminhosMidia = paraW(conexoes.begin()->second->caminhos());
         }
-        ::swprintf_s(buffer, L"%llu", static_cast<unsigned long long>(pacotes));
-        linhaInfo(L"quadros enviados", buffer, tema::kTexto);
+    }
+    info(L"conexao", estadoMidia, abertas > 0 ? tema::kVerde : tema::kApagado);
+
+    // Sem caminho público nem retransmitido, quem está fora da sua rede não
+    // recebe nada - e essa é a informação que faltava quando a conexão ficava
+    // presa em "procurando caminho".
+    if (!caminhosMidia.empty()) {
+        const bool soLocal = caminhosMidia == L"local";
+        info(L"caminho", caminhosMidia, soLocal ? tema::kVermelho : tema::kApagado);
     } else {
-        linhaInfo(L"encoder", L"parado", tema::kApagado);
+        info(L"audio", audio.pidExcluido() ? L"sem o Discord" : L"tudo",
+             audio.ativo() ? tema::kVerde : tema::kApagado);
     }
 }
 

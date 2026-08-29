@@ -46,6 +46,10 @@ public:
     ID3D11Device* dispositivo() const;
     void redimensionar(uint32_t largura, uint32_t altura);
 
+    // Verdadeiro depois que o Windows reiniciou a GPU. A partir daí nenhuma
+    // chamada ao dispositivo antigo funciona, e quem desenha precisa saber.
+    bool dispositivoPerdido() const;
+
     void comecarQuadro();
     void terminarQuadro();
 

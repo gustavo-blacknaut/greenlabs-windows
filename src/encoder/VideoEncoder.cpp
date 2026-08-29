@@ -263,10 +263,44 @@ bool VideoEncoder::Interno::ajustarCodecApi() {
     v.ulVal = config.bitrate;
     definir(CODECAPI_AVEncCommonMeanBitRate, v);
 
+    // Janela do controle de taxa. Sem definir, o padrão é cerca de um segundo,
+    // e um segundo de folga deixa o quadro-chave sair com 100 KB - vinte vezes
+    // o tamanho de um quadro normal. Essa rajada é o que entope a fila do
+    // roteador. Com 250 ms, o encoder é obrigado a distribuir os bits, e o
+    // quadro-chave sai numa fração do tamanho.
+    //
+    // Anda junto com o pacer: este limita o tamanho do estouro, o pacer espalha
+    // no tempo o que ainda estoura.
+    v.vt = VT_UI4;
+    v.ulVal = config.bitrate / 4;
+    definir(CODECAPI_AVEncCommonBufferSize, v);
+
     // Zero quadros B, pelo mesmo motivo do perfil ConstrainedBaseline.
     v.vt = VT_UI4;
     v.ulVal = 0;
     definir(CODECAPI_AVEncMPVDefaultBPictureCount, v);
+
+    // Uma única imagem de referência.
+    //
+    // O encoder da AMD guarda várias por padrão, e guardar referência significa
+    // segurar quadro dentro do pipeline antes de soltar o primeiro byte. Para
+    // gravar arquivo isso rende qualidade; ao vivo é atraso puro, e ninguém
+    // olhando a tela do outro percebe a diferença de qualidade - percebe o
+    // atraso.
+    v.vt = VT_UI4;
+    v.ulVal = 1;
+    definir(CODECAPI_AVEncVideoMaxNumRefFrame, v);
+
+    // Equilíbrio entre qualidade e velocidade no meio, e nao no extremo.
+    //
+    // Ja tentei 0 (tudo para velocidade) achando que cortaria atraso. Cortou o
+    // tempo de encode e INCHOU o quadro: o quadro-chave saltou de 101 KB para
+    // 149 KB, porque codificar mais rapido e codificar menos eficiente. Quadro
+    // maior e mais bytes na rede, e na saida de casa isso custa muito mais
+    // atraso do que os microssegundos economizados no chip.
+    v.vt = VT_UI4;
+    v.ulVal = 50;
+    definir(CODECAPI_AVEncCommonQualityVsSpeed, v);
 
     if (config.intervaloChaveSegundos > 0) {
         v.vt = VT_UI4;

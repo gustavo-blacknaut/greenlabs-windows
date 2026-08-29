@@ -59,19 +59,27 @@ void AudioEncoder::parar() {
 
 bool AudioEncoder::ativo() const { return d_->enc != nullptr; }
 
-const std::vector<uint8_t>& AudioEncoder::codificar(const float* intercalado, uint32_t quadros) {
-    static const std::vector<uint8_t> vazio;
-    if (!d_->enc || !intercalado || quadros == 0) return vazio;
+void AudioEncoder::acumular(const float* intercalado, uint32_t quadros) {
+    if (!d_->enc || !intercalado || quadros == 0) return;
 
     const size_t entram = static_cast<size_t>(quadros) * kCanaisAudio;
+    if (entram > Interno::kCapacidade) return;
 
     // Não cabe: o consumidor está atrasado. Descartar o que já havia é melhor
     // que crescer o buffer - som velho não interessa e atraso não se recupera.
+    //
+    // Com o proximo() drenando em laço, isto virou o caso raro que deveria
+    // sempre ter sido. Antes acontecia o tempo todo, porque só um quadro saía
+    // por chamada e o resto se empilhava aqui até estourar.
     if (d_->usado + entram > Interno::kCapacidade) d_->usado = 0;
-    if (entram > Interno::kCapacidade) return vazio;
 
     memcpy(d_->acumulado + d_->usado, intercalado, entram * sizeof(float));
     d_->usado += entram;
+}
+
+const std::vector<uint8_t>& AudioEncoder::proximo() {
+    static const std::vector<uint8_t> vazio;
+    if (!d_->enc) return vazio;
 
     const size_t precisa = static_cast<size_t>(kQuadrosPorPacote) * kCanaisAudio;
     if (d_->usado < precisa) return vazio;

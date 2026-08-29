@@ -45,6 +45,19 @@ int64_t agoraQpc() {
     return v.QuadPart;
 }
 
+// A rotação que o DXGI informa, em graus.
+//
+// DXGI_MODE_ROTATION_UNSPECIFIED aparece em monitor único e significa "sem
+// giro"; tratá-lo como desconhecido faria a tela girar sem motivo.
+uint32_t grausDe(DXGI_MODE_ROTATION rotacao) {
+    switch (rotacao) {
+        case DXGI_MODE_ROTATION_ROTATE90:  return 90;
+        case DXGI_MODE_ROTATION_ROTATE180: return 180;
+        case DXGI_MODE_ROTATION_ROTATE270: return 270;
+        default:                           return 0;
+    }
+}
+
 // Percorre adaptadores e saídas chamando a função para cada par encontrado.
 template <class Fn>
 void paraCadaSaida(Fn&& fn) {
@@ -117,6 +130,7 @@ std::vector<MonitorInfo> ScreenCapture::listarMonitores() {
                 static_cast<uint32_t>(descricao.DesktopCoordinates.bottom -
                                       descricao.DesktopCoordinates.top),
                 primario,
+                grausDe(descricao.Rotation),
             });
             ++indice;
         }
@@ -142,6 +156,7 @@ bool ScreenCapture::iniciar(uint32_t indiceMonitor) {
                                                  descricao.DesktopCoordinates.left);
         d_->info.altura = static_cast<uint32_t>(descricao.DesktopCoordinates.bottom -
                                                descricao.DesktopCoordinates.top);
+        d_->info.graus = grausDe(descricao.Rotation);
         return false;  // achou, para de procurar
     });
 
@@ -158,14 +173,60 @@ bool ScreenCapture::iniciar(uint32_t indiceMonitor) {
     };
     D3D_FEATURE_LEVEL nivelObtido{};
 
-    HRESULT resultado = ::D3D11CreateDevice(
-        d_->adaptador.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, niveis,
-        ARRAYSIZE(niveis), D3D11_SDK_VERSION,
-        &d_->dispositivo, &nivelObtido, &d_->contexto);
-    if (FAILED(resultado)) {
-        erro("D3D11CreateDevice falhou: {}", hr(resultado));
+    // Escada de tentativas, em vez de uma só.
+    //
+    // Pedir VIDEO_SUPPORT de saída é o certo - é o que dá encoder e
+    // decodificador na GPU. Mas há máquina e há momento em que o driver
+    // simplesmente recusa (DXGI_ERROR_UNSUPPORTED), e antes disso derrubava o
+    // aplicativo inteiro na abertura: caixa de erro, nada funciona, fim.
+    //
+    // Sem aceleração de vídeo o programa continua útil - a tela é capturada, o
+    // codec cai para software, a chamada acontece. E se nem o adaptador servir,
+    // o WARP serve: é o rasterizador por software da própria Microsoft, mais
+    // lento e sempre disponível. É a mesma escada que o Chromium desce, e é por
+    // isso que o Electron abre em máquina onde isto não abria.
+    struct Tentativa {
+        IDXGIAdapter1* adaptador;
+        D3D_DRIVER_TYPE tipo;
+        UINT sinalizadores;
+        const char* descricao;
+    };
+    const UINT comVideo = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    const UINT semVideo = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+    const Tentativa tentativas[] = {
+        {d_->adaptador.Get(), D3D_DRIVER_TYPE_UNKNOWN, comVideo, "GPU com aceleracao de video"},
+        {d_->adaptador.Get(), D3D_DRIVER_TYPE_UNKNOWN, semVideo, "GPU sem aceleracao de video"},
+        {nullptr, D3D_DRIVER_TYPE_HARDWARE, comVideo, "GPU padrao com aceleracao de video"},
+        {nullptr, D3D_DRIVER_TYPE_HARDWARE, semVideo, "GPU padrao sem aceleracao de video"},
+        {nullptr, D3D_DRIVER_TYPE_WARP, semVideo, "WARP (software)"},
+    };
+
+    HRESULT resultado = E_FAIL;
+    const char* escolhida = nullptr;
+    for (const Tentativa& t : tentativas) {
+        d_->dispositivo.Reset();
+        d_->contexto.Reset();
+        resultado = ::D3D11CreateDevice(t.adaptador, t.tipo, nullptr, t.sinalizadores, niveis,
+                                        ARRAYSIZE(niveis), D3D11_SDK_VERSION, &d_->dispositivo,
+                                        &nivelObtido, &d_->contexto);
+        if (SUCCEEDED(resultado)) {
+            escolhida = t.descricao;
+            break;
+        }
+        aviso("D3D11: {} nao serviu ({})", t.descricao, hr(resultado));
+    }
+
+    if (!escolhida) {
+        erro("D3D11CreateDevice falhou em todas as tentativas: {}", hr(resultado));
         return false;
+    }
+
+    // Vale registrar qual ganhou: a diferença entre a primeira e a última é a
+    // diferença entre transmitir 1080p sem sentir e a máquina inteira sofrer.
+    info("D3D11: {}", escolhida);
+    if (escolhida != tentativas[0].descricao) {
+        aviso("sem o caminho preferido de video - o codec pode cair para software");
     }
 
     // Duplicacao que nao abre agora nao impede o aplicativo de rodar: da para

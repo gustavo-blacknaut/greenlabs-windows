@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(GreenLabs
-    VERSION 0.3.2
+    VERSION 0.4.5
     DESCRIPTION "Cliente nativo do GreenLabs Live Streaming"
     LANGUAGES C CXX)
 
@@ -124,6 +124,7 @@ add_library(greenlabs_core STATIC
     src/network/WebSocketClient.cpp
     src/network/Signaling.cpp
     src/network/Midia.cpp
+    src/network/Pacer.cpp
     src/config/Config.cpp
     ui/Renderizador.cpp
     ui/Aplicacao.cpp

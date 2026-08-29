@@ -34,8 +34,17 @@ public:
     // múltiplos certinhos, e mandar pedaço solto quebra o decodificador do
     // outro lado.
     //
-    // Devolve vazio quando ainda não fechou um quadro.
-    const std::vector<uint8_t>& codificar(const float* intercalado, uint32_t quadros);
+    // Junta o que vier. NAO codifica: quem tira os pacotes e o proximo().
+    void acumular(const float* intercalado, uint32_t quadros);
+
+    // Um pacote de 20 ms por chamada, ate acabar; vazio quando nao ha mais
+    // quadro completo acumulado.
+    //
+    // Sao dois passos, e nao um, porque o WASAPI nao entrega em fatias de
+    // 20 ms - numa volta ele pode trazer 40 ou 60. Com uma funcao so, que
+    // recebia e devolvia UM pacote, o resto ficava para tras a cada chamada ate
+    // o acumulador estourar e descartar tudo. Assim o chamador drena em laco.
+    const std::vector<uint8_t>& proximo();
 
 private:
     struct Interno;
