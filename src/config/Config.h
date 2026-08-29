@@ -19,6 +19,11 @@ struct Config {
     int qualidade = 1;  // índice na tabela de qualidades
     int monitor = 0;
 
+    // Transmitir o som do sistema junto com a tela. Ligado é o padrão, porque
+    // é o motivo de o GreenLabs existir; desligado serve a quem só quer
+    // mostrar a tela — e gasta menos banda e menos máquina.
+    bool audio = true;
+
     // Servidores já usados, do mais recente para o mais antigo. Quem entra numa
     // sala hoje volta nela amanhã, e digitar o endereço de novo toda vez é o
     // tipo de atrito que faz a pessoa desistir.

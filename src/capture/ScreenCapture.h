@@ -27,9 +27,26 @@ namespace gl {
 struct MonitorInfo {
     uint32_t indice = 0;
     std::string nome;
+
+    // Medidas LÓGICAS: como a área de trabalho aparece para quem olha. Num
+    // monitor girado para retrato, são 1080x1920.
     uint32_t largura = 0;
     uint32_t altura = 0;
     bool primario = false;
+
+    // Quantos graus a imagem está girada em relação ao painel.
+    //
+    // Isto existe porque a duplicação NÃO devolve a textura como a pessoa vê:
+    // ela devolve na orientação física do painel. Um monitor 1920x1080 posto em
+    // pé continua entregando uma textura 1920x1080, com o conteúdo deitado.
+    // Ignorar este campo é o que fazia a tela do monitor em retrato chegar
+    // virada do outro lado.
+    uint32_t graus = 0;  // 0, 90, 180 ou 270
+
+    // Medidas FÍSICAS: o tamanho real da textura que a duplicação entrega. Com
+    // 90 ou 270 graus, são as lógicas trocadas.
+    uint32_t larguraFisica() const { return (graus == 90 || graus == 270) ? altura : largura; }
+    uint32_t alturaFisica() const { return (graus == 90 || graus == 270) ? largura : altura; }
 };
 
 struct QuadroCapturado {

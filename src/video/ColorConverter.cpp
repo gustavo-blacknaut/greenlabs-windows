@@ -39,7 +39,7 @@ ColorConverter::~ColorConverter() = default;
 bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto,
                              uint32_t larguraEntrada, uint32_t alturaEntrada,
                              uint32_t larguraSaida, uint32_t alturaSaida,
-                             Saida formatoSaida) {
+                             Saida formatoSaida, uint32_t graus) {
     d_->dispositivo = dispositivo;
     d_->contexto = contexto;
     d_->larguraEntrada = larguraEntrada;
@@ -130,8 +130,33 @@ bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* con
                                                           D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
     d_->videoContexto->VideoProcessorSetStreamAutoProcessingMode(d_->processador.Get(), 0, FALSE);
 
-    info("conversao BGRA {}x{} -> NV12 {}x{} na GPU", larguraEntrada, alturaEntrada, d_->largura,
-         d_->altura);
+    // Giro do monitor.
+    //
+    // A duplicação entrega a textura na orientação FÍSICA do painel: um monitor
+    // 1920x1080 posto em pé continua entregando 1920x1080, com o conteúdo
+    // deitado. Quem via a transmissão recebia a tela virada de lado.
+    //
+    // O Video Processor gira de graça, na mesma passada da conversão de cor -
+    // é a unidade de função fixa da placa, não custa quadro nenhum. Fazer isso
+    // com shader ou na CPU custaria os dois.
+    if (graus != 0) {
+        ComPtr<ID3D11VideoContext1> videoContexto1;
+        if (SUCCEEDED(d_->videoContexto.As(&videoContexto1))) {
+            const auto giro = (graus == 90)    ? D3D11_VIDEO_PROCESSOR_ROTATION_90
+                              : (graus == 180) ? D3D11_VIDEO_PROCESSOR_ROTATION_180
+                                               : D3D11_VIDEO_PROCESSOR_ROTATION_270;
+            videoContexto1->VideoProcessorSetStreamRotation(d_->processador.Get(), 0, TRUE, giro);
+            info("monitor girado {} graus: corrigindo na GPU", graus);
+        } else {
+            aviso("monitor girado {} graus, mas o driver nao expoe rotacao no Video Processor",
+                  graus);
+        }
+    }
+
+    // Diz o formato de verdade: o mesmo Video Processor serve os dois sentidos,
+    // e um log que sempre escreve "NV12" mente na metade das vezes.
+    info("conversao {}x{} -> {} {}x{} na GPU", larguraEntrada, alturaEntrada,
+         formatoSaida == Saida::Nv12 ? "NV12" : "BGRA", d_->largura, d_->altura);
     return true;
 }
 

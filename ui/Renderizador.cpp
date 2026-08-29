@@ -40,6 +40,7 @@ Estilo estiloDe(Fonte f) {
 
 struct Renderizador::Interno {
     ComPtr<ID3D11Device> dispositivo;
+    bool dispositivoPerdido = false;
     ComPtr<ID3D11DeviceContext> contexto;
     ComPtr<IDXGISwapChain1> cadeia;
 
@@ -94,8 +95,18 @@ void Renderizador::liberar() {
     d_->dispositivo2d.Reset();
     d_->fabrica2d.Reset();
     d_->cadeia.Reset();
+
+    // Limpa e esvazia o contexto antes de largar o dispositivo. Sem isto o
+    // pipeline continua segurando referência ao buffer da cadeia antiga, e a
+    // criação da cadeia seguinte para a MESMA janela é recusada com
+    // E_ACCESSDENIED - foi o que impediu a recuperação depois do reset da GPU.
+    if (d_->contexto) {
+        d_->contexto->ClearState();
+        d_->contexto->Flush();
+    }
     d_->contexto.Reset();
     d_->dispositivo.Reset();
+    d_->dispositivoPerdido = false;
     d_->larguraVideo = 0;
     d_->alturaVideo = 0;
 }
@@ -218,6 +229,18 @@ void Renderizador::redimensionar(uint32_t largura, uint32_t altura) {
 
     const HRESULT resultado = d_->cadeia->ResizeBuffers(0, largura, altura, DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(resultado)) {
+        // Dispositivo removido é outra história: a GPU resetou (o TDR do
+        // Windows), e daí em diante TODA chamada falha. Registrar uma vez e
+        // marcar; sem isso o laço voltava aqui a cada 5 ms e enchia o log com
+        // milhares de linhas iguais enquanto a tela ficava parada.
+        if (resultado == DXGI_ERROR_DEVICE_REMOVED || resultado == DXGI_ERROR_DEVICE_RESET) {
+            if (!d_->dispositivoPerdido) {
+                d_->dispositivoPerdido = true;
+                HRESULT motivo = d_->dispositivo ? d_->dispositivo->GetDeviceRemovedReason() : 0;
+                erro("a GPU foi reiniciada pelo Windows (motivo {})", hr(motivo));
+            }
+            return;
+        }
         erro("ResizeBuffers falhou: {}", hr(resultado));
         return;
     }
@@ -325,8 +348,20 @@ void Renderizador::terminarQuadro() {
     d_->contexto2d->EndDraw();
     // Intervalo 1: acompanha o refresh do monitor. Zero rasgaria a imagem e
     // gastaria GPU à toa numa interface que quase não muda.
-    d_->cadeia->Present(1, 0);
+    const HRESULT resultado = d_->cadeia->Present(1, 0);
+
+    // O Present é onde o reset da GPU costuma aparecer primeiro. Marcar aqui
+    // faz o resto do programa saber que precisa se refazer, em vez de seguir
+    // chamando um dispositivo que não existe mais.
+    if ((resultado == DXGI_ERROR_DEVICE_REMOVED || resultado == DXGI_ERROR_DEVICE_RESET) &&
+        !d_->dispositivoPerdido) {
+        d_->dispositivoPerdido = true;
+        const HRESULT motivo = d_->dispositivo ? d_->dispositivo->GetDeviceRemovedReason() : 0;
+        erro("a GPU foi reiniciada pelo Windows (motivo {})", hr(motivo));
+    }
 }
+
+bool Renderizador::dispositivoPerdido() const { return d_->dispositivoPerdido; }
 
 void Renderizador::limpar(const D2D1_COLOR_F& cor) { d_->contexto2d->Clear(cor); }
 

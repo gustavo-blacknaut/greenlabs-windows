@@ -1,5 +1,7 @@
 #include "network/Midia.h"
 
+#include "network/Pacer.h"
+
 #include <rtc/rtc.hpp>
 
 #include <atomic>
@@ -66,6 +68,7 @@ struct ConexaoPar::Interno {
     std::shared_ptr<rtc::PeerConnection> conexao;
     std::shared_ptr<rtc::Track> faixaVideo;
     std::shared_ptr<rtc::RtpPacketizationConfig> empacotamento;
+    std::shared_ptr<Pacer> pacer;
 
     AoDescrever aoDescrever;
     AoCandidato aoCandidato;
@@ -366,6 +369,14 @@ void ConexaoPar::Interno::montarEmpacotador(std::shared_ptr<rtc::Track> faixa) {
     auto remontador = std::make_shared<rtc::H264RtpDepacketizer>(
         rtc::NalUnit::Separator::LongStartSequence);
     empacotador->addToChain(remontador);
+
+    // O pacer por último, que é onde ele tem de estar: depois de tudo que
+    // produz pacote, imediatamente antes do transporte. Sem ele o quadro-chave
+    // sai como uma rajada única e entope a fila do roteador, e aí a internet
+    // inteira da casa piora enquanto se transmite.
+    pacer = std::make_shared<Pacer>(config.bitrate);
+    empacotador->addToChain(pacer);
+
     faixa->setMediaHandler(empacotador);
     faixaVideo = std::move(faixa);
 }

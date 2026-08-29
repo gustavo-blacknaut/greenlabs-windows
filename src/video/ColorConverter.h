@@ -38,7 +38,7 @@ public:
     bool iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto,
                  uint32_t larguraEntrada, uint32_t alturaEntrada,
                  uint32_t larguraSaida, uint32_t alturaSaida,
-                 Saida formatoSaida = Saida::Nv12);
+                 Saida formatoSaida = Saida::Nv12, uint32_t graus = 0);
 
     // A textura devolvida pertence ao conversor e é reaproveitada a cada
     // quadro — quem consome precisa fazê-lo antes da próxima chamada.
