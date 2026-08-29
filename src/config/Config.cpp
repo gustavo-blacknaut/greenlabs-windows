@@ -73,6 +73,7 @@ Config Config::carregar() {
     c.qualidade = static_cast<int>(json.numero("qualidade", padrao.qualidade));
     c.monitor = static_cast<int>(json.numero("monitor", padrao.monitor));
     c.audio = json.booleano("audio", padrao.audio);
+    c.volume = static_cast<int>(json.numero("volume", padrao.volume));
 
     for (const Json& item : json.filho("servidores").itens()) {
         if (item.tipo() == Json::Tipo::Texto && !item.comoTexto().empty()) {
@@ -100,6 +101,7 @@ void Config::salvar() const {
     json["qualidade"] = Json{qualidade};
     json["monitor"] = Json{monitor};
     json["audio"] = Json{audio};
+    json["volume"] = Json{volume};
 
     Json lista = Json::lista();
     for (const auto& s : servidores) lista.adicionar(Json{s});

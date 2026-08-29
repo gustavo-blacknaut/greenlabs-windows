@@ -80,6 +80,9 @@ struct AudioPlayer::Interno {
     std::atomic<bool> rodando{false};
     std::thread thread;
 
+    /// Ganho aplicado na saida. Lido pela thread de audio a cada ciclo.
+    std::atomic<float> volume{1.0f};
+
     // Só para o relatório: escritas relaxed, ninguém decide nada com elas.
     std::atomic<uint64_t> faltas{0};
     std::atomic<uint64_t> recargas{0};
@@ -252,6 +255,15 @@ void AudioPlayer::Interno::laco() {
                 retomando = false;
             }
 
+            // O volume entra ANTES do limitador: baixando o som, nada mais
+            // encosta no teto, e o limitador para de agir - que e o certo.
+            // Aplicado depois, ele comprimiria com base no sinal cheio e
+            // deixaria o som abafado mesmo baixo.
+            const float ganho = volume.load(std::memory_order_relaxed);
+            if (ganho != 1.0f) {
+                for (size_t i = 0; i < total; ++i) saida[i] *= ganho;
+            }
+
             // O Opus devolve amostra além de 1.0 e o WASAPI corta seco, o que é
             // distorção. Aqui só o que passa de 0,95 é comprimido.
             for (size_t i = 0; i < total; ++i) {
@@ -330,6 +342,11 @@ void AudioPlayer::parar() {
 }
 
 bool AudioPlayer::ativo() const { return d_->rodando.load(); }
+
+void AudioPlayer::definirVolume(float volume) {
+    d_->volume.store(volume < 0.0f ? 0.0f : (volume > 1.0f ? 1.0f : volume),
+                    std::memory_order_relaxed);
+}
 
 AudioPlayer::Estatisticas AudioPlayer::estatisticas() const {
     Estatisticas e;

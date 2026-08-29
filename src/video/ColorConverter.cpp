@@ -83,6 +83,31 @@ bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* con
         return false;
     }
 
+    // Pergunta ao driver o que ele aceita, em vez de supor.
+    //
+    // O Video Processor de cada placa suporta um conjunto diferente de
+    // formatos, e ele recusa o resto com E_INVALIDARG na hora de criar a vista
+    // - um erro que nao diz qual formato nem em qual direcao. Perguntar antes
+    // transforma isso numa linha de log que aponta o problema direto.
+    const DXGI_FORMAT formatoDeEntrada =
+        (formatoSaida == Saida::Bgra) ? DXGI_FORMAT_NV12 : DXGI_FORMAT_B8G8R8A8_UNORM;
+    const DXGI_FORMAT formatoDeSaida =
+        (formatoSaida == Saida::Bgra) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_NV12;
+
+    UINT suporteEntrada = 0;
+    UINT suporteSaida = 0;
+    d_->enumerador->CheckVideoProcessorFormat(formatoDeEntrada, &suporteEntrada);
+    d_->enumerador->CheckVideoProcessorFormat(formatoDeSaida, &suporteSaida);
+
+    if (!(suporteEntrada & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
+        erro("o Video Processor desta placa nao aceita este formato na entrada");
+        return false;
+    }
+    if (!(suporteSaida & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
+        erro("o Video Processor desta placa nao aceita este formato na saida");
+        return false;
+    }
+
     D3D11_TEXTURE2D_DESC saida{};
     saida.Width = d_->largura;
     saida.Height = d_->altura;

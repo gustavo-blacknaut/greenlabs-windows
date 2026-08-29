@@ -1,27 +1,47 @@
 # GreenLabs — cliente nativo em C++
 
-Migração do cliente [GreenLabs Live Streaming](https://github.com/gustavo-blacknaut/greenlabs-desktop)
-de Electron para C++ nativo. Sem Electron, sem Chromium, sem Node.
+Cliente nativo do [GreenLabs](https://github.com/gustavo-blacknaut/greenlabs-desktop),
+escrito do zero em C++. Sem Electron, sem Chromium, sem Node — a janela é
+Direct2D, a captura é DXGI, o codec é Media Foundation e o transporte é
+libdatachannel.
 
-**Estado: etapa 1 de 7.** O núcleo de captura está pronto e medido. Ainda não
-há rede, encoder nem interface — o cliente em Electron continua sendo o que
-transmite. Ver [ANALISE-MIGRACAO.md](ANALISE-MIGRACAO.md) para o plano completo
-e os riscos.
+**Estado: as sete etapas estão de pé.** O cliente captura, codifica, conecta,
+transmite, recebe e desenha por conta própria. Uma chamada acontece inteira
+aqui, sem Electron no caminho.
 
 ---
 
-## O que já funciona
+## O que funciona
 
 | Etapa | Estado |
 | --- | --- |
-| 1. Captura de tela (DXGI) | ✅ pronto e medido |
-| 1. Captura de áudio (WASAPI EXCLUDE) | ✅ pronto e medido |
-| 2. Encoder | ⬜ |
-| 3. Sinalização (WebSocket) | ⬜ |
-| 4. Mídia (ICE/DTLS/SRTP) | ⬜ ← etapa de risco |
-| 5. Recepção e renderização | ⬜ |
-| 6. Interface | ⬜ |
-| 7. Paridade e troca | ⬜ |
+| 1. Captura de tela (DXGI Desktop Duplication) | ✅ |
+| 1. Captura de áudio (WASAPI process loopback, modo EXCLUDE) | ✅ |
+| 2. Encoder H.264 por hardware (Media Foundation) | ✅ |
+| 3. Sinalização (WebSocket) | ✅ |
+| 4. Mídia (ICE/DTLS/SRTP, via libdatachannel) | ✅ |
+| 5. Recepção e renderização (decodificação por DXVA, Direct2D) | ✅ |
+| 6. Interface (Direct2D, sem framework) | ✅ |
+| 7. Paridade com o cliente em Electron | 🔸 quase |
+
+O que ainda separa este cliente do de Electron é o que o navegador ganha de
+graça com o libwebrtc e aqui foi preciso escrever à mão: controle de
+congestionamento que reage à rede, e um jitter buffer no nível do NetEQ. O que
+existe hoje — pacer de RTP, jitter buffer com correção de velocidade, anel sem
+trava entre a captura e o envio — resolve o caso normal, e está documentado no
+código junto com o motivo de cada escolha.
+
+### O que este cliente faz que o de Electron não faz
+
+- **Transmite o som do sistema inteiro menos um aplicativo.** O Discord fica de
+  fora da captura sem ser silenciado para você. É process loopback do WASAPI em
+  modo EXCLUDE, por árvore de processos — não existe equivalente no navegador.
+- **Vê várias telas ao mesmo tempo.** Um decodificador por transmissão, com
+  miniatura ao vivo de cada pessoa e troca de palco por clique.
+- **Encoder e decodificador na GPU**, com a textura indo da duplicação para o
+  encoder sem passar pela memória principal.
+- **Corrige monitor girado** lendo a rotação do DXGI e girando no Video
+  Processor, no mesmo passo da conversão de cor.
 
 ### Medido nesta máquina
 
@@ -91,8 +111,9 @@ versão 0.2.7 do cliente em Electron.
 ## Compilando
 
 Precisa de **Visual Studio Build Tools 2022 ou mais novo** com o pacote
-"Desenvolvimento para desktop com C++" e o Windows SDK. Nada além disso: esta
-etapa não usa nenhuma dependência externa — DXGI e WASAPI vêm no próprio SDK.
+"Desenvolvimento para desktop com C++", o Windows SDK e CMake. DXGI, WASAPI,
+Media Foundation e Direct2D vêm no próprio SDK; libdatachannel, Opus e mbedTLS
+são buscados pelo CMake na primeira compilação.
 
 ```powershell
 .\build.ps1                  # Release
@@ -150,18 +171,31 @@ src/
 ├── capture/
 │   ├── ScreenCapture   DXGI Desktop Duplication -> ID3D11Texture2D
 │   ├── AudioCapture    WASAPI process loopback, modo EXCLUDE
+│   ├── CursorCompositor compoe o ponteiro no quadro capturado
 │   └── ProcessTree     acha a raiz da arvore a excluir
+├── video/
+│   └── ColorConverter  BGRA <-> NV12 e rotacao, no Video Processor
+├── encoder/
+│   └── VideoEncoder    H.264 por hardware, Media Foundation
+├── decoder/
+│   └── VideoDecoder    H.264 por DXVA; um por transmissao recebida
 ├── audio/
-│   └── RingBuffer      buffer circular entre a thread de audio e o consumidor
+│   ├── AudioCodec      Opus nos dois sentidos
+│   └── AudioPlayer     saida WASAPI com jitter buffer por velocidade
+├── network/
+│   ├── Signaling       WebSocket com o servidor
+│   ├── Midia           ICE/DTLS/SRTP sobre libdatachannel
+│   └── Pacer           espalha os pacotes RTP no tempo
+├── config/
 └── util/
-    └── Log
 
+ui/                     janela, Direct2D, tema
 tools/probe/            medicao do nucleo, sem UI e sem rede
 ```
 
-O núcleo (`greenlabs_core`) não conhece interface nem rede. Compila e roda
-sozinho — é o que o `probe` prova, e é o que vai permitir medir latência sem a
-janela no meio quando o encoder entrar.
+O núcleo (`greenlabs_core`) não conhece a janela: `probe` e `sinal` usam as
+mesmas peças sem abrir interface nenhuma. É o que permite medir captura e
+áudio sem o desenho no meio.
 
 ---
 
@@ -179,8 +213,21 @@ de notar:
   errado para tempo real, e latência de graça.
 - **A parada na subida da árvore de processos** (`ProcessTree.cpp`): descrita
   acima.
-
-Cada um desses deve virar teste antes da etapa 6.
+- **Alvo de 80 ms no jitter buffer de áudio** (`AudioPlayer.cpp`): já esteve em
+  60, e as faltas voltaram — cada falta é uma emenda audível. Menos folga é
+  menos atraso só até o ponto em que vira estalo.
+- **Captura no ritmo do fps escolhido, e não a cada volta do laço**
+  (`Aplicacao.cpp`): o `AcquireNextFrame` e a composição do cursor rodando solto
+  martelavam o dispositivo D3D centenas de vezes por segundo para produzir 30
+  quadros úteis, e o decodificador do vídeo recebido brigava por ele.
+- **`ID3D10Multithread::SetMultithreadProtected`** (`VideoDecoder.cpp`): sem
+  isso o Media Foundation recusa a aceleração e decodifica na CPU **sem dizer
+  nada**. Uma RX 590 parada enquanto o log dizia "Microsoft H264 Video Decoder
+  MFT".
+- **Captura e desenho na mesma thread** (`Aplicacao.cpp`): a proteção
+  multithread torna cada *chamada* D3D atômica, não cada *sequência*. Em threads
+  separadas, o compositor do cursor e o Direct2D se intercalam e o driver
+  pendura a GPU — `DXGI_ERROR_DEVICE_HUNG` em segundos.
 
 ---
 

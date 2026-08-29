@@ -237,6 +237,17 @@ struct Aplicacao::Interno {
     std::condition_variable temVideo;
     std::thread threadVideo;
     std::atomic<bool> decodificando{false};
+
+    /// Encerra a thread de decodificacao e espera por ela.
+    ///
+    /// Precisa ser chamada em TODO caminho de saida: uma std::thread destruida
+    /// ainda ativa chama std::terminate, e o processo morre com
+    /// STATUS_STACK_BUFFER_OVERRUN - um crash na saida, sem nada no log.
+    void pararDecodificacao() {
+        decodificando.store(false);
+        temVideo.notify_all();
+        if (threadVideo.joinable()) threadVideo.join();
+    }
     void lacoDecodificacao();
     std::vector<std::shared_ptr<ConexaoPar>> destinosVideo;
     Signaling sinal;
@@ -258,6 +269,22 @@ struct Aplicacao::Interno {
     // o que chega dos outros toca sempre.
     bool audioLigado = true;
     D2D1_RECT_F btAudio{};
+
+    // Volume do que chega da chamada, de 0 a 100.
+    int volumeDaChamada = 100;
+    D2D1_RECT_F barraVolume{};
+    bool arrastandoVolume = false;
+
+    /// Converte a posicao do mouse na barra em volume, e aplica na hora.
+    void ajustarVolumePor(float x) {
+        const float largura = barraVolume.right - barraVolume.left;
+        if (largura <= 0) return;
+        const float fracao = (x - barraVolume.left) / largura;
+        const int novo = static_cast<int>((fracao < 0 ? 0 : (fracao > 1 ? 1 : fracao)) * 100.0f + 0.5f);
+        if (novo == volumeDaChamada) return;
+        volumeDaChamada = novo;
+        alto.definirVolume(static_cast<float>(novo) / 100.0f);
+    }
     bool transmitindo = false;
     std::wstring aviso;
 
@@ -436,6 +463,23 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
             }
             return 0;
 
+        // Arrastar na barra de volume. Sem estes dois, so daria para clicar num
+        // ponto - e ajustar volume e coisa que se faz arrastando e ouvindo.
+        case WM_MOUSEMOVE:
+            if (d && d->arrastandoVolume && (w & MK_LBUTTON)) {
+                d->ajustarVolumePor(static_cast<float>(GET_X_LPARAM(l)));
+            }
+            return 0;
+
+        case WM_LBUTTONUP:
+            if (d && d->arrastandoVolume) {
+                d->arrastandoVolume = false;
+                ::ReleaseCapture();
+                d->config.volume = d->volumeDaChamada;
+                d->config.salvar();
+            }
+            return 0;
+
         case WM_CHAR:
             if (d) d->tecla(static_cast<wchar_t>(w));
             return 0;
@@ -496,6 +540,8 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     d_->qualidadeEscolhida =
         (d_->config.qualidade >= 0 && d_->config.qualidade < 3) ? d_->config.qualidade : 1;
     d_->audioLigado = d_->config.audio;
+    d_->volumeDaChamada = (d_->config.volume >= 0 && d_->config.volume <= 100) ? d_->config.volume : 100;
+    d_->alto.definirVolume(static_cast<float>(d_->volumeDaChamada) / 100.0f);
 
     d_->monitores = ScreenCapture::listarMonitores();
     if (d_->monitores.empty()) {
@@ -661,6 +707,7 @@ int Aplicacao::rodar() {
         while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
                 d_->pararTransmissao();
+                d_->pararDecodificacao();
                 d_->sinal.sair();
                 return static_cast<int>(msg.wParam);
             }
@@ -1100,6 +1147,7 @@ void Aplicacao::Interno::conectar() {
     config.nome = paraUtf8(campoNome.valor);
     config.qualidade = qualidadeEscolhida;
     config.audio = audioLigado;
+    config.volume = volumeDaChamada;
     config.monitor = monitorEscolhido;
     config.lembrarServidor(servidor);
     config.salvar();
@@ -1715,9 +1763,19 @@ void Aplicacao::Interno::clique(float x, float y) {
         }
     }
 
+    // A barra de volume vem antes dos botoes: ela ocupa a largura toda do
+    // painel, e um clique nela nao pode cair em outro controle.
+    if (dentro(barraVolume, x, y)) {
+        arrastandoVolume = true;
+        ::SetCapture(janela);
+        ajustarVolumePor(x);
+        return;
+    }
+
     if (dentro(btAudio, x, y)) {
         audioLigado = !audioLigado;
         config.audio = audioLigado;
+    config.volume = volumeDaChamada;
         config.salvar();
         // Mesma regra da qualidade: a captura de som nasce junto com a
         // transmissão, então trocar no meio recomeça - sem derrubar a conexão.
@@ -1943,9 +2001,29 @@ void Aplicacao::Interno::desenharAoVivo() {
     }
 
     if (!render.temQuadro(escolhida ? escolhida->id : std::string("previa"))) {
-        render.texto(transmitindo ? L"Aguardando o primeiro quadro…"
-                                  : L"Ninguém está transmitindo",
-                     palco, tema::kApagado, Fonte::Subtitulo, DWRITE_TEXT_ALIGNMENT_CENTER);
+        // Estado vazio com logo e duas linhas: uma dizendo o que está
+        // acontecendo, outra dizendo o que fazer. Só a primeira deixava a
+        // pessoa parada olhando para um retângulo preto sem saída.
+        const float meio = (palco.top + palco.bottom) / 2.0f;
+        render.logo(D2D1::RectF(palco.left, meio - 92, palco.right, meio - 28), 0.22f);
+
+        const wchar_t* titulo;
+        const wchar_t* dica;
+        if (transmitindo) {
+            titulo = L"Preparando sua transmissão";
+            dica = L"Os outros já vão começar a ver.";
+        } else if (!conectado.load()) {
+            titulo = L"Você não está numa sala";
+            dica = L"Entre numa sala para ver e ser visto.";
+        } else {
+            titulo = L"Ninguém está transmitindo";
+            dica = L"Clique em TRANSMITIR para mostrar a sua tela.";
+        }
+
+        render.texto(titulo, D2D1::RectF(palco.left, meio - 14, palco.right, meio + 14),
+                     tema::kTexto, Fonte::Subtitulo, DWRITE_TEXT_ALIGNMENT_CENTER);
+        render.texto(dica, D2D1::RectF(palco.left, meio + 18, palco.right, meio + 42),
+                     tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
     render.contorno(palco, tema::kLinha, tema::kRaioCartao);
 
@@ -2055,7 +2133,37 @@ void Aplicacao::Interno::desenharAoVivo() {
         const float bola = audioLigado ? tl + 22 : tl + 2;
         render.retangulo(D2D1::RectF(bola, tt + 2, bola + 12, tt + 14), tema::kPainel, 6);
     }
-    y += 44;
+    y += 40;
+
+    // Volume do que CHEGA da chamada.
+    //
+    // Fica logo abaixo do interruptor de propósito: os dois falam de som, mas
+    // de lados opostos - um é o que sai daqui, o outro é o que entra. E é uma
+    // barra, e não um número: ninguém sabe dizer se quer 70 ou 80, mas todo
+    // mundo sabe arrastar até parar de incomodar.
+    {
+        render.texto(L"Volume de quem eu ouço",
+                     D2D1::RectF(esq, y, dir - 44, y + 16), tema::kApagado, Fonte::Pequena);
+        render.texto(std::to_wstring(volumeDaChamada) + L"%",
+                     D2D1::RectF(esq, y, dir, y + 16), tema::kTexto, Fonte::Pequena,
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+        y += 22;
+
+        barraVolume = D2D1::RectF(esq, y, dir, y + 18);
+        const float trilhoY = y + 7;
+        render.retangulo(D2D1::RectF(esq, trilhoY, dir, trilhoY + 5), tema::kLinha, 3);
+
+        const float fracao = static_cast<float>(volumeDaChamada) / 100.0f;
+        const float ate = esq + (dir - esq) * fracao;
+        if (ate > esq) render.retangulo(D2D1::RectF(esq, trilhoY, ate, trilhoY + 5), tema::kVerde, 3);
+
+        // A bolinha fica presa dentro da barra nas pontas, senao ela some
+        // metade para fora no 0 e no 100.
+        const float centro = (ate < esq + 7) ? esq + 7 : ((ate > dir - 7) ? dir - 7 : ate);
+        render.retangulo(D2D1::RectF(centro - 7, trilhoY - 4, centro + 7, trilhoY + 9),
+                         tema::kTexto, 7);
+        y += 26;
+    }
 
     // ---- quem está na sala
     std::vector<Participante> copia;
@@ -2115,7 +2223,10 @@ void Aplicacao::Interno::desenharAoVivo() {
         y += 10;
         render.linha(esq, y, dir, y, tema::kLinha);
         y += 16;
-        secao((L"TRANSMITINDO  (" + std::to_wstring(aoVivo.size()) + L")").c_str());
+        secao(aoVivo.size() > 1 ? (L"TRANSMITINDO  (" + std::to_wstring(aoVivo.size()) +
+                                    L")  ·  CLIQUE PARA VER")
+                                     .c_str()
+                                 : (L"TRANSMITINDO  (" + std::to_wstring(aoVivo.size()) + L")").c_str());
 
         for (const auto& n : aoVivo) {
             // 16:9 na largura disponível, mais uma faixa para o nome.
@@ -2126,15 +2237,26 @@ void Aplicacao::Interno::desenharAoVivo() {
             const bool ativo = n.id == noPalco;
             render.retangulo(cartao, ativo ? tema::kVerdeSuave : tema::kPainel2, 10);
 
-            // A miniatura é a mesma imagem do palco, desenhada pequena. A chave
-            // do renderizador é a mesma da transmissão, então palco e miniatura
-            // compartilham a cópia - não custa uma segunda.
             const auto areaMini =
                 D2D1::RectF(cartao.left + 4, cartao.top + 4, cartao.right - 4, cartao.top + alturaMini);
             render.retangulo(areaMini, tema::kFundo, 7);
-            render.video(n.id, ativo ? nullptr : n.quadro, areaMini);
 
-            render.texto(ativo ? (L"● " + n.nome + L"  ·  no palco") : n.nome,
+            // Quem está no palco NÃO é desenhado de novo aqui.
+            //
+            // O renderizador guarda, por chave, onde a imagem caiu - e é disso
+            // que a etiqueta em cima do vídeo se serve. Desenhando a mesma
+            // chave duas vezes, a segunda (a miniatura) sobrescrevia a
+            // primeira, e a etiqueta ia parar em cima do cartão em vez de em
+            // cima do palco. Além disso, decodificar já é caro; desenhar a
+            // mesma imagem duas vezes por quadro é gasto sem nada em troca.
+            if (ativo) {
+                render.texto(L"no palco", areaMini, tema::kVerde, Fonte::Pequena,
+                             DWRITE_TEXT_ALIGNMENT_CENTER);
+            } else {
+                render.video(n.id, n.quadro, areaMini);
+            }
+
+            render.texto(ativo ? (L"●  " + n.nome) : n.nome,
                          D2D1::RectF(cartao.left + 10, cartao.top + alturaMini,
                                      cartao.right - 10, cartao.bottom),
                          ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
