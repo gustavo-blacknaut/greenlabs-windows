@@ -28,6 +28,10 @@ inline constexpr D2D1_COLOR_F kVerdeLinha  = cor(0x37FF94, 0.35f);   // --green-
 inline constexpr D2D1_COLOR_F kAzul        = cor(0x53A8FF);          // --blue
 inline constexpr D2D1_COLOR_F kPainel      = cor(0x0C1018, 0.86f);   // --panel
 inline constexpr D2D1_COLOR_F kPainel2     = cor(0xFFFFFF, 0.045f);  // --panel-2
+// Um degrau acima do kPainel2, para o que está sob o ponteiro. A diferença é
+// pequena de propósito: realce forte em cada linha apontada faz o painel
+// piscar enquanto a mão passa por cima dele.
+inline constexpr D2D1_COLOR_F kPainel3     = cor(0xFFFFFF, 0.085f);  // --panel-hover
 inline constexpr D2D1_COLOR_F kLinha       = cor(0xFFFFFF, 0.08f);   // --line
 inline constexpr D2D1_COLOR_F kApagado     = cor(0x93A3B3);          // --muted
 inline constexpr D2D1_COLOR_F kVermelho    = cor(0xFF6B6B);

@@ -304,7 +304,36 @@ std::string ConexaoPar::caminhos() const {
 // quadro inteiro em Annex-B, que e exatamente o formato que o decodificador
 // espera.
 void ConexaoPar::Interno::montarRecepcao(const std::shared_ptr<rtc::Track>& faixa) {
-    const std::string idDaFaixa = faixa->description().mid();
+    // O identificador precisa dizer de QUEM é o vídeo, e não só qual m-line ele
+    // ocupa.
+    //
+    // Aqui ia o mid - "0", "2", "4". Serve de chave, porque é único, mas não
+    // carrega o dono, e era por isso que o nome de quem transmite era chutado
+    // como "o primeiro participante que não sou eu": com três pessoas na sala,
+    // o chute erra. O servidor põe o dono no msid, no formato
+    // "greenlabs-<8 primeiros do dono>", e é de lá que ele sai.
+    //
+    // Sem msid nenhum - servidor antigo, ou outro cliente oferecendo direto -
+    // cai no mid de novo, que é o comportamento de antes.
+    // O mid continua fazendo parte da chave: ele é o único identificador que o
+    // protocolo garante único. O msid entra na frente, quando existe, só para
+    // carregar o dono - e o formato fica "<msid>#<mid>".
+    //
+    // Sem juntar os dois, duas faixas cujo msid fosse igual (a nossa própria,
+    // por exemplo, que é "greenlabs-tela") virariam uma entrada só no mapa, e
+    // duas pessoas transmitindo voltariam a se embaralhar - exatamente o que a
+    // separação por faixa veio resolver.
+    const std::string mid = faixa->description().mid();
+    std::string idDaFaixa = mid;
+    for (const std::string& atributo : faixa->description().attributes()) {
+        const size_t inicio = atributo.find("greenlabs-");
+        if (inicio == std::string::npos) continue;
+        size_t fim = atributo.find_first_of(" \t\r\n", inicio);
+        if (fim == std::string::npos) fim = atributo.size();
+        idDaFaixa = atributo.substr(inicio, fim - inicio) + "#" + mid;
+        break;
+    }
+    info("faixa recebida identificada como {}", idDaFaixa);
     faixa->onFrame([this, idDaFaixa](rtc::binary dados, rtc::FrameInfo) {
         if (aoReceberVideo && !dados.empty()) {
             aoReceberVideo(dados.data(), dados.size(), idDaFaixa);

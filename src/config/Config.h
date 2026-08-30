@@ -28,6 +28,13 @@ struct Config {
     // Windows: abaixa so a chamada, deixando jogo e musica como estao.
     int volume = 100;
 
+    // Caminho simbolico da camera escolhida, ou vazio para nenhuma.
+    //
+    // O caminho, e nao o indice: com indice, plugar um adaptador de captura
+    // trocaria silenciosamente a camera escolhida pela nova. Vazio e o padrao
+    // porque camera e coisa que se liga de proposito, nunca por omissao.
+    std::string camera;
+
     // Servidores já usados, do mais recente para o mais antigo. Quem entra numa
     // sala hoje volta nela amanhã, e digitar o endereço de novo toda vez é o
     // tipo de atrito que faz a pessoa desistir.

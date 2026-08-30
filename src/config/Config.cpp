@@ -74,6 +74,7 @@ Config Config::carregar() {
     c.monitor = static_cast<int>(json.numero("monitor", padrao.monitor));
     c.audio = json.booleano("audio", padrao.audio);
     c.volume = static_cast<int>(json.numero("volume", padrao.volume));
+    c.camera = json.texto("camera");
 
     for (const Json& item : json.filho("servidores").itens()) {
         if (item.tipo() == Json::Tipo::Texto && !item.comoTexto().empty()) {
@@ -102,6 +103,7 @@ void Config::salvar() const {
     json["monitor"] = Json{monitor};
     json["audio"] = Json{audio};
     json["volume"] = Json{volume};
+    json["camera"] = Json{camera};
 
     Json lista = Json::lista();
     for (const auto& s : servidores) lista.adicionar(Json{s});

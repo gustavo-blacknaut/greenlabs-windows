@@ -379,6 +379,18 @@ void Renderizador::retangulo(const D2D1_RECT_F& area, const D2D1_COLOR_F& cor, f
     }
 }
 
+// Limita o desenho a um retângulo, para listas que rolam.
+//
+// Sem isto, uma lista maior que o painel simplesmente vazava por baixo dele e
+// ia parar em cima dos botões - que é o que acontecia com a sala cheia. O
+// recorte precisa ser fechado no mesmo quadro em que foi aberto: o Direct2D
+// mantém uma pilha, e deixar um aberto derruba o EndDraw com erro.
+void Renderizador::recortar(const D2D1_RECT_F& area) {
+    d_->contexto2d->PushAxisAlignedClip(area, D2D1_ANTIALIAS_MODE_ALIASED);
+}
+
+void Renderizador::soltarRecorte() { d_->contexto2d->PopAxisAlignedClip(); }
+
 void Renderizador::contorno(const D2D1_RECT_F& area, const D2D1_COLOR_F& cor, float raio,
                             float espessura) {
     if (cor.a <= 0.0f) return;

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(GreenLabs
-    VERSION 0.5.2
+    VERSION 0.6.0
     DESCRIPTION "Cliente nativo do GreenLabs Live Streaming"
     LANGUAGES C CXX)
 
@@ -114,6 +114,7 @@ add_library(greenlabs_core STATIC
     src/util/Json.cpp
     src/capture/ProcessTree.cpp
     src/capture/AudioCapture.cpp
+    src/capture/CameraCapture.cpp
     src/capture/ScreenCapture.cpp
     src/capture/Cursor.cpp
     src/video/ColorConverter.cpp
@@ -153,6 +154,8 @@ target_link_libraries(greenlabs_core PUBLIC
     ole32         # COM
     runtimeobject # WRL: FtmBase do handler de ativacao
     mfplat        # Media Foundation: encoder H.264 por hardware
+    mf            # MFEnumDeviceSources e MFCreateDeviceSource: as cameras
+    mfreadwrite   # IMFSourceReader: leitura da camera
     mfuuid        # GUIDs de midia
     strmiids      # GUIDs do ICodecAPI
     ws2_32        # sockets do cliente WebSocket
