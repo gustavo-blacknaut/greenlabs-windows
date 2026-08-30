@@ -18,6 +18,8 @@
 
 #include <d2d1.h>
 
+#include <cmath>
+
 #include "ui/Renderizador.h"
 
 namespace gl::icone {
@@ -104,27 +106,83 @@ inline void camera(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F&
     r.linha(a.right, topo, a.right, topo + altura, cor, traco);
 }
 
-/// Uma engrenagem: um anel com quatro dentes e o furo no meio.
+/// Uma engrenagem: um anel com oito dentes curtos para fora.
 ///
-/// Dente redondo em vez de quadrado: a esta altura, quatro retângulos de dois
-/// pixels em volta de um círculo leem como sujeira, e o círculo lê como dente.
+/// A primeira versão punha quatro bolinhas nos quatro lados do anel, e o
+/// resultado lia como losango, não como engrenagem - as bolinhas ficavam fora
+/// do anel e eram a única coisa que se via. Dentes são traços curtos saindo da
+/// borda, e oito bastam para o olho fechar a forma nesse tamanho.
 inline void engrenagem(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
-                       float lado = 15.0f, float traco = 1.5f) {
+                       float lado = 16.0f, float traco = 1.5f) {
     const auto a = encaixar(area, lado);
     const float cx = (a.left + a.right) / 2;
     const float cy = (a.top + a.bottom) / 2;
     const float raio = (a.right - a.left) / 2;
 
-    const float dente = raio * 0.30f;
-    for (int i = 0; i < 4; ++i) {
-        const float dx = (i == 0) ? -raio : (i == 1) ? raio : 0.0f;
-        const float dy = (i == 2) ? -raio : (i == 3) ? raio : 0.0f;
-        r.retangulo(D2D1::RectF(cx + dx - dente, cy + dy - dente, cx + dx + dente, cy + dy + dente),
-                    cor, dente);
+    const float anel = raio * 0.60f;
+    r.contorno(D2D1::RectF(cx - anel, cy - anel, cx + anel, cy + anel), cor, anel, traco);
+
+    // Oito dentes, do anel até a borda.
+    for (int i = 0; i < 8; ++i) {
+        const float ang = static_cast<float>(i) * 0.7853981634f;  // 45 graus
+        const float sx = cx + std::cos(ang) * anel;
+        const float sy = cy + std::sin(ang) * anel;
+        const float ex = cx + std::cos(ang) * raio;
+        const float ey = cy + std::sin(ang) * raio;
+        r.linha(sx, sy, ex, ey, cor, traco + 0.4f);
     }
 
-    const float anel = raio * 0.74f;
-    r.contorno(D2D1::RectF(cx - anel, cy - anel, cx + anel, cy + anel), cor, anel, traco + 0.6f);
+    // O furo do meio, para não virar um sol.
+    const float furo = raio * 0.24f;
+    r.contorno(D2D1::RectF(cx - furo, cy - furo, cx + furo, cy + furo), cor, furo, traco);
+}
+
+/// Uma porta com a seta saindo, para sair da sala.
+inline void porta(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                  float lado = 15.0f, float traco = 1.5f) {
+    const auto a = encaixar(area, lado);
+    const float meio = (a.top + a.bottom) / 2;
+
+    // A porta: três lados, aberta para a direita, por onde a seta sai.
+    const float batenteDireita = a.left + (a.right - a.left) * 0.52f;
+    r.linha(batenteDireita, a.top, a.left, a.top, cor, traco);
+    r.linha(a.left, a.top, a.left, a.bottom, cor, traco);
+    r.linha(a.left, a.bottom, batenteDireita, a.bottom, cor, traco);
+
+    // A seta saindo.
+    const float pontaX = a.right;
+    const float caudaX = a.left + (a.right - a.left) * 0.42f;
+    r.linha(caudaX, meio, pontaX, meio, cor, traco);
+    r.linha(pontaX - 4, meio - 4, pontaX, meio, cor, traco);
+    r.linha(pontaX - 4, meio + 4, pontaX, meio, cor, traco);
+}
+
+/// Um monitor com ondas saindo, para transmitir.
+inline void transmitir(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                       float lado = 16.0f, float traco = 1.5f) {
+    const auto a = encaixar(area, lado);
+    const float largura = (a.right - a.left) * 0.62f;
+    const float altura = (a.bottom - a.top) * 0.68f;
+    const float topo = a.top + ((a.bottom - a.top) - altura) / 2;
+
+    r.contorno(D2D1::RectF(a.left, topo, a.left + largura, topo + altura), cor, 2, traco);
+    const float meioX = a.left + largura / 2;
+    r.linha(meioX, topo + altura, meioX, a.bottom, cor, traco);
+
+    // Duas ondas à direita, como as de sinal.
+    const float cy = topo + altura / 2;
+    for (int i = 0; i < 2; ++i) {
+        const float x = a.left + largura + 2 + static_cast<float>(i) * 3.5f;
+        const float h = 2.5f + static_cast<float>(i) * 2.5f;
+        r.linha(x, cy - h, x + 1.5f, cy, cor, traco);
+        r.linha(x + 1.5f, cy, x, cy + h, cor, traco);
+    }
+}
+
+/// Um quadrado cheio, para parar.
+inline void parar(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                  float lado = 11.0f) {
+    r.retangulo(encaixar(area, lado), cor, 2);
 }
 
 /// Um ponto cheio, para "ao vivo".

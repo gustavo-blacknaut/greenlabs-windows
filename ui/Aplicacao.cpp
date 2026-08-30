@@ -3047,7 +3047,13 @@ void Aplicacao::Interno::desenharAoVivo() {
         // acontecendo, outra dizendo o que fazer. Só a primeira deixava a
         // pessoa parada olhando para um retângulo preto sem saída.
         const float meio = (palco.top + palco.bottom) / 2.0f;
-        render.logo(D2D1::RectF(palco.left, meio - 92, palco.right, meio - 28), 0.22f);
+        const float meioX = (palco.left + palco.right) / 2.0f;
+
+        // Um monitor desenhado, do mesmo jeito que o Electron faz - e não a
+        // logo. A logo diz "este é o GreenLabs", que a pessoa já sabe; o
+        // monitor diz do que se está falando.
+        icone::monitor(render, D2D1::RectF(meioX - 22, meio - 74, meioX + 22, meio - 30),
+                       tema::kLinhaForte, 40.0f, 2.2f);
 
         const wchar_t* titulo;
         const wchar_t* dica;
@@ -3058,8 +3064,8 @@ void Aplicacao::Interno::desenharAoVivo() {
             titulo = L"Você não está numa sala";
             dica = L"Entre numa sala para ver e ser visto.";
         } else {
-            titulo = L"Ninguém está transmitindo";
-            dica = L"Clique em TRANSMITIR para mostrar a sua tela.";
+            titulo = L"Nenhuma transmissão ativa";
+            dica = L"Clique em transmitir para começar";
         }
 
         render.texto(titulo, D2D1::RectF(palco.left, meio - 14, palco.right, meio + 14),
@@ -3076,9 +3082,13 @@ void Aplicacao::Interno::desenharAoVivo() {
         const bool vendoOutro = doOutro && doOutroLargura > 0;
         std::wstring texto;
         D2D1_COLOR_F corTexto = tema::kApagado;
+        // O ponto de "ao vivo" e desenhado, nao escrito: o caractere depende da
+        // fonte e vem com peso e tamanho diferentes em cada uma.
+        bool comPonto = false;
 
         if (vendoOutro) {
-            texto = L"●  " + (escolhida ? escolhida->nome : L"Alguem na sala");
+            texto = escolhida ? escolhida->nome : L"Alguem na sala";
+            comPonto = true;
             if (doOutroLargura > 0) texto += L"  ·  " + std::to_wstring(doOutroLargura) + L"p";
             corTexto = tema::kVerde;
         } else {
@@ -3097,8 +3107,9 @@ void Aplicacao::Interno::desenharAoVivo() {
             if (oQue.empty()) oQue = L"nada escolhido";
 
             if (transmitindo) {
-                texto = L"●  AO VIVO  ·  " + oQue;
+                texto = L"AO VIVO  ·  " + oQue;
                 corTexto = tema::kVerde;
+                comPonto = true;
             } else {
                 texto = oQue;
             }
@@ -3116,12 +3127,21 @@ void Aplicacao::Interno::desenharAoVivo() {
         const float ancoraX = (temVideoNaTela ? v.left : palco.left) + 14;
         const float ancoraY = (temVideoNaTela ? v.top : palco.top) + 14;
 
-        const float largura = render.larguraDoTexto(texto, Fonte::Pequena) + 28;
-        const auto etiqueta =
-            D2D1::RectF(ancoraX, ancoraY, ancoraX + largura, ancoraY + 30);
+        const float recuo = comPonto ? 30.0f : 14.0f;
+        const float largura = render.larguraDoTexto(texto, Fonte::Pequena) + recuo + 14;
+        const auto etiqueta = D2D1::RectF(ancoraX, ancoraY, ancoraX + largura, ancoraY + 30);
         render.retangulo(etiqueta, tema::kFundo, 15);
-        if (corTexto.g > 0.5f) render.contorno(etiqueta, tema::kVerdeLinha, 15);
-        render.texto(texto, etiqueta, corTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (comPonto) render.contorno(etiqueta, tema::kVerdeLinha, 15);
+        if (comPonto) {
+            icone::aoVivo(render,
+                          D2D1::RectF(etiqueta.left + 12, etiqueta.top, etiqueta.left + 22,
+                                      etiqueta.bottom),
+                          tema::kVerde);
+        }
+        render.texto(texto,
+                     D2D1::RectF(etiqueta.left + recuo, etiqueta.top, etiqueta.right,
+                                 etiqueta.bottom),
+                     corTexto, Fonte::Pequena);
     }
 
     // Em tela cheia acaba aqui. A saída fica escrita num canto, discreta:
@@ -3153,7 +3173,7 @@ void Aplicacao::Interno::desenharAoVivo() {
     const float alturaDiagnostico = transmitindo ? 74.0f : 0.0f;
     const float baseBotoes = painel.bottom - 16 - alturaDiagnostico;
     const float topoRolavel = painel.top + 42;
-    const float fimRolavel = baseBotoes - 50;
+    const float fimRolavel = baseBotoes - 58;
 
     areaRolavel = D2D1::RectF(painel.left, topoRolavel, painel.right, fimRolavel);
     alturaVisivel = fimRolavel - topoRolavel;
@@ -3290,9 +3310,16 @@ void Aplicacao::Interno::desenharAoVivo() {
                     render.video(n.id, n.quadro, areaMini);
                 }
 
-                render.texto(ativo ? (L"●  " + n.nome) : n.nome,
-                             D2D1::RectF(cartao.left + 11, areaMini.bottom + 1, cartao.right - 11,
-                                         cartao.bottom - 3),
+                const float recuoNome = ativo ? 26.0f : 11.0f;
+                if (ativo) {
+                    icone::aoVivo(render,
+                                  D2D1::RectF(cartao.left + 10, areaMini.bottom + 1,
+                                              cartao.left + 22, cartao.bottom - 3),
+                                  tema::kVerde);
+                }
+                render.texto(n.nome,
+                             D2D1::RectF(cartao.left + recuoNome, areaMini.bottom + 1,
+                                         cartao.right - 11, cartao.bottom - 3),
                              ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
 
                 btTransmissoes.push_back(cartao);
@@ -3426,10 +3453,53 @@ void Aplicacao::Interno::desenharAoVivo() {
     // calculado por posição fixa se sobrepunha aos nomes.
     const float base = baseBotoes;
 
-    btSair = D2D1::RectF(esq, base - 38, esq + 84, base);
-    desenharBotao(btSair, L"SAIR", false);
-    btTransmitir = D2D1::RectF(esq + 92, base - 38, dir, base);
-    desenharBotao(btTransmitir, transmitindo ? L"PARAR" : L"TRANSMITIR", transmitindo);
+    // SAIR discreto, TRANSMITIR em verde cheio.
+    //
+    // No Electron a ação principal é um botão verde com sombra, e as outras são
+    // fantasmas. Dois botões do mesmo peso lado a lado obrigam a ler os dois
+    // para descobrir qual é o que se quer - e o que se quer, num aplicativo de
+    // mostrar a tela, é transmitir.
+    const float alturaBotao = 46;
+    btSair = D2D1::RectF(esq, base - alturaBotao, esq + 92, base);
+    btTransmitir = D2D1::RectF(esq + 100, base - alturaBotao, dir, base);
+
+    {
+        const bool sob = apontando(btSair);
+        render.retangulo(btSair, sob ? tema::kPainel3 : tema::kPainel2, 13);
+        render.contorno(btSair, sob ? tema::kLinhaForte : tema::kLinha, 13);
+        const auto areaIcone =
+            D2D1::RectF(btSair.left + 14, btSair.top, btSair.left + 32, btSair.bottom);
+        icone::porta(render, areaIcone, sob ? tema::kVermelho : tema::kApagado, 15.0f);
+        render.texto(L"SAIR", D2D1::RectF(btSair.left + 34, btSair.top, btSair.right - 8,
+                                          btSair.bottom),
+                     sob ? tema::kTexto : tema::kApagado, Fonte::Botao);
+    }
+
+    {
+        const bool sob = apontando(btTransmitir);
+        const auto fundo = transmitindo ? (sob ? tema::kVermelho : tema::kVermelhoSuave)
+                                        : (sob ? tema::kVerde : tema::kVerdeForte);
+        render.retangulo(btTransmitir, fundo, 13);
+
+        // O texto do botão verde é escuro, e o do vermelho é claro: é o
+        // contraste que cada fundo pede, não uma escolha de estilo.
+        const auto corTexto = transmitindo ? tema::kTexto : tema::kFundo;
+
+        const std::wstring rotulo = transmitindo ? L"PARAR" : L"TRANSMITIR";
+        const float larguraTexto = render.larguraDoTexto(rotulo, Fonte::Botao);
+        const float meio = (btTransmitir.left + btTransmitir.right) / 2;
+        const float inicio = meio - (larguraTexto + 26) / 2;
+
+        const auto areaIcone = D2D1::RectF(inicio, btTransmitir.top, inicio + 18,
+                                           btTransmitir.bottom);
+        if (transmitindo) icone::parar(render, areaIcone, corTexto, 11.0f);
+        else icone::transmitir(render, areaIcone, corTexto, 16.0f, 1.7f);
+
+        render.texto(rotulo,
+                     D2D1::RectF(inicio + 26, btTransmitir.top, btTransmitir.right,
+                                 btTransmitir.bottom),
+                     corTexto, Fonte::Botao);
+    }
 
     if (!transmitindo) return;
 
@@ -3691,9 +3761,22 @@ void Aplicacao::Interno::desenharModal() {
     if (marcadas == 1) rotuloConfirmar = L"TRANSMITIR";
     else if (marcadas > 1) rotuloConfirmar = L"TRANSMITIR OS " + std::to_wstring(marcadas);
 
-    render.texto(rotuloConfirmar, btModalConfirmar,
-                 podeConfirmar ? tema::kFundo : tema::kApagado, Fonte::Botao,
-                 DWRITE_TEXT_ALIGNMENT_CENTER);
+    {
+        const auto cor = podeConfirmar ? tema::kFundo : tema::kApagado;
+        const float largura = render.larguraDoTexto(rotuloConfirmar, Fonte::Botao);
+        const float meio = (btModalConfirmar.left + btModalConfirmar.right) / 2;
+        const float inicio = meio - (largura + (podeConfirmar ? 26.0f : 0.0f)) / 2;
+        if (podeConfirmar) {
+            icone::transmitir(render,
+                              D2D1::RectF(inicio, btModalConfirmar.top, inicio + 18,
+                                          btModalConfirmar.bottom),
+                              cor, 16.0f, 1.7f);
+        }
+        render.texto(rotuloConfirmar,
+                     D2D1::RectF(inicio + (podeConfirmar ? 26.0f : 0.0f), btModalConfirmar.top,
+                                 btModalConfirmar.right, btModalConfirmar.bottom),
+                     cor, Fonte::Botao);
+    }
 
     // ---- corpo: a grade de cartões
     const auto corpo = moldura.corpo;
@@ -3922,8 +4005,19 @@ void Aplicacao::Interno::desenharConfig() {
                  moldura.basePe - alturaPe, tema::kLinha);
     render.retangulo(btConfigConcluir,
                      apontando(btConfigConcluir) ? tema::kVerde : tema::kVerdeForte, 11);
-    render.texto(L"CONCLUIR", btConfigConcluir, tema::kFundo, Fonte::Botao,
-                 DWRITE_TEXT_ALIGNMENT_CENTER);
+    {
+        const float largura = render.larguraDoTexto(L"CONCLUIR", Fonte::Botao);
+        const float meio = (btConfigConcluir.left + btConfigConcluir.right) / 2;
+        const float inicio = meio - (largura + 24) / 2;
+        icone::visto(render,
+                     D2D1::RectF(inicio, btConfigConcluir.top, inicio + 16,
+                                 btConfigConcluir.bottom),
+                     tema::kFundo, 12.0f, 2.2f);
+        render.texto(L"CONCLUIR",
+                     D2D1::RectF(inicio + 24, btConfigConcluir.top, btConfigConcluir.right,
+                                 btConfigConcluir.bottom),
+                     tema::kFundo, Fonte::Botao);
+    }
 
     render.recortar(corpo);
     float y = corpo.top;
