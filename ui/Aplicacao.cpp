@@ -1742,7 +1742,18 @@ void Aplicacao::Interno::pararTransmissao() {
     // envio de dentro da trava.
     destinosAudio.clear();
     destinosVideo.clear();
-    {
+
+    // Em modo retransmissor a conexão com o servidor NÃO cai aqui.
+    //
+    // Ela é o caminho dos dois sentidos: derrubá-la ao parar de transmitir
+    // derruba junto o que se RECEBE, e apertar transmitir de novo não tinha
+    // mais por onde sair - dava para ver no diagnóstico "conexao: sem ninguem"
+    // com a transmissão ligada. Quem parou fica sem imagem para os outros
+    // sozinho, porque o fluxo seca e eles tiram da lista pelo tempo sem pacote.
+    //
+    // Em malha é diferente: lá a conexão existe por causa da transmissão, e sem
+    // ela não há o que manter de pé.
+    if (!modoSfu.load()) {
         std::lock_guard trava(travaConexoes);
         conexoes.clear();
     }
