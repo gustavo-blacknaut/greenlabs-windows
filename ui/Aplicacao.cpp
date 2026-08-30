@@ -2954,9 +2954,14 @@ void Aplicacao::Interno::desenharAoVivo() {
     // A área que rola vai do topo do painel até onde os botões começam. Eles
     // ficam ancorados na base e fora do recorte: botão que rola para fora da
     // vista é botão que não existe na hora em que se precisa dele.
+    // Cabeçalho do painel, fora do que rola - como o .side-header do Electron.
+    render.texto(L"PAINEL DE CONTROLE",
+                 D2D1::RectF(esq, painel.top + 14, dir, painel.top + 32), tema::kVerde,
+                 Fonte::Pequena);
+
     const float alturaDiagnostico = transmitindo ? 74.0f : 0.0f;
     const float baseBotoes = painel.bottom - 16 - alturaDiagnostico;
-    const float topoRolavel = painel.top + 16;
+    const float topoRolavel = painel.top + 42;
     const float fimRolavel = baseBotoes - 50;
 
     areaRolavel = D2D1::RectF(painel.left, topoRolavel, painel.right, fimRolavel);
@@ -2972,32 +2977,51 @@ void Aplicacao::Interno::desenharAoVivo() {
 
     render.recortar(areaRolavel);
     float y = topoRolavel - rolagem;
-
-    auto secao = [&](const wchar_t* titulo) {
-        render.texto(titulo, D2D1::RectF(esq, y, dir, y + 14), tema::kApagado, Fonte::Pequena);
-        y += 20;
+    // Ícones desenhados à mão.
+    //
+    // O Electron usa lucide; aqui não há biblioteca de ícones nem fonte que se
+    // possa contar com um glifo de monitor. Dois retângulos e dois círculos
+    // dizem a mesma coisa e não dependem de nada estar instalado.
+    auto iconeMonitor = [&](float ix, float iy, const D2D1_COLOR_F& cor) {
+        render.contorno(D2D1::RectF(ix, iy, ix + 14, iy + 10), cor, 2);
+        render.retangulo(D2D1::RectF(ix + 5, iy + 11, ix + 9, iy + 12), cor, 1);
+    };
+    auto iconePessoas = [&](float ix, float iy, const D2D1_COLOR_F& cor) {
+        render.contorno(D2D1::RectF(ix, iy + 1, ix + 7, iy + 8), cor, 4);
+        render.contorno(D2D1::RectF(ix + 6, iy + 3, ix + 12, iy + 9), cor, 3);
     };
 
-    // Item de lista: fundo quando escolhido, nada quando não. Sem contorno em
-    // cima do fundo - é o que tirava o ar do painel.
-    //
-    // O realce sob o ponteiro é o meio-termo entre os dois: diz "isto responde
-    // ao clique" sem dizer "isto está escolhido".
-    auto item = [&](const std::wstring& esquerda, const std::wstring& direita, bool ativo) {
-        const auto area = D2D1::RectF(esq, y, dir, y + 30);
-        const bool sob = !ativo && sobre(area) && sobre(areaRolavel);
-        if (sob) sobreClicavel = true;
-        render.retangulo(area, ativo ? tema::kVerdeSuave : (sob ? tema::kPainel3 : tema::kPainel2),
-                         8);
-        render.texto(esquerda, D2D1::RectF(area.left + 11, area.top, area.right - 70, area.bottom),
-                     ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
-        if (!direita.empty()) {
-            render.texto(direita,
-                         D2D1::RectF(area.left, area.top, area.right - 11, area.bottom),
-                         tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        }
+    // Uma seção no formato do Electron: barra de título verde com contador em
+    // cima e o corpo com borda em volta. A borda é desenhada DEPOIS do conteúdo
+    // porque só aí se sabe onde ela termina.
+    auto abrirSecao = [&](int qualIcone, const std::wstring& titulo) {
+        const float topo = y;
+        const auto barra = D2D1::RectF(esq, y, dir, y + 34);
+        render.retangulo(barra, tema::kPainel2, 11);
+        // O canto de baixo da barra é reto: ela encosta no corpo da seção.
+        render.retangulo(D2D1::RectF(barra.left, barra.bottom - 11, barra.right, barra.bottom),
+                         tema::kPainel2);
+        render.linha(barra.left, barra.bottom, barra.right, barra.bottom, tema::kLinha);
+
+        if (qualIcone == 0) iconeMonitor(barra.left + 12, barra.top + 11, tema::kVerde);
+        else iconePessoas(barra.left + 12, barra.top + 12, tema::kVerde);
+
+        render.texto(titulo, D2D1::RectF(barra.left + 34, barra.top, barra.right - 12, barra.bottom),
+                     tema::kVerde, Fonte::Pequena);
         y += 34;
-        return area;
+        return topo;
+    };
+
+    auto fecharSecao = [&](float topo) {
+        y += 10;
+        render.contorno(D2D1::RectF(esq, topo, dir, y), tema::kLinha, 11);
+        y += 12;
+    };
+
+    auto vazio = [&](const wchar_t* texto) {
+        render.texto(texto, D2D1::RectF(esq + 12, y + 8, dir - 12, y + 46), tema::kApagado,
+                     Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+        y += 46;
     };
 
     // ---- o que está indo no ar
@@ -3006,7 +3030,6 @@ void Aplicacao::Interno::desenharAoVivo() {
     // de lugar: era uma pilha de listas aqui na lateral e virou o modal, que é
     // onde ela cabe - com miniatura ao vivo de cada tela, em vez de "Monitor 1"
     // e "Monitor 2" para adivinhar.
-    secao(L"O QUE VAI NO AR");
     {
         std::wstring resumo;
         if (!telasLigadas.empty()) {
@@ -3020,48 +3043,74 @@ void Aplicacao::Interno::desenharAoVivo() {
         }
         if (resumo.empty()) resumo = L"nada escolhido";
 
-        const auto area = D2D1::RectF(esq, y, dir, y + 40);
-        const bool sob = apontando(area);
-        render.retangulo(area, sob ? tema::kPainel3 : tema::kPainel2, 10);
-        render.contorno(area, sob ? tema::kLinhaForte : tema::kLinha, 10);
-        render.texto(resumo,
-                     D2D1::RectF(area.left + 12, area.top, area.right - 68, area.bottom),
+        const auto area = D2D1::RectF(esq, y, dir, y + 42);
+        const bool sob = sobre(area) && sobre(areaRolavel);
+        if (sob) sobreClicavel = true;
+        render.retangulo(area, sob ? tema::kPainel3 : tema::kPainel2, 11);
+        render.contorno(area, sob ? tema::kLinhaForte : tema::kLinha, 11);
+        iconeMonitor(area.left + 12, area.top + 15, tema::kApagado);
+        render.texto(resumo, D2D1::RectF(area.left + 34, area.top, area.right - 66, area.bottom),
                      tema::kTexto, Fonte::Pequena);
-        render.texto(L"mudar",
-                     D2D1::RectF(area.left, area.top, area.right - 12, area.bottom), tema::kVerde,
-                     Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        render.texto(L"mudar", D2D1::RectF(area.left, area.top, area.right - 12, area.bottom),
+                     tema::kVerde, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
         btEscolher = area;
-        y += 46;
+        y += 54;
     }
 
-    // Volume do que CHEGA da chamada.
-    //
-    // Fica logo abaixo do interruptor de propósito: os dois falam de som, mas
-    // de lados opostos - um é o que sai daqui, o outro é o que entra. E é uma
-    // barra, e não um número: ninguém sabe dizer se quer 70 ou 80, mas todo
-    // mundo sabe arrastar até parar de incomodar.
+    // ---- transmissões, com miniatura ao vivo de cada uma
     {
-        render.texto(L"Volume de quem eu ouço",
-                     D2D1::RectF(esq, y, dir - 44, y + 16), tema::kApagado, Fonte::Pequena);
-        render.texto(std::to_wstring(volumeDaChamada) + L"%",
-                     D2D1::RectF(esq, y, dir, y + 16), tema::kTexto, Fonte::Pequena,
-                     DWRITE_TEXT_ALIGNMENT_TRAILING);
-        y += 22;
+        const float topo =
+            abrirSecao(0, L"TRANSMISSÕES (" + std::to_wstring(aoVivo.size()) + L")");
 
-        barraVolume = D2D1::RectF(esq, y, dir, y + 18);
-        const float trilhoY = y + 7;
-        render.retangulo(D2D1::RectF(esq, trilhoY, dir, trilhoY + 5), tema::kLinha, 3);
+        btTransmissoes.clear();
+        idsTransmissoes.clear();
 
-        const float fracao = static_cast<float>(volumeDaChamada) / 100.0f;
-        const float ate = esq + (dir - esq) * fracao;
-        if (ate > esq) render.retangulo(D2D1::RectF(esq, trilhoY, ate, trilhoY + 5), tema::kVerde, 3);
+        if (aoVivo.empty()) {
+            vazio(L"Nenhuma transmissão ativa no momento.");
+        } else {
+            y += 10;
+            for (const auto& n : aoVivo) {
+                const float larguraCartao = dir - esq - 20;
+                const float alturaMini = larguraCartao * 9.0f / 16.0f;
+                const auto cartao =
+                    D2D1::RectF(esq + 10, y, dir - 10, y + alturaMini + 28);
 
-        // A bolinha fica presa dentro da barra nas pontas, senao ela some
-        // metade para fora no 0 e no 100.
-        const float centro = (ate < esq + 7) ? esq + 7 : ((ate > dir - 7) ? dir - 7 : ate);
-        render.retangulo(D2D1::RectF(centro - 7, trilhoY - 4, centro + 7, trilhoY + 9),
-                         tema::kTexto, 7);
-        y += 26;
+                const bool ativo = n.id == noPalco;
+                const bool sob = !ativo && sobre(cartao) && sobre(areaRolavel);
+                if (sob) sobreClicavel = true;
+
+                render.retangulo(cartao, ativo ? tema::kVerdeSuave
+                                               : (sob ? tema::kPainel3 : tema::kPainel2),
+                                 11);
+                render.contorno(cartao, ativo ? tema::kVerdeLinha : tema::kLinha, 11);
+
+                const auto areaMini = D2D1::RectF(cartao.left + 5, cartao.top + 5,
+                                                  cartao.right - 5, cartao.top + alturaMini);
+                render.retangulo(areaMini, tema::kFundo, 8);
+
+                // Quem está no palco NÃO é desenhado de novo aqui: o
+                // renderizador guarda, por chave, onde a imagem caiu, e é disso
+                // que a etiqueta em cima do vídeo se serve. Desenhar a mesma
+                // chave duas vezes mandaria a etiqueta para cima do cartão.
+                if (ativo) {
+                    render.texto(L"no palco", areaMini, tema::kVerde, Fonte::Pequena,
+                                 DWRITE_TEXT_ALIGNMENT_CENTER);
+                } else {
+                    render.video(n.id, n.quadro, areaMini);
+                }
+
+                render.texto(ativo ? (L"●  " + n.nome) : n.nome,
+                             D2D1::RectF(cartao.left + 11, areaMini.bottom + 1, cartao.right - 11,
+                                         cartao.bottom - 3),
+                             ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+
+                btTransmissoes.push_back(cartao);
+                idsTransmissoes.push_back(n.id);
+                y += alturaMini + 38;
+            }
+            y -= 10;
+        }
+        fecharSecao(topo);
     }
 
     // ---- quem está na sala
@@ -3071,100 +3120,95 @@ void Aplicacao::Interno::desenharAoVivo() {
         copia = pares;
     }
 
-    render.linha(esq, y, dir, y, tema::kLinha);
-    y += 16;
-    secao((L"NA SALA  (" + std::to_wstring(copia.size() + 1) + L")").c_str());
-
-    // Uma pessoa por linha, com marca de quem está no palco.
-    //
-    // Isto responde à pergunta que a tela antiga deixava no ar: o palco troca
-    // sozinho para quem transmite, e nada dizia que aquilo tinha acontecido nem
-    // de quem era a tela. Agora o ponto verde diz.
-    auto pessoa = [&](const std::wstring& nome, int ping, bool souEu, bool noPalco) {
-        const auto area = D2D1::RectF(esq, y, dir, y + 26);
-        if (noPalco) render.retangulo(area, tema::kVerdeSuave, 7);
-
-        float x = area.left + (noPalco ? 10.0f : 2.0f);
-        if (noPalco) {
-            render.retangulo(D2D1::RectF(x, area.top + 11, x + 5, area.top + 16), tema::kVerde, 3);
-            x += 12;
-        }
-        render.texto(nome, D2D1::RectF(x, area.top, area.right - 62, area.bottom),
-                     souEu ? tema::kVerde : tema::kTexto, Fonte::Pequena);
-        render.texto(std::to_wstring(ping) + L" ms",
-                     D2D1::RectF(area.left, area.top, area.right - 8, area.bottom),
-                     tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
-        y += 28;
-    };
-
-    const std::wstring meuNome = campoNome.valor.empty() ? L"Você" : campoNome.valor + L"  (você)";
-    pessoa(meuNome, sinal.pingMs(), true, transmitindo && !escolhida);
-
-    for (const auto& p : copia) {
-        // Comparação por id, e não por nome: dois amigos com o mesmo apelido
-        // punham a marca do palco nos dois - e num grupo isso não é raro.
-        const bool estaNoPalco = escolhida && !escolhida->dono.empty() && escolhida->dono == p.id;
-        pessoa(paraW(p.nome), p.pingMs, false, estaNoPalco);
-    }
-
-    // ---- transmissões: um cartão com miniatura por pessoa transmitindo
-    //
-    // É o que faltava para ver a tela de quem está na chamada. Antes o palco
-    // trocava sozinho e não havia como escolher nem saber quantas transmissões
-    // existiam - com duas pessoas transmitindo, uma delas simplesmente não
-    // aparecia em lugar nenhum.
-    //
-    // Cada cartão desenha a miniatura ao vivo daquela transmissão, e clicar põe
-    // no palco. É o mesmo desenho da coluna de cartões do cliente em Electron.
-    btTransmissoes.clear();
-    idsTransmissoes.clear();
-
-    if (!aoVivo.empty()) {
+    {
+        const float topo =
+            abrirSecao(1, L"PESSOAS (" + std::to_wstring(copia.size() + 1) + L")");
         y += 10;
-        render.linha(esq, y, dir, y, tema::kLinha);
-        y += 16;
-        secao(aoVivo.size() > 1 ? (L"TRANSMITINDO  (" + std::to_wstring(aoVivo.size()) +
-                                    L")  ·  CLIQUE PARA VER")
-                                     .c_str()
-                                 : (L"TRANSMITINDO  (" + std::to_wstring(aoVivo.size()) + L")").c_str());
 
-        for (const auto& n : aoVivo) {
-            // 16:9 na largura disponível, mais uma faixa para o nome.
-            const float larguraCartao = dir - esq;
-            const float alturaMini = larguraCartao * 9.0f / 16.0f;
-            const auto cartao = D2D1::RectF(esq, y, dir, y + alturaMini + 26);
+        // Uma pessoa por linha, com avatar de iniciais e pastilha de ping - o
+        // mesmo desenho do .user-row-card do Electron. O ponto verde diz quem
+        // está no palco: o palco troca sozinho quando alguém transmite, e nada
+        // dizia que aquilo tinha acontecido nem de quem era a tela.
+        auto pessoa = [&](const std::wstring& nome, int ping, bool souEu, bool noPalcoAgora) {
+            const auto area = D2D1::RectF(esq + 10, y, dir - 10, y + 44);
+            render.retangulo(area, noPalcoAgora ? tema::kVerdeSuave : tema::kPainel2, 12);
+            render.contorno(area, noPalcoAgora ? tema::kVerdeLinha : tema::kLinha, 12);
 
-            const bool ativo = n.id == noPalco;
-            render.retangulo(cartao, ativo ? tema::kVerdeSuave : tema::kPainel2, 10);
+            // Avatar: as duas primeiras letras, em maiúsculas.
+            std::wstring iniciais = nome.substr(0, 2);
+            for (auto& c : iniciais) c = static_cast<wchar_t>(::towupper(c));
+            const auto circulo =
+                D2D1::RectF(area.left + 8, area.top + 7, area.left + 38, area.top + 37);
+            render.retangulo(circulo, tema::kVerdeSuave, 15);
+            render.contorno(circulo, tema::kVerdeLinha, 15);
+            render.texto(iniciais, circulo, tema::kTexto, Fonte::Pequena,
+                         DWRITE_TEXT_ALIGNMENT_CENTER);
 
-            const auto areaMini =
-                D2D1::RectF(cartao.left + 4, cartao.top + 4, cartao.right - 4, cartao.top + alturaMini);
-            render.retangulo(areaMini, tema::kFundo, 7);
-
-            // Quem está no palco NÃO é desenhado de novo aqui.
-            //
-            // O renderizador guarda, por chave, onde a imagem caiu - e é disso
-            // que a etiqueta em cima do vídeo se serve. Desenhando a mesma
-            // chave duas vezes, a segunda (a miniatura) sobrescrevia a
-            // primeira, e a etiqueta ia parar em cima do cartão em vez de em
-            // cima do palco. Além disso, decodificar já é caro; desenhar a
-            // mesma imagem duas vezes por quadro é gasto sem nada em troca.
-            if (ativo) {
-                render.texto(L"no palco", areaMini, tema::kVerde, Fonte::Pequena,
-                             DWRITE_TEXT_ALIGNMENT_CENTER);
-            } else {
-                render.video(n.id, n.quadro, areaMini);
+            const float direitaNome = ping > 0 ? area.right - 66 : area.right - 12;
+            render.texto(nome, D2D1::RectF(area.left + 46, area.top, direitaNome, area.bottom),
+                         tema::kTexto, Fonte::Pequena);
+            if (souEu) {
+                const float largura = render.larguraDoTexto(nome, Fonte::Pequena);
+                render.texto(L"(você)",
+                             D2D1::RectF(area.left + 52 + largura, area.top, direitaNome,
+                                         area.bottom),
+                             tema::kVerde, Fonte::Pequena);
             }
 
-            render.texto(ativo ? (L"●  " + n.nome) : n.nome,
-                         D2D1::RectF(cartao.left + 10, cartao.top + alturaMini,
-                                     cartao.right - 10, cartao.bottom),
-                         ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+            if (ping > 0) {
+                const std::wstring texto = std::to_wstring(ping) + L"ms";
+                const float largura = render.larguraDoTexto(texto, Fonte::Pequena) + 14;
+                const auto pastilha = D2D1::RectF(area.right - 10 - largura, area.top + 12,
+                                                  area.right - 10, area.top + 32);
+                render.retangulo(pastilha, tema::kVerdeSuave, 6);
+                render.contorno(pastilha, tema::kVerdeLinha, 6);
+                render.texto(texto, pastilha, tema::kVerde, Fonte::Pequena,
+                             DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
+            y += 50;
+        };
 
-            btTransmissoes.push_back(cartao);
-            idsTransmissoes.push_back(n.id);
-            y += alturaMini + 32;
+        const std::wstring meuNome = campoNome.valor.empty() ? L"Você" : campoNome.valor;
+        pessoa(meuNome, static_cast<int>(sinal.pingMs()), true, transmitindo && !escolhida);
+
+        for (const auto& p : copia) {
+            const bool estaNoPalco =
+                escolhida && !escolhida->dono.empty() && escolhida->dono == p.id;
+            pessoa(paraW(p.nome), p.pingMs, false, estaNoPalco);
         }
+
+        y -= 6;
+        fecharSecao(topo);
+    }
+
+    // ---- volume do que CHEGA da chamada
+    //
+    // Fica por último porque é ajuste, não escolha: quem abre o painel está
+    // procurando quem está na sala, não o volume.
+    {
+        render.texto(L"VOLUME DE QUEM EU OUÇO", D2D1::RectF(esq, y, dir - 44, y + 14),
+                     tema::kApagado, Fonte::Pequena);
+        render.texto(std::to_wstring(volumeDaChamada) + L"%",
+                     D2D1::RectF(esq, y, dir, y + 14), tema::kTexto, Fonte::Pequena,
+                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+        y += 22;
+
+        barraVolume = D2D1::RectF(esq, y, dir, y + 18);
+        const float trilhoY = y + 7;
+        render.retangulo(D2D1::RectF(esq, trilhoY, dir, trilhoY + 5), tema::kLinha, 3);
+
+        const float fracao = static_cast<float>(volumeDaChamada) / 100.0f;
+        const float ate = esq + (dir - esq) * fracao;
+        if (ate > esq) {
+            render.retangulo(D2D1::RectF(esq, trilhoY, ate, trilhoY + 5), tema::kVerde, 3);
+        }
+
+        // A bolinha fica presa dentro da barra nas pontas, senão ela some
+        // metade para fora no 0 e no 100.
+        const float centro = (ate < esq + 7) ? esq + 7 : ((ate > dir - 7) ? dir - 7 : ate);
+        render.retangulo(D2D1::RectF(centro - 7, trilhoY - 4, centro + 7, trilhoY + 9),
+                         tema::kTexto, 7);
+        y += 26;
     }
 
     // Fim da parte que rola. A altura medida aqui é o que limita a rolagem no
