@@ -1743,6 +1743,31 @@ void Aplicacao::Interno::pararTransmissao() {
     destinosAudio.clear();
     destinosVideo.clear();
 
+    // Avisa que a transmissão acabou, em vez de só parar de mandar pacote.
+    //
+    // Sem o aviso, quem assiste fica com o último quadro congelado até o
+    // próprio tempo sem pacote expirar - e no celular isso demora. O servidor
+    // não manda esse recado por conta própria: quem publica é que avisa, e é o
+    // que o cliente do navegador já faz.
+    //
+    // O identificador é o mesmo que o servidor monta para a stream ao
+    // encaminhar: "greenlabs-" mais os oito primeiros do dono. É por ele que o
+    // outro lado acha o cartão.
+    if (!meuId.empty()) {
+        Json fim = Json::objeto();
+        fim["type"] = Json{std::string("stream-ended")};
+        fim["streamId"] = Json{"greenlabs-" + meuId.substr(0, 8)};
+
+        std::vector<std::string> destinos;
+        {
+            std::lock_guard trava(travaPares);
+            for (const auto& p : pares) {
+                if (p.id != meuId) destinos.push_back(p.id);
+            }
+        }
+        for (const auto& id : destinos) sinal.enviarPara(id, fim);
+    }
+
     // Em modo retransmissor a conexão com o servidor NÃO cai aqui.
     //
     // Ela é o caminho dos dois sentidos: derrubá-la ao parar de transmitir
