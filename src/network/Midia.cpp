@@ -1,5 +1,7 @@
 #include "network/Midia.h"
 
+#include <variant>
+
 #include "network/Pacer.h"
 
 #include <rtc/rtc.hpp>
@@ -334,6 +336,27 @@ void ConexaoPar::Interno::montarRecepcao(const std::shared_ptr<rtc::Track>& faix
         break;
     }
     info("faixa recebida identificada como {}", idDaFaixa);
+
+    // Uma faixa que SÓ recebe precisa do remontador dela.
+    //
+    // O onFrame não desempacota nada sozinho: quem transforma pacote RTP em
+    // quadro é o H264RtpDepacketizer, e ele precisa estar na cadeia da faixa.
+    // A primeira faixa ganhava um de carona, porque o montarEmpacotador monta a
+    // cadeia inteira nela; as outras não ganhavam nada, e o onFrame delas nunca
+    // era chamado - a faixa existia, os pacotes chegavam, e não virava imagem.
+    //
+    // Só entra onde ainda não há cadeia: pôr um por cima do empacotador
+    // apagaria o caminho de envio, que é o que setMediaHandler faz.
+    if (!faixa->getMediaHandler()) {
+        auto remontador = std::make_shared<rtc::H264RtpDepacketizer>(
+            rtc::NalUnit::Separator::LongStartSequence);
+
+        // PLI: é como se pede quadro-chave a quem publica. Sem responder, a
+        // imagem fica quebrada até o próximo IDR espontâneo.
+        remontador->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
+        faixa->setMediaHandler(remontador);
+    }
+
     faixa->onFrame([this, idDaFaixa](rtc::binary dados, rtc::FrameInfo) {
         if (aoReceberVideo && !dados.empty()) {
             aoReceberVideo(dados.data(), dados.size(), idDaFaixa);
@@ -489,6 +512,39 @@ bool ConexaoPar::oferecer() {
 
 void ConexaoPar::receberDescricao(const std::string& tipo, const std::string& sdp) {
     try {
+        {
+            // Resumo das m-lines da descrição recebida, lido do texto do SDP.
+            //
+            // "offer aceita" sozinho não diz nada quando o vídeo não aparece:
+            // não dá para saber se o servidor mandou faixa nova, se reaproveitou
+            // a que já existia, nem em que direção. Uma linha com o tipo, o mid
+            // e a direção de cada m-line responde as três de uma vez.
+            std::string resumo;
+            std::string tipoDaLinha;
+            size_t pos = 0;
+            while (pos < sdp.size()) {
+                size_t fim = sdp.find('\n', pos);
+                if (fim == std::string::npos) fim = sdp.size();
+                std::string linha = sdp.substr(pos, fim - pos);
+                while (!linha.empty() && (linha.back() == '\r' || linha.back() == ' ')) {
+                    linha.pop_back();
+                }
+                pos = fim + 1;
+
+                if (linha.rfind("m=", 0) == 0) {
+                    const size_t espaco = linha.find(' ');
+                    tipoDaLinha = linha.substr(2, espaco == std::string::npos ? 0 : espaco - 2);
+                } else if (linha.rfind("a=mid:", 0) == 0) {
+                    if (!resumo.empty()) resumo += " | ";
+                    resumo += tipoDaLinha + " mid " + linha.substr(6);
+                } else if (linha == "a=sendrecv" || linha == "a=sendonly" ||
+                           linha == "a=recvonly" || linha == "a=inactive") {
+                    resumo += " " + linha.substr(2);
+                }
+            }
+            info("[sdp] {} de {}: {}", tipo, d_->par.substr(0, 8), resumo);
+        }
+
         d_->conexao->setRemoteDescription(rtc::Description(sdp, tipo));
         if (tipo == "answer") {
             d_->esperandoResposta.store(false);

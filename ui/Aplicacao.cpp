@@ -556,7 +556,7 @@ struct Aplicacao::Interno {
     // sobram ficam vazios de proposito: sem eles, a unica transmissao pularia de
     // tamanho a cada pessoa que entra.
     int divisoes = 1;
-    D2D1_RECT_F btBarraFonte{};
+    D2D1_RECT_F btBarraFonte{}, btBarraCamera{}, btBarraSair{};
     std::vector<D2D1_RECT_F> btDivisoes;
     void desenharBarraDeAcoes();
 
@@ -2636,6 +2636,24 @@ void Aplicacao::Interno::clique(float x, float y) {
         abrirModal();
         return;
     }
+    if (dentro(btBarraCamera, x, y)) {
+        // O mesmo modal, ja na aba das cameras: quem clicou na camera quer a
+        // camera, nao a lista de telas.
+        abrirModal();
+        abaModal = 1;
+        return;
+    }
+    if (dentro(btBarraSair, x, y)) {
+        if (conectado.load()) {
+            pararTransmissao();
+            sinal.sair();
+            conectado.store(false);
+            telaAtual = Tela::Entrada;
+        } else {
+            conectar();
+        }
+        return;
+    }
     for (size_t i = 0; i < btDivisoes.size(); ++i) {
         if (!dentro(btDivisoes[i], x, y)) continue;
         divisoes = (i == 0) ? 1 : (i == 1) ? 2 : 4;
@@ -2877,13 +2895,26 @@ void Aplicacao::Interno::desenharBarraDeAcoes() {
         icone::engrenagem(render, btEngrenagem, sob ? tema::kTexto : tema::kApagado, 16.0f);
     }
 
-    // Escolher o que transmitir.
+    // Câmera e tela: os dois abrem o mesmo modal, cada um na aba dele. É o
+    // mesmo par de botões da barra do Electron.
+    btBarraCamera = botao(36);
+    {
+        const bool sob = apontando(btBarraCamera);
+        render.retangulo(btBarraCamera, sob ? tema::kPainel3 : tema::kPainel2, 10);
+        render.contorno(btBarraCamera, sob ? tema::kLinhaForte : tema::kLinha, 10);
+        icone::camera(render, btBarraCamera,
+                      camerasVivas() > 0 ? tema::kVerde : (sob ? tema::kTexto : tema::kApagado),
+                      15.0f);
+    }
+
     btBarraFonte = botao(36);
     {
         const bool sob = apontando(btBarraFonte);
         render.retangulo(btBarraFonte, sob ? tema::kPainel3 : tema::kPainel2, 10);
         render.contorno(btBarraFonte, sob ? tema::kLinhaForte : tema::kLinha, 10);
-        icone::monitor(render, btBarraFonte, sob ? tema::kTexto : tema::kApagado, 15.0f);
+        icone::monitor(render, btBarraFonte,
+                       !telasLigadas.empty() ? tema::kVerde : (sob ? tema::kTexto : tema::kApagado),
+                       15.0f);
     }
 
     // Divisão do palco: três botões grudados, num trilho só - o layout-picker.
@@ -2909,6 +2940,21 @@ void Aplicacao::Interno::desenharBarraDeAcoes() {
             else if (i == 1) icone::doisQuadros(render, area, cor);
             else icone::quatroQuadros(render, area, cor);
             btDivisoes.push_back(area);
+        }
+    }
+
+    // Sair da sala, na barra, como no Electron: a porta vermelha quando se está
+    // dentro, a tomada verde quando não. É o mesmo botão trocando de papel -
+    // sempre no mesmo lugar, que é o que a mão decora.
+    btBarraSair = botao(36);
+    {
+        const bool sob = apontando(btBarraSair);
+        if (ligado) {
+            render.retangulo(btBarraSair, sob ? tema::kVermelho : tema::kVermelhoSuave, 10);
+            icone::porta(render, btBarraSair, sob ? tema::kTexto : tema::kFundo, 16.0f, 1.6f);
+        } else {
+            render.retangulo(btBarraSair, sob ? tema::kVerde : tema::kVerdeForte, 10);
+            icone::tomada(render, btBarraSair, tema::kFundo, 15.0f, 1.6f);
         }
     }
 
@@ -3574,7 +3620,9 @@ void Aplicacao::Interno::desenharAoVivo() {
         const bool sob = apontando(btSair);
         render.retangulo(btSair, sob ? tema::kPainel3 : tema::kPainel2, 13);
         render.contorno(btSair, sob ? tema::kLinhaForte : tema::kLinha, 13);
-        icone::porta(render, btSair, sob ? tema::kVermelho : tema::kApagado, 17.0f, 1.6f);
+        // Vermelha sempre, e nao so sob o ponteiro: sair da sala e a unica acao
+        // do painel que desfaz algo, e a cor e o que diz isso antes do clique.
+        icone::porta(render, btSair, sob ? tema::kTexto : tema::kVermelho, 17.0f, 1.6f);
     }
 
     {
