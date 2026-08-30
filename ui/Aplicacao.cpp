@@ -556,7 +556,7 @@ struct Aplicacao::Interno {
     // sobram ficam vazios de proposito: sem eles, a unica transmissao pularia de
     // tamanho a cada pessoa que entra.
     int divisoes = 1;
-    D2D1_RECT_F btBarraFonte{}, btBarraCamera{}, btBarraSair{};
+    D2D1_RECT_F btBarraFonte{}, btBarraCamera{}, btBarraSair{}, btBarraTransmitir{};
     std::vector<D2D1_RECT_F> btDivisoes;
     void desenharBarraDeAcoes();
 
@@ -659,7 +659,7 @@ struct Aplicacao::Interno {
 
     // Botões, guardados entre o desenho e o clique.
     D2D1_RECT_F btMinimizar{}, btMaximizar{}, btFechar{};
-    D2D1_RECT_F btEntrar{}, btTransmitir{}, btSair{};
+    D2D1_RECT_F btEntrar{};
     // A linha "o que vai no ar" no painel: clicar abre o modal.
     D2D1_RECT_F btEscolher{};
     std::vector<D2D1_RECT_F> btQualidades;
@@ -2643,6 +2643,12 @@ void Aplicacao::Interno::clique(float x, float y) {
         abaModal = 1;
         return;
     }
+    if (dentro(btBarraTransmitir, x, y)) {
+        // Parar e imediato; comecar passa pela escolha do que vai no ar.
+        if (transmitindo) pararTransmissao();
+        else abrirModal();
+        return;
+    }
     if (dentro(btBarraSair, x, y)) {
         if (conectado.load()) {
             pararTransmissao();
@@ -2706,22 +2712,7 @@ void Aplicacao::Interno::clique(float x, float y) {
     // - invisível, mas ativo.
     const bool naAreaRolavel =
         y >= areaRolavel.top && y <= areaRolavel.bottom;
-    if (!naAreaRolavel) {
-        if (dentro(btSair, x, y)) {
-            pararTransmissao();
-            sinal.sair();
-            conectado.store(false);
-            telaAtual = Tela::Entrada;
-            return;
-        }
-        if (dentro(btTransmitir, x, y)) {
-            // Parar e imediato; comecar passa pela escolha do que vai no ar.
-            if (transmitindo) pararTransmissao();
-            else abrirModal();
-            return;
-        }
-        return;
-    }
+    if (!naAreaRolavel) return;
 
     if (dentro(btEscolher, x, y)) {
         abrirModal();
@@ -2941,6 +2932,28 @@ void Aplicacao::Interno::desenharBarraDeAcoes() {
             else icone::quatroQuadros(render, area, cor);
             btDivisoes.push_back(area);
         }
+    }
+
+    // Transmitir e parar, na barra: e a acao principal e precisa de peso.
+    btBarraTransmitir = botao(transmitindo ? 104.0f : 128.0f);
+    {
+        const bool sob = apontando(btBarraTransmitir);
+        const auto fundo = transmitindo ? (sob ? tema::kVermelho : tema::kVermelhoSuave)
+                                        : (sob ? tema::kVerde : tema::kVerdeForte);
+        render.retangulo(btBarraTransmitir, fundo, 10);
+        const auto corTexto = transmitindo ? tema::kTexto : tema::kFundo;
+        const std::wstring rotulo = transmitindo ? L"PARAR" : L"TRANSMITIR";
+        const float larguraTexto = render.larguraDoTexto(rotulo, Fonte::Pequena);
+        const float meio = (btBarraTransmitir.left + btBarraTransmitir.right) / 2;
+        const float inicio = meio - (larguraTexto + 22) / 2;
+        const auto areaIcone =
+            D2D1::RectF(inicio, btBarraTransmitir.top, inicio + 16, btBarraTransmitir.bottom);
+        if (transmitindo) icone::parar(render, areaIcone, corTexto, 10.0f);
+        else icone::transmitir(render, areaIcone, corTexto, 14.0f, 1.6f);
+        render.texto(rotulo,
+                     D2D1::RectF(inicio + 22, btBarraTransmitir.top, btBarraTransmitir.right,
+                                 btBarraTransmitir.bottom),
+                     corTexto, Fonte::Pequena);
     }
 
     // Sair da sala, na barra, como no Electron: a porta vermelha quando se está
@@ -3164,12 +3177,21 @@ void Aplicacao::Interno::desenharAoVivo() {
         if (escolhida && n.id == escolhida->id) continue;
         quadros.push_back({n.id, n.nome, n.quadro, false, false});
     }
-    if (telaLigada(monitorEscolhido) || !camerasAbertas.empty()) {
-        quadros.push_back({"previa", L"Você", previaDaTela(), true, false});
-    }
-    for (auto& c : camerasAbertas) {
-        ID3D11Texture2D* imagem = c->previa(tela.dispositivo(), tela.contexto());
-        if (imagem) quadros.push_back({"cam:" + c->id, paraW(c->nome), imagem, true, true});
+    // A própria imagem entra no palco SÓ transmitindo.
+    //
+    // Antes ela aparecia assim que uma tela estava escolhida, mesmo fora do ar.
+    // O palco passa a ideia de "isto está indo para a sala", e mostrar ali algo
+    // que não está indo é mentira - a pessoa vê a própria tela no palco e
+    // conclui que já está compartilhando. Para se enquadrar antes existe a
+    // prévia dentro do modal, que é onde a escolha acontece.
+    if (transmitindo) {
+        if (telaLigada(monitorEscolhido)) {
+            quadros.push_back({"previa", L"Você", previaDaTela(), true, false});
+        }
+        for (auto& c : camerasAbertas) {
+            ID3D11Texture2D* imagem = c->previa(tela.dispositivo(), tela.contexto());
+            if (imagem) quadros.push_back({"cam:" + c->id, paraW(c->nome), imagem, true, true});
+        }
     }
 
     const size_t vagas = static_cast<size_t>(divisoes);
@@ -3318,10 +3340,11 @@ void Aplicacao::Interno::desenharAoVivo() {
                  D2D1::RectF(esq, painel.top + 14, dir, painel.top + 32), tema::kVerde,
                  Fonte::Pequena);
 
+    // Sem botoes no pe, a lista vai ate a base do painel - so o diagnostico,
+    // que aparece transmitindo, reserva espaco.
     const float alturaDiagnostico = transmitindo ? 74.0f : 0.0f;
-    const float baseBotoes = painel.bottom - 16 - alturaDiagnostico;
     const float topoRolavel = painel.top + 42;
-    const float fimRolavel = baseBotoes - 58;
+    const float fimRolavel = painel.bottom - 16 - alturaDiagnostico;
 
     areaRolavel = D2D1::RectF(painel.left, topoRolavel, painel.right, fimRolavel);
     alturaVisivel = fimRolavel - topoRolavel;
@@ -3595,62 +3618,13 @@ void Aplicacao::Interno::desenharAoVivo() {
         render.retangulo(D2D1::RectF(x0, y0, x0 + 3, y0 + alturaPolegar), tema::kLinha, 2);
     }
 
-    // ---- pé do painel: botões e, abaixo deles, o diagnóstico
+    // ---- pé do painel: só o diagnóstico
     //
-    // Ancorados na base em vez de seguirem a lista. Com a sala cheia, o rodapé
-    // calculado por posição fixa se sobrepunha aos nomes.
-    const float base = baseBotoes;
-
-    // SAIR discreto, TRANSMITIR em verde cheio.
-    //
-    // No Electron a ação principal é um botão verde com sombra, e as outras são
-    // fantasmas. Dois botões do mesmo peso lado a lado obrigam a ler os dois
-    // para descobrir qual é o que se quer - e o que se quer, num aplicativo de
-    // mostrar a tela, é transmitir.
-    const float alturaBotao = 46;
-    btSair = D2D1::RectF(esq, base - alturaBotao, esq + alturaBotao, base);
-    btTransmitir = D2D1::RectF(btSair.right + 8, base - alturaBotao, dir, base);
-
-    // Só a porta, sem a palavra.
-    //
-    // O ícone já diz o que faz, e o quadrado sobrando vira largura para o botão
-    // ao lado - que é o que a pessoa está procurando quando olha para o pé do
-    // painel. É o mesmo icon-btn-only do Electron.
-    {
-        const bool sob = apontando(btSair);
-        render.retangulo(btSair, sob ? tema::kPainel3 : tema::kPainel2, 13);
-        render.contorno(btSair, sob ? tema::kLinhaForte : tema::kLinha, 13);
-        // Vermelha sempre, e nao so sob o ponteiro: sair da sala e a unica acao
-        // do painel que desfaz algo, e a cor e o que diz isso antes do clique.
-        icone::porta(render, btSair, sob ? tema::kTexto : tema::kVermelho, 17.0f, 1.6f);
-    }
-
-    {
-        const bool sob = apontando(btTransmitir);
-        const auto fundo = transmitindo ? (sob ? tema::kVermelho : tema::kVermelhoSuave)
-                                        : (sob ? tema::kVerde : tema::kVerdeForte);
-        render.retangulo(btTransmitir, fundo, 13);
-
-        // O texto do botão verde é escuro, e o do vermelho é claro: é o
-        // contraste que cada fundo pede, não uma escolha de estilo.
-        const auto corTexto = transmitindo ? tema::kTexto : tema::kFundo;
-
-        const std::wstring rotulo = transmitindo ? L"PARAR" : L"TRANSMITIR";
-        const float larguraTexto = render.larguraDoTexto(rotulo, Fonte::Botao);
-        const float meio = (btTransmitir.left + btTransmitir.right) / 2;
-        const float inicio = meio - (larguraTexto + 26) / 2;
-
-        const auto areaIcone = D2D1::RectF(inicio, btTransmitir.top, inicio + 18,
-                                           btTransmitir.bottom);
-        if (transmitindo) icone::parar(render, areaIcone, corTexto, 11.0f);
-        else icone::transmitir(render, areaIcone, corTexto, 16.0f, 1.7f);
-
-        render.texto(rotulo,
-                     D2D1::RectF(inicio + 26, btTransmitir.top, btTransmitir.right,
-                                 btTransmitir.bottom),
-                     corTexto, Fonte::Botao);
-    }
-
+    // Os botões SAIR e TRANSMITIR viviam aqui E na barra de cima. Dois botões
+    // que fazem a mesma coisa, na mesma tela, obrigam a pessoa a descobrir se
+    // são o mesmo - e duas portas lado a lado é pergunta, não interface. Ficou
+    // a barra, que é onde o Electron os põe.
+    if (!transmitindo) return;
     if (!transmitindo) return;
 
     // Diagnóstico: três linhas, e só o que muda de verdade enquanto se
