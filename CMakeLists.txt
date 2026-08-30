@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(GreenLabs
-    VERSION 1.1.4
+    VERSION 1.1.5
     DESCRIPTION "Cliente nativo do GreenLabs Live Streaming"
     LANGUAGES C CXX)
 
@@ -190,7 +190,13 @@ greenlabs_flags(greenlabs_core)
 # -------------------------------------------------------------- aplicativo
 #
 # WIN32 e o que faz o executavel abrir sem console atras da janela.
-add_executable(GreenLabs WIN32 src/main/main.cpp ui/recursos.rc)
+# O VERSIONINFO do .exe sai do mesmo project(VERSION) que o resto. Estava
+# escrito a mao no .rc e ficou parado em 0.3.2 ate a 1.1.4 - quem olhasse as
+# propriedades do arquivo via uma versao que nao existia mais.
+string(REPLACE "." "," GREENLABS_VERSAO_RC "${PROJECT_VERSION},0")
+configure_file(ui/recursos.rc.in ${CMAKE_CURRENT_BINARY_DIR}/recursos.rc @ONLY)
+
+add_executable(GreenLabs WIN32 src/main/main.cpp ${CMAKE_CURRENT_BINARY_DIR}/recursos.rc)
 target_link_libraries(GreenLabs PRIVATE greenlabs_core)
 greenlabs_flags(GreenLabs)
 
