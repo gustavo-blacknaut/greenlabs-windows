@@ -550,6 +550,21 @@ struct Aplicacao::Interno {
     std::vector<D2D1_RECT_F> btRemoverServidor;
     D2D1_RECT_F btConfigConcluir{}, btSalvarPadrao{}, btRestaurar{}, btEngrenagem{};
 
+    // Barra de acoes: em quantos quadros o palco se divide, e os botoes dela.
+    //
+    // 1, 2 ou 4, como no Electron. Com mais quadros do que transmissoes, os que
+    // sobram ficam vazios de proposito: sem eles, a unica transmissao pularia de
+    // tamanho a cada pessoa que entra.
+    int divisoes = 1;
+    D2D1_RECT_F btBarraFonte{};
+    std::vector<D2D1_RECT_F> btDivisoes;
+    void desenharBarraDeAcoes();
+
+    // Os quadros do palco e o que ha em cada um, para o clique saber onde caiu.
+    std::vector<D2D1_RECT_F> btQuadros;
+    std::vector<std::string> chavesQuadros;
+    D2D1_RECT_F btExpandirQuadro{};
+
     // Campo desenhado sem o rotulo por cima - dentro do modal o rotulo ja vem
     // separado, e o desenharCampo original o desenha acima da area.
     void desenharCampoSimples(Campo& campo);
@@ -937,6 +952,7 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     // A lista de câmeras é montada agora, mas nenhuma é aberta: enumerar não
     // acende a luzinha de ninguém. A escolhida só é aberta quando a
     // transmissão começa.
+    d_->divisoes = d_->config.divisoes;
     d_->telasLigadas = d_->config.telas;
 
     // Primeira abertura: a tela principal já vem marcada.
@@ -2608,8 +2624,36 @@ void Aplicacao::Interno::clique(float x, float y) {
     // abaixo ha um return antecipado para tudo que esta fora dela. Testar aqui,
     // junto dos outros botoes da barra, e o que faz o clique chegar: antes ele
     // era engolido por aquele return e a engrenagem simplesmente nao respondia.
+    // A barra de ações e o palco ficam FORA da área rolável do painel, e mais
+    // abaixo há um return antecipado para tudo que está fora dela. Testar aqui,
+    // junto dos botões da janela, é o que faz esses cliques chegarem - foi
+    // exatamente por estar depois daquele return que a engrenagem não respondia.
     if (dentro(btEngrenagem, x, y)) {
         abrirConfig();
+        return;
+    }
+    if (dentro(btBarraFonte, x, y)) {
+        abrirModal();
+        return;
+    }
+    for (size_t i = 0; i < btDivisoes.size(); ++i) {
+        if (!dentro(btDivisoes[i], x, y)) continue;
+        divisoes = (i == 0) ? 1 : (i == 1) ? 2 : 4;
+        config.divisoes = divisoes;
+        config.salvar();
+        return;
+    }
+    if (dentro(btExpandirQuadro, x, y)) {
+        alternarTelaCheia();
+        return;
+    }
+    // Clicar num quadro põe aquela transmissão em primeiro - é o que decide
+    // quem aparece quando o palco está dividido em menos quadros do que há
+    // gente transmitindo.
+    for (size_t i = 0; i < btQuadros.size() && i < chavesQuadros.size(); ++i) {
+        if (!dentro(btQuadros[i], x, y)) continue;
+        std::lock_guard t(travaTransmissoes);
+        noPalco = chavesQuadros[i];
         return;
     }
     if (dentro(btMaximizar, x, y)) {
@@ -2774,6 +2818,118 @@ void Aplicacao::Interno::desenharCampo(Campo& campo, const std::wstring& rotulo)
     }
 }
 
+
+// A barra de ações, num cartão logo abaixo da barra de título.
+//
+// São duas fileiras de propósito, e é o desenho do cliente em Electron: em
+// cima o nome da janela e os botões do Windows, que são do sistema; embaixo o
+// que é do aplicativo - a marca, o estado da sala e as ações. Misturar os dois
+// numa fileira só faz o botão de fechar ficar do lado do de transmitir, e um
+// deles vai ser clicado por engano.
+void Aplicacao::Interno::desenharBarraDeAcoes() {
+    const float larg = render.largura();
+    const float topo = tema::kAlturaTitulo + tema::kEspaco;
+    const auto barra = D2D1::RectF(tema::kEspaco, topo, larg - tema::kEspaco,
+                                   topo + tema::kAlturaAcoes);
+
+    render.retangulo(barra, tema::kPainel, 16);
+    render.contorno(barra, tema::kLinha, 16);
+
+    // ---- esquerda: a marca e o estado
+    const auto selo = D2D1::RectF(barra.left + 10, barra.top + 9, barra.left + 44,
+                                  barra.bottom - 9);
+    render.retangulo(selo, tema::kVerdeSuave, 10);
+    render.contorno(selo, tema::kVerdeLinha, 10);
+    render.logo(D2D1::RectF(selo.left + 5, selo.top + 5, selo.right - 5, selo.bottom - 5));
+
+    const bool ligado = conectado.load();
+    render.retangulo(D2D1::RectF(barra.left + 56, (barra.top + barra.bottom) / 2 - 4,
+                                 barra.left + 64, (barra.top + barra.bottom) / 2 + 4),
+                     ligado ? tema::kVerde : tema::kApagado, 4);
+
+    std::wstring estado = L"Desconectado";
+    if (ligado) {
+        size_t quantas = 0;
+        {
+            std::lock_guard trava(travaPares);
+            quantas = pares.size() + 1;
+        }
+        estado = L"Conectado em " + campoSala.valor + L"  (" + std::to_wstring(quantas) + L")";
+    }
+    render.texto(estado, D2D1::RectF(barra.left + 72, barra.top, barra.right - 400, barra.bottom),
+                 ligado ? tema::kTexto : tema::kApagado, Fonte::Botao);
+
+    // ---- direita: as ações, montadas da borda para dentro
+    float x = barra.right - 10;
+
+    auto botao = [&](float largura) {
+        const auto area = D2D1::RectF(x - largura, barra.top + 8, x, barra.bottom - 8);
+        x = area.left - 6;
+        return area;
+    };
+
+    // Engrenagem.
+    btEngrenagem = botao(36);
+    {
+        const bool sob = apontando(btEngrenagem);
+        render.retangulo(btEngrenagem, sob ? tema::kPainel3 : tema::kPainel2, 10);
+        render.contorno(btEngrenagem, sob ? tema::kLinhaForte : tema::kLinha, 10);
+        icone::engrenagem(render, btEngrenagem, sob ? tema::kTexto : tema::kApagado, 16.0f);
+    }
+
+    // Escolher o que transmitir.
+    btBarraFonte = botao(36);
+    {
+        const bool sob = apontando(btBarraFonte);
+        render.retangulo(btBarraFonte, sob ? tema::kPainel3 : tema::kPainel2, 10);
+        render.contorno(btBarraFonte, sob ? tema::kLinhaForte : tema::kLinha, 10);
+        icone::monitor(render, btBarraFonte, sob ? tema::kTexto : tema::kApagado, 15.0f);
+    }
+
+    // Divisão do palco: três botões grudados, num trilho só - o layout-picker.
+    {
+        const float largura = 3 * 32 + 8;
+        const auto trilho = D2D1::RectF(x - largura, barra.top + 8, x, barra.bottom - 8);
+        x = trilho.left - 6;
+        render.retangulo(trilho, tema::kPainel2, 10);
+        render.contorno(trilho, tema::kLinha, 10);
+
+        btDivisoes.clear();
+        for (int i = 0; i < 3; ++i) {
+            const auto area = D2D1::RectF(trilho.left + 4 + static_cast<float>(i) * 32,
+                                          trilho.top + 4, trilho.left + 4 + static_cast<float>(i + 1) * 32,
+                                          trilho.bottom - 4);
+            const int quantas = (i == 0) ? 1 : (i == 1) ? 2 : 4;
+            const bool ativa = divisoes == quantas;
+            const bool sob = !ativa && apontando(area);
+            if (ativa) render.retangulo(area, tema::kVerdeSuave, 8);
+            else if (sob) render.retangulo(area, tema::kPainel3, 8);
+            const auto cor = ativa ? tema::kVerde : (sob ? tema::kTexto : tema::kApagado);
+            if (i == 0) icone::umQuadro(render, area, cor);
+            else if (i == 1) icone::doisQuadros(render, area, cor);
+            else icone::quatroQuadros(render, area, cor);
+            btDivisoes.push_back(area);
+        }
+    }
+
+    // Pastilha do ping.
+    if (ligado) {
+        const std::wstring texto = std::to_wstring(sinal.pingMs()) + L"ms";
+        const float largura = render.larguraDoTexto(texto, Fonte::Pequena) + 26;
+        const auto pastilha = botao(largura);
+        render.retangulo(pastilha, tema::kVerdeSuave, 9);
+        render.contorno(pastilha, tema::kVerdeLinha, 9);
+        icone::aoVivo(render,
+                      D2D1::RectF(pastilha.left + 8, pastilha.top, pastilha.left + 16,
+                                  pastilha.bottom),
+                      tema::kVerde, 6.0f);
+        render.texto(texto,
+                     D2D1::RectF(pastilha.left + 18, pastilha.top, pastilha.right - 6,
+                                 pastilha.bottom),
+                     tema::kVerde, Fonte::Pequena);
+    }
+}
+
 void Aplicacao::Interno::desenharBarraTitulo() {
     const float larg = render.largura();
     render.retangulo(D2D1::RectF(0, 0, larg, tema::kAlturaTitulo), tema::kPainel);
@@ -2787,55 +2943,6 @@ void Aplicacao::Interno::desenharBarraTitulo() {
 
     const float b = tema::kLarguraBotaoTitulo;
 
-    // Estado e ping, como na barra do Electron: bolinha, palavra, pastilha.
-    //
-    // Ficam à esquerda dos botões de janela, e não no painel, porque é
-    // informação de sessão inteira - vale igual estando no palco, na tela de
-    // entrada ou em tela cheia.
-    {
-        const bool ligado = conectado.load();
-        const float base = larg - 3 * b - 16;
-
-        std::wstring pingTexto;
-        if (ligado) {
-            pingTexto = std::to_wstring(sinal.pingMs()) + L"ms";
-            const float largura = render.larguraDoTexto(pingTexto, Fonte::Pequena) + 18;
-            const auto pastilha = D2D1::RectF(base - largura, 9, base, tema::kAlturaTitulo - 9);
-            render.retangulo(pastilha, tema::kVerdeSuave, 7);
-            render.contorno(pastilha, tema::kVerdeLinha, 7);
-            render.texto(pingTexto, pastilha, tema::kVerde, Fonte::Pequena,
-                         DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
-
-        const std::wstring estado = ligado ? L"Conectado" : L"Desconectado";
-        const float larguraEstado = render.larguraDoTexto(estado, Fonte::Pequena);
-        const float larguraPing =
-            pingTexto.empty() ? 0.0f : render.larguraDoTexto(pingTexto, Fonte::Pequena) + 26;
-        const float direitaEstado = base - larguraPing;
-
-        render.retangulo(D2D1::RectF(direitaEstado - larguraEstado - 16,
-                                     tema::kAlturaTitulo / 2 - 3,
-                                     direitaEstado - larguraEstado - 10,
-                                     tema::kAlturaTitulo / 2 + 3),
-                         ligado ? tema::kVerde : tema::kVermelho, 3);
-        render.texto(estado,
-                     D2D1::RectF(direitaEstado - larguraEstado - 4, 0, direitaEstado,
-                                 tema::kAlturaTitulo),
-                     ligado ? tema::kTexto : tema::kApagado, Fonte::Pequena);
-
-        // Engrenagem: abre a configuração. Só aparece dentro da chamada porque
-        // na tela de entrada os mesmos campos já estão na frente da pessoa.
-        if (telaAtual == Tela::AoVivo) {
-            btEngrenagem = D2D1::RectF(direitaEstado - larguraEstado - 58, 6,
-                                       direitaEstado - larguraEstado - 22,
-                                       tema::kAlturaTitulo - 6);
-            const bool sob = apontando(btEngrenagem);
-            render.retangulo(btEngrenagem, sob ? tema::kPainel3 : tema::kTransparente, 9);
-            icone::engrenagem(render, btEngrenagem, sob ? tema::kTexto : tema::kApagado);
-        } else {
-            btEngrenagem = {};
-        }
-    }
 
     btFechar = D2D1::RectF(larg - b, 0, larg, tema::kAlturaTitulo);
     btMaximizar = D2D1::RectF(larg - 2 * b, 0, larg - b, tema::kAlturaTitulo);
@@ -2940,10 +3047,11 @@ void Aplicacao::Interno::desenharAoVivo() {
     const float larg = render.largura();
     const float alt = render.altura();
 
-    // Em tela cheia não há painel nem barra: o palco é a janela. Os controles
+    // Em tela cheia não há painel nem barras: o palco é a janela. Os controles
     // não somem por elegância - é que numa tela cheia eles ficariam por cima da
     // imagem, e a imagem é o motivo de alguém pedir tela cheia.
-    const float topo = telaCheia ? 0.0f : tema::kAlturaTitulo + tema::kEspaco;
+    const float topo =
+        telaCheia ? 0.0f : tema::kAlturaTitulo + 2 * tema::kEspaco + tema::kAlturaAcoes;
     const float painelX =
         telaCheia ? larg : larg - tema::kLarguraPainelLateral - tema::kEspaco;
 
@@ -2979,170 +3087,164 @@ void Aplicacao::Interno::desenharAoVivo() {
     for (const auto& n : aoVivo) {
         if (n.id == noPalco) { escolhida = &n; break; }
     }
-    ID3D11Texture2D* doOutro = escolhida ? escolhida->quadro : nullptr;
-    const uint32_t doOutroLargura = escolhida ? escolhida->largura : 0;
 
-    // ---- palco
-    //
-    // Sem barra inferior: os botões foram para o pé do painel lateral, e o
-    // palco herdou os 64 px que ela ocupava. Numa tela de chamada, imagem é o
-    // conteúdo e botão é moldura.
+    // ---- o palco
     const auto palco = telaCheia
                            ? D2D1::RectF(0, 0, larg, alt)
                            : D2D1::RectF(tema::kEspaco, topo, painelX - tema::kEspaco,
                                          alt - tema::kEspaco);
-    // Palco mais escuro que o painel, e não igual.
-    //
-    // A imagem entra com a proporção dela, então sobra faixa em volta. Com o
-    // palco na mesma cor do painel lateral, essa faixa lia como "a interface
-    // está quebrada aqui". Escuro, ela lê como moldura - que é o que é.
+    // Palco mais escuro que o painel, e não igual: a imagem entra com a
+    // proporção dela e sobra faixa em volta. Na mesma cor do painel, essa faixa
+    // lia como "a interface está quebrada aqui"; escura, lê como moldura.
     render.retangulo(palco, tema::kFundo, tema::kRaioCartao);
 
-    // Passar textura nula é de propósito: sem quadro novo o renderizador
-    // repinta o último. Antes a prévia apagava a cada instante em que a tela
-    // não mudava, e o resultado era piscar sem parar.
-    const auto dentroDoPalco =
-        D2D1::RectF(palco.left + 5, palco.top + 5, palco.right - 5, palco.bottom - 5);
+    // O que cabe no palco, na ordem em que vai aparecer.
+    //
+    // A escolhida primeiro, depois as outras, e a própria prévia por último -
+    // ver o que os outros mandam é o motivo de estar aqui; a própria tela a
+    // gente já tem na frente.
+    struct Quadro {
+        std::string chave;
+        std::wstring nome;
+        ID3D11Texture2D* imagem;
+        bool minha;
+        bool camera;
+    };
+    std::vector<Quadro> quadros;
     if (escolhida) {
-        render.video(escolhida->id, escolhida->quadro, dentroDoPalco);
-    } else {
-        render.video("previa", previaDaTela(), dentroDoPalco);
-
-        // A câmera por cima da própria tela, no mesmo canto em que ela vai
-        // dentro do quadro que os outros recebem.
-        //
-        // Aqui é uma segunda imagem desenhada em cima; lá é uma composição do
-        // Video Processor. São caminhos diferentes de propósito - o que sai na
-        // transmissão precisa ser um quadro só, e o que aparece aqui precisa
-        // aparecer mesmo sem transmissão nenhuma acontecendo. O que importa é
-        // que o enquadramento seja o mesmo, e é.
-        const D2D1_RECT_F v = render.areaDoVideo("previa");
-        const bool temTela = render.temQuadro("previa") && v.right > v.left;
-        const D2D1_RECT_F base = (temTela && telaLigada(monitorEscolhido)) ? v : dentroDoPalco;
-
-        const float larguraBase = base.right - base.left;
-        const float margem = larguraBase / 48.0f;
-        const size_t quantas = camerasVivas();
-        const float fatia = 4.0f + 1.0f * static_cast<float>(quantas > 0 ? quantas - 1 : 0);
-        const float larguraCam = larguraBase / fatia;
-
-        float direita = base.right - margem;
-        for (auto& c : camerasAbertas) {
-            ID3D11Texture2D* cam = c->previa(tela.dispositivo(), tela.contexto());
-            if (!cam) continue;
-
-            const float alturaCam = larguraCam * static_cast<float>(c->captura.altura()) /
-                                    c->captura.largura();
-            const auto canto = D2D1::RectF(direita - larguraCam, base.bottom - margem - alturaCam,
-                                           direita, base.bottom - margem);
-            render.retangulo(canto, tema::kFundo, 6);
-            render.video("cam:" + c->id, cam, canto);
-            render.contorno(canto, tema::kVerdeLinha, 6);
-            direita = canto.left - margem / 2;
-        }
+        quadros.push_back({escolhida->id, escolhida->nome, escolhida->quadro, false, false});
+    }
+    for (const auto& n : aoVivo) {
+        if (escolhida && n.id == escolhida->id) continue;
+        quadros.push_back({n.id, n.nome, n.quadro, false, false});
+    }
+    if (telaLigada(monitorEscolhido) || !camerasAbertas.empty()) {
+        quadros.push_back({"previa", L"Você", previaDaTela(), true, false});
+    }
+    for (auto& c : camerasAbertas) {
+        ID3D11Texture2D* imagem = c->previa(tela.dispositivo(), tela.contexto());
+        if (imagem) quadros.push_back({"cam:" + c->id, paraW(c->nome), imagem, true, true});
     }
 
-    if (!render.temQuadro(escolhida ? escolhida->id : std::string("previa"))) {
-        // Estado vazio com logo e duas linhas: uma dizendo o que está
-        // acontecendo, outra dizendo o que fazer. Só a primeira deixava a
-        // pessoa parada olhando para um retângulo preto sem saída.
+    const size_t vagas = static_cast<size_t>(divisoes);
+    if (quadros.size() > vagas) quadros.resize(vagas);
+
+    btQuadros.clear();
+    chavesQuadros.clear();
+
+    if (quadros.empty()) {
+        // ---- estado vazio
         const float meio = (palco.top + palco.bottom) / 2.0f;
         const float meioX = (palco.left + palco.right) / 2.0f;
 
-        // Um monitor desenhado, do mesmo jeito que o Electron faz - e não a
-        // logo. A logo diz "este é o GreenLabs", que a pessoa já sabe; o
-        // monitor diz do que se está falando.
+        // Um monitor desenhado, como o Electron faz - e não a logo. A logo diz
+        // "este é o GreenLabs", que a pessoa já sabe; o monitor diz do que se
+        // está falando.
         icone::monitor(render, D2D1::RectF(meioX - 22, meio - 74, meioX + 22, meio - 30),
                        tema::kLinhaForte, 40.0f, 2.2f);
 
         const wchar_t* titulo;
         const wchar_t* dica;
-        if (transmitindo) {
-            titulo = L"Preparando sua transmissão";
-            dica = L"Os outros já vão começar a ver.";
-        } else if (!conectado.load()) {
+        if (!conectado.load()) {
             titulo = L"Você não está numa sala";
             dica = L"Entre numa sala para ver e ser visto.";
         } else {
             titulo = L"Nenhuma transmissão ativa";
             dica = L"Clique em transmitir para começar";
         }
-
         render.texto(titulo, D2D1::RectF(palco.left, meio - 14, palco.right, meio + 14),
                      tema::kTexto, Fonte::Subtitulo, DWRITE_TEXT_ALIGNMENT_CENTER);
         render.texto(dica, D2D1::RectF(palco.left, meio + 18, palco.right, meio + 42),
                      tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
-    }
-    render.contorno(palco, tema::kLinha, tema::kRaioCartao);
-
-    // Uma etiqueta só, no alto à esquerda, dizendo o que se está vendo. Antes
-    // havia duas - selo de ao vivo em cima e nome embaixo - e as duas competiam
-    // com a imagem.
-    {
-        const bool vendoOutro = doOutro && doOutroLargura > 0;
-        std::wstring texto;
-        D2D1_COLOR_F corTexto = tema::kApagado;
-        // O ponto de "ao vivo" e desenhado, nao escrito: o caractere depende da
-        // fonte e vem com peso e tamanho diferentes em cada uma.
-        bool comPonto = false;
-
-        if (vendoOutro) {
-            texto = escolhida ? escolhida->nome : L"Alguem na sala";
-            comPonto = true;
-            if (doOutroLargura > 0) texto += L"  ·  " + std::to_wstring(doOutroLargura) + L"p";
-            corTexto = tema::kVerde;
-        } else {
-            // O que está indo, dito em português: "2 telas e 1 câmera".
-            const size_t quantasCameras = camerasVivas();
-            std::wstring oQue;
-            if (!telasLigadas.empty()) {
-                oQue = std::to_wstring(telasLigadas.size()) +
-                       (telasLigadas.size() == 1 ? L" tela" : L" telas");
-            }
-            if (quantasCameras > 0) {
-                if (!oQue.empty()) oQue += L" e ";
-                oQue += std::to_wstring(quantasCameras) +
-                        (quantasCameras == 1 ? L" câmera" : L" câmeras");
-            }
-            if (oQue.empty()) oQue = L"nada escolhido";
-
-            if (transmitindo) {
-                texto = L"AO VIVO  ·  " + oQue;
-                corTexto = tema::kVerde;
-                comPonto = true;
-            } else {
-                texto = oQue;
-            }
-        }
-
-        // Ancorada no VÍDEO, não no palco.
+        render.contorno(palco, tema::kLinha, tema::kRaioCartao);
+    } else {
+        // ---- a grade
         //
-        // A imagem quase nunca preenche o palco: ela entra com a proporção
-        // certa e sobra faixa preta dos lados ou em cima. Ancorando no palco, a
-        // etiqueta ia parar no meio dessa faixa, solta, longe da imagem que ela
-        // descreve. Ancorada no vídeo, ela senta no canto da imagem.
-        const std::string chave = escolhida ? escolhida->id : std::string("previa");
-        const D2D1_RECT_F v = render.areaDoVideo(chave);
-        const bool temVideoNaTela = render.temQuadro(chave) && v.right > v.left;
-        const float ancoraX = (temVideoNaTela ? v.left : palco.left) + 14;
-        const float ancoraY = (temVideoNaTela ? v.top : palco.top) + 14;
+        // As vagas que sobram ficam desenhadas e vazias, de propósito: sem
+        // elas, a única transmissão pularia de tamanho a cada pessoa que entra.
+        const int colunas = (divisoes == 1) ? 1 : 2;
+        const int linhas = (divisoes == 4) ? 2 : 1;
+        const float vao = 8;
+        const float largCela = (palco.right - palco.left - vao * (colunas + 1)) / colunas;
+        const float altCela = (palco.bottom - palco.top - vao * (linhas + 1)) / linhas;
 
-        const float recuo = comPonto ? 30.0f : 14.0f;
-        const float largura = render.larguraDoTexto(texto, Fonte::Pequena) + recuo + 14;
-        const auto etiqueta = D2D1::RectF(ancoraX, ancoraY, ancoraX + largura, ancoraY + 30);
-        render.retangulo(etiqueta, tema::kFundo, 15);
-        if (comPonto) render.contorno(etiqueta, tema::kVerdeLinha, 15);
-        if (comPonto) {
-            icone::aoVivo(render,
-                          D2D1::RectF(etiqueta.left + 12, etiqueta.top, etiqueta.left + 22,
-                                      etiqueta.bottom),
-                          tema::kVerde);
+        for (int i = 0; i < divisoes; ++i) {
+            const int coluna = i % colunas;
+            const int linha = i / colunas;
+            const auto cela = D2D1::RectF(
+                palco.left + vao + static_cast<float>(coluna) * (largCela + vao),
+                palco.top + vao + static_cast<float>(linha) * (altCela + vao),
+                palco.left + vao + static_cast<float>(coluna) * (largCela + vao) + largCela,
+                palco.top + vao + static_cast<float>(linha) * (altCela + vao) + altCela);
+
+            if (static_cast<size_t>(i) >= quadros.size()) {
+                // Vaga livre.
+                render.contorno(cela, tema::kLinha, 12);
+                const float meioX = (cela.left + cela.right) / 2;
+                const float meioY = (cela.top + cela.bottom) / 2;
+                icone::monitor(render, D2D1::RectF(meioX - 14, meioY - 30, meioX + 14, meioY - 2),
+                               tema::kLinha, 22.0f, 1.6f);
+                render.texto(L"vaga livre",
+                             D2D1::RectF(cela.left, meioY + 6, cela.right, meioY + 26),
+                             tema::kLinhaForte, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+                continue;
+            }
+
+            const Quadro& q = quadros[static_cast<size_t>(i)];
+            const bool ativa = q.chave == noPalco;
+            const bool sob = apontando(cela);
+
+            render.video(q.chave, q.imagem, cela);
+            if (ativa && divisoes > 1) render.contorno(cela, tema::kVerdeLinha, 12, 2.0f);
+            else if (sob) render.contorno(cela, tema::kLinhaForte, 12);
+
+            // Rodapé do quadro: pastilha com o ícone da fonte e o nome, sobre a
+            // imagem. Ancorado no VÍDEO e não na célula - a imagem entra com a
+            // proporção dela e quase nunca preenche a célula inteira, e uma
+            // etiqueta no meio da faixa preta fica solta, longe do que descreve.
+            const D2D1_RECT_F v = render.areaDoVideo(q.chave);
+            const bool temImagem = render.temQuadro(q.chave) && v.right > v.left;
+            const D2D1_RECT_F base = temImagem ? v : cela;
+
+            std::wstring rotulo = q.nome;
+            if (q.minha) rotulo += L" · Você";
+
+            const float largura = render.larguraDoTexto(rotulo, Fonte::Pequena) + 44;
+            const auto etiqueta = D2D1::RectF(base.left + 10, base.bottom - 40,
+                                              (std::min)(base.left + 10 + largura, base.right - 10),
+                                              base.bottom - 10);
+            render.retangulo(etiqueta, tema::kFundo, 15);
+            if (ativa) render.contorno(etiqueta, tema::kVerdeLinha, 15);
+
+            const auto areaIcone =
+                D2D1::RectF(etiqueta.left + 10, etiqueta.top, etiqueta.left + 26, etiqueta.bottom);
+            if (q.camera) icone::camera(render, areaIcone, tema::kVerde, 13.0f);
+            else if (q.minha) icone::monitor(render, areaIcone, tema::kApagado, 13.0f);
+            else icone::aoVivo(render, areaIcone, tema::kVerde);
+
+            render.texto(rotulo,
+                         D2D1::RectF(etiqueta.left + 30, etiqueta.top, etiqueta.right - 6,
+                                     etiqueta.bottom),
+                         ativa ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+
+            // Botão de expandir, no canto de cima à direita da imagem. Só
+            // aparece sob o ponteiro: um botão fixo sobre cada quadro é ruído
+            // permanente numa tela cujo conteúdo é a imagem.
+            if (sob) {
+                const auto bt = D2D1::RectF(base.right - 42, base.top + 10, base.right - 10,
+                                            base.top + 42);
+                render.retangulo(bt, tema::kFundo, 9);
+                render.contorno(bt, tema::kLinha, 9);
+                if (telaCheia) icone::encolher(render, bt, tema::kTexto);
+                else icone::expandir(render, bt, tema::kTexto);
+                btExpandirQuadro = bt;
+            }
+
+            btQuadros.push_back(cela);
+            chavesQuadros.push_back(q.chave);
         }
-        render.texto(texto,
-                     D2D1::RectF(etiqueta.left + recuo, etiqueta.top, etiqueta.right,
-                                 etiqueta.bottom),
-                     corTexto, Fonte::Pequena);
     }
+
 
     // Em tela cheia acaba aqui. A saída fica escrita num canto, discreta:
     // janela sem borda e sem botão é onde a pessoa se sente presa, e uma linha
@@ -3460,19 +3562,19 @@ void Aplicacao::Interno::desenharAoVivo() {
     // para descobrir qual é o que se quer - e o que se quer, num aplicativo de
     // mostrar a tela, é transmitir.
     const float alturaBotao = 46;
-    btSair = D2D1::RectF(esq, base - alturaBotao, esq + 92, base);
-    btTransmitir = D2D1::RectF(esq + 100, base - alturaBotao, dir, base);
+    btSair = D2D1::RectF(esq, base - alturaBotao, esq + alturaBotao, base);
+    btTransmitir = D2D1::RectF(btSair.right + 8, base - alturaBotao, dir, base);
 
+    // Só a porta, sem a palavra.
+    //
+    // O ícone já diz o que faz, e o quadrado sobrando vira largura para o botão
+    // ao lado - que é o que a pessoa está procurando quando olha para o pé do
+    // painel. É o mesmo icon-btn-only do Electron.
     {
         const bool sob = apontando(btSair);
         render.retangulo(btSair, sob ? tema::kPainel3 : tema::kPainel2, 13);
         render.contorno(btSair, sob ? tema::kLinhaForte : tema::kLinha, 13);
-        const auto areaIcone =
-            D2D1::RectF(btSair.left + 14, btSair.top, btSair.left + 32, btSair.bottom);
-        icone::porta(render, areaIcone, sob ? tema::kVermelho : tema::kApagado, 15.0f);
-        render.texto(L"SAIR", D2D1::RectF(btSair.left + 34, btSair.top, btSair.right - 8,
-                                          btSair.bottom),
-                     sob ? tema::kTexto : tema::kApagado, Fonte::Botao);
+        icone::porta(render, btSair, sob ? tema::kVermelho : tema::kApagado, 17.0f, 1.6f);
     }
 
     {
@@ -4143,7 +4245,10 @@ void Aplicacao::Interno::desenhar() {
 
     // A barra some em tela cheia: ela é a única coisa que ainda desenharia por
     // cima da imagem depois que o painel sai.
-    if (!telaCheia) desenharBarraTitulo();
+    if (!telaCheia) {
+        desenharBarraTitulo();
+        if (telaAtual == Tela::AoVivo) desenharBarraDeAcoes();
+    }
 
     // O modal por último, por cima de tudo - inclusive da barra de título, que
     // é o comportamento de qualquer janela modal.

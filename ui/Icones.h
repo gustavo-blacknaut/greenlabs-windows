@@ -179,6 +179,73 @@ inline void transmitir(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLO
     }
 }
 
+/// Um quadro só: a divisão simples do palco.
+inline void umQuadro(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                     float lado = 13.0f, float traco = 1.4f) {
+    r.contorno(encaixar(area, lado), cor, 2, traco);
+}
+
+/// Dois quadros lado a lado.
+inline void doisQuadros(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                        float lado = 13.0f, float traco = 1.4f) {
+    const auto a = encaixar(area, lado);
+    const float meio = (a.left + a.right) / 2;
+    r.contorno(D2D1::RectF(a.left, a.top, meio - 1, a.bottom), cor, 1.5f, traco);
+    r.contorno(D2D1::RectF(meio + 1, a.top, a.right, a.bottom), cor, 1.5f, traco);
+}
+
+/// Quatro quadros em grade.
+inline void quatroQuadros(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                          float lado = 13.0f, float traco = 1.3f) {
+    const auto a = encaixar(area, lado);
+    const float meioX = (a.left + a.right) / 2;
+    const float meioY = (a.top + a.bottom) / 2;
+    r.contorno(D2D1::RectF(a.left, a.top, meioX - 1, meioY - 1), cor, 1.5f, traco);
+    r.contorno(D2D1::RectF(meioX + 1, a.top, a.right, meioY - 1), cor, 1.5f, traco);
+    r.contorno(D2D1::RectF(a.left, meioY + 1, meioX - 1, a.bottom), cor, 1.5f, traco);
+    r.contorno(D2D1::RectF(meioX + 1, meioY + 1, a.right, a.bottom), cor, 1.5f, traco);
+}
+
+/// Uma tomada, para entrar na sala.
+inline void tomada(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                   float lado = 14.0f, float traco = 1.5f) {
+    const auto a = encaixar(area, lado);
+    const float meioY = (a.top + a.bottom) / 2;
+    const float corpo = a.left + (a.right - a.left) * 0.58f;
+    r.contorno(D2D1::RectF(a.left + 3, a.top + 2, corpo, a.bottom - 2), cor, 3, traco);
+    r.linha(a.left + 3, meioY, a.left, meioY, cor, traco);
+    r.linha(corpo, meioY - 3, a.right, meioY - 3, cor, traco);
+    r.linha(corpo, meioY + 3, a.right, meioY + 3, cor, traco);
+}
+
+/// Setas para fora, para expandir.
+inline void expandir(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                     float lado = 12.0f, float traco = 1.5f) {
+    const auto a = encaixar(area, lado);
+    const float t = 4;
+    // Canto de cima à esquerda e de baixo à direita, como um "abrir".
+    r.linha(a.left, a.top, a.left + t, a.top, cor, traco);
+    r.linha(a.left, a.top, a.left, a.top + t, cor, traco);
+    r.linha(a.right, a.bottom, a.right - t, a.bottom, cor, traco);
+    r.linha(a.right, a.bottom, a.right, a.bottom - t, cor, traco);
+    r.linha(a.left + 1, a.top + 1, a.right - 1, a.bottom - 1, cor, traco);
+}
+
+/// Setas para dentro, para voltar do tamanho cheio.
+inline void encolher(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
+                     float lado = 12.0f, float traco = 1.5f) {
+    const auto a = encaixar(area, lado);
+    const float t = 4;
+    const float cx = (a.left + a.right) / 2;
+    const float cy = (a.top + a.bottom) / 2;
+    r.linha(cx - t, cy - t, cx, cy - t, cor, traco);
+    r.linha(cx - t, cy - t, cx - t, cy, cor, traco);
+    r.linha(cx + t, cy + t, cx, cy + t, cor, traco);
+    r.linha(cx + t, cy + t, cx + t, cy, cor, traco);
+    r.linha(a.left, a.top, cx - t, cy - t, cor, traco);
+    r.linha(a.right, a.bottom, cx + t, cy + t, cor, traco);
+}
+
 /// Um quadrado cheio, para parar.
 inline void parar(Renderizador& r, const D2D1_RECT_F& area, const D2D1_COLOR_F& cor,
                   float lado = 11.0f) {
