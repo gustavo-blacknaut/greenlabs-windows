@@ -359,6 +359,25 @@ struct Aplicacao::Interno {
         if (rolagem > limite) rolagem = limite;
     }
 
+    // Tamanho para o qual o conversor, o encoder e o cursor foram montados.
+    // Zero significa "ainda não montei nada", e aí a primeira captura não conta
+    // como mudança.
+    uint32_t larguraMontada = 0;
+    uint32_t alturaMontada = 0;
+    bool precisaRemontar = false;
+
+    /// Refaz o caminho de vídeo depois de o monitor mudar de resolução.
+    ///
+    /// Roda no laço principal, fora da trava da captura: pararEncodeSomente
+    /// pega essa mesma trava, e chamar daqui de dentro travaria o programa.
+    void remontarVideo() {
+        precisaRemontar = false;
+        // As medidas guardadas na lista são as antigas, e é delas que sai o
+        // tamanho de saída do encoder.
+        monitores = ScreenCapture::listarMonitores();
+        reiniciarEncode();
+    }
+
     // Tela cheia: o palco ocupando a janela inteira, sem painel.
     //
     // É o que se quer quando a chamada vira "assistir alguém jogar" - e era a
@@ -884,6 +903,10 @@ int Aplicacao::rodar() {
         // uma, ou uma trava em volta de cada sequência. Enquanto isso não
         // existe, as duas ficam aqui: bombearCaptura já respeita o fps
         // escolhido, então isto custa 30 passagens por segundo, não mais.
+        // Antes de capturar: se o monitor mudou de resolução, o conversor e o
+        // encoder ainda estão montados para o tamanho de antes.
+        if (d_->precisaRemontar) d_->remontarVideo();
+
         d_->bombearCaptura();
 
         // A GPU pode ser reiniciada pelo Windows a qualquer momento - driver
@@ -965,6 +988,29 @@ void Aplicacao::Interno::bombearCaptura() {
     switch (tela.proximoQuadro(4, quadro)) {
         case ResultadoQuadro::Ok: {
             quadrosNoSegundo += 1;
+
+            // A resolução do monitor muda com o programa rodando: jogo que
+            // troca o modo de vídeo, monitor reconectado, a pessoa mexendo nas
+            // configurações de tela.
+            //
+            // O conversor, o encoder e o compositor do cursor foram montados
+            // para o tamanho de antes. O conversor é o que dá para ver: ele lê
+            // uma área maior do que a textura agora tem. Remontar é o único
+            // caminho, e não pode ser feito daqui - pararEncodeSomente pega a
+            // mesma trava que esta função já está segurando. Fica anotado, e o
+            // laço principal refaz antes da próxima passada.
+            if (quadro.largura != larguraMontada || quadro.altura != alturaMontada) {
+                if (larguraMontada != 0) {
+                    info("a captura mudou de {}x{} para {}x{}; refazendo o video",
+                         larguraMontada, alturaMontada, quadro.largura, quadro.altura);
+                    precisaRemontar = true;
+                }
+                larguraMontada = quadro.largura;
+                alturaMontada = quadro.altura;
+
+                // O compositor do cursor tem o tamanho velho gravado nele.
+                cursorPronto = false;
+            }
 
             // O cursor entra aqui, antes de qualquer outra coisa: assim ele
             // aparece tanto na prévia quanto no que é transmitido, e ninguém
