@@ -527,7 +527,10 @@ struct Aplicacao::Interno {
     //
     // A escolha fica AQUI enquanto o modal está aberto, e só vale ao confirmar.
     // Aplicar a cada clique acenderia e apagaria webcam a cada indecisão.
-    bool modalAberto = false;
+    enum class Modal { Nenhum, Fonte, Config };
+    Modal modal = Modal::Nenhum;
+    bool modalAberto() const { return modal != Modal::Nenhum; }
+
     int abaModal = 0;  // 0 telas, 1 câmeras
     std::vector<int> telasNoModal;
     std::vector<std::string> camerasNoModal;
@@ -537,6 +540,19 @@ struct Aplicacao::Interno {
     D2D1_RECT_F btModalFechar{}, btModalConfirmar{}, btModalAudio{};
     D2D1_RECT_F btAbaTelas{}, btAbaCameras{};
     std::vector<D2D1_RECT_F> btCartoesModal;
+
+    // Modal de configuracao.
+    int abaConfig = 0;  // 0 conexao, 1 servidores
+    std::wstring avisoConfig;
+    float alturaConteudoConfig = 0;
+    std::vector<D2D1_RECT_F> btAbasConfig;
+    std::vector<D2D1_RECT_F> btServidoresConfig;
+    std::vector<D2D1_RECT_F> btRemoverServidor;
+    D2D1_RECT_F btConfigConcluir{}, btSalvarPadrao{}, btRestaurar{}, btEngrenagem{};
+
+    // Campo desenhado sem o rotulo por cima - dentro do modal o rotulo ja vem
+    // separado, e o desenharCampo original o desenha acima da area.
+    void desenharCampoSimples(Campo& campo);
 
     // Rolagem da grade do modal, medida como a do painel lateral.
     float rolagemModal = 0;
@@ -550,7 +566,23 @@ struct Aplicacao::Interno {
     std::vector<ComPtr<ID3D11Texture2D>> quadrosDoModal;
 
     void abrirModal();
+    void abrirConfig();
     void fecharModal();
+
+    // Moldura comum aos dois modais: fundo escuro, cartao, cabecalho e abas.
+    // Devolve o retangulo do corpo. O que muda de um para o outro e so o que
+    // vai dentro - e por isso os dois sao identicos por construcao, e nao por
+    // eu ter copiado as medidas de um para o outro e lembrado de manter.
+    struct MolduraModal {
+        D2D1_RECT_F cartao;
+        D2D1_RECT_F corpo;
+        float basePe;
+    };
+    MolduraModal desenharMoldura(const wchar_t* icone, const std::wstring& titulo,
+                                 const std::wstring& subtitulo, float alturaPe,
+                                 const std::vector<std::wstring>& abas, int abaAtiva,
+                                 std::vector<D2D1_RECT_F>& areasDasAbas);
+    void desenharConfig();
     void confirmarModal();
     void desenharModal();
     void bombearPreviasDoModal();
@@ -730,7 +762,8 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
                 const float y = static_cast<float>(GET_Y_LPARAM(l));
                 // A faixa de cima arrasta a janela, como na barra de título do
                 // Electron - menos onde há botão.
-                if (y < tema::kAlturaTitulo && x < d->render.largura() - 3 * tema::kLarguraBotaoTitulo) {
+                if (y < tema::kAlturaTitulo && !dentro(d->btEngrenagem, x, y) &&
+                    x < d->render.largura() - 3 * tema::kLarguraBotaoTitulo) {
                     ::ReleaseCapture();
                     ::SendMessageW(janela, WM_NCLBUTTONDOWN, HTCAPTION, 0);
                     return 0;
@@ -787,7 +820,7 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
 
                 // Com o modal aberto a roda é dele: rolar o painel atrás de uma
                 // janela modal é rolar o que não dá para ver.
-                if (d->modalAberto) {
+                if (d->modalAberto()) {
                     const auto& area = d->areaRolavelModal;
                     if (x >= area.left - 20 && x <= area.right + 20 && y >= area.top &&
                         y <= area.bottom) {
@@ -827,7 +860,7 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
         // vê preso numa janela sem bordas.
         case WM_KEYDOWN:
             if (d) {
-                if (w == VK_ESCAPE && d->modalAberto) { d->fecharModal(); return 0; }
+                if (w == VK_ESCAPE && d->modalAberto()) { d->fecharModal(); return 0; }
                 if (d->telaAtual == Tela::AoVivo) {
                     if (w == VK_F11) { d->alternarTelaCheia(); return 0; }
                     if (w == VK_ESCAPE && d->telaCheia) { d->alternarTelaCheia(); return 0; }
@@ -1127,7 +1160,7 @@ int Aplicacao::rodar() {
         d_->bombearCaptura();
 
         // As miniaturas do modal so andam enquanto ele esta aberto.
-        if (d_->modalAberto) d_->bombearPreviasDoModal();
+        if (d_->modalAberto()) d_->bombearPreviasDoModal();
 
         // A GPU pode ser reiniciada pelo Windows a qualquer momento - driver
         // que trava, atualização, jogo pesado abrindo. Quando isso acontece,
@@ -2442,7 +2475,80 @@ void Aplicacao::Interno::trocarPrincipal(int novo) {
 void Aplicacao::Interno::clique(float x, float y) {
     // O modal come todos os cliques enquanto está aberto. É o que faz dele um
     // modal: nada atrás dele responde.
-    if (modalAberto) {
+    if (modal == Modal::Config) {
+        if (dentro(btModalFechar, x, y) || dentro(btConfigConcluir, x, y)) {
+            // Concluir é fechar salvando: o que está nos campos vira o que
+            // vale. Dois botões que fazem quase a mesma coisa confundiriam.
+            config.nome = paraUtf8(campoNome.valor);
+            config.servidor = paraUtf8(campoServidor.valor);
+            config.sala = paraUtf8(campoSala.valor);
+            config.salvar();
+            fecharModal();
+            return;
+        }
+        for (size_t i = 0; i < btAbasConfig.size(); ++i) {
+            if (dentro(btAbasConfig[i], x, y)) {
+                abaConfig = static_cast<int>(i);
+                return;
+            }
+        }
+        if (abaConfig == 0) {
+            for (Campo* campo : {&campoNome, &campoServidor, &campoSala}) {
+                campo->focado = dentro(campo->area, x, y);
+                if (!campo->focado) campo->tudoSelecionado = false;
+            }
+            if (dentro(btSalvarPadrao, x, y)) {
+                config.nome = paraUtf8(campoNome.valor);
+                config.servidor = paraUtf8(campoServidor.valor);
+                config.sala = paraUtf8(campoSala.valor);
+                config.lembrarServidor(config.servidor);
+                config.salvar();
+                avisoConfig = L"Salvo. É o que vai abrir da próxima vez.";
+                return;
+            }
+            if (dentro(btRestaurar, x, y)) {
+                // Só as preferências. Não mexe em quem está na sala nem derruba
+                // a chamada: restaurar o que se digita não é sair de onde se
+                // está.
+                const Config limpo;
+                config.qualidade = limpo.qualidade;
+                config.audio = limpo.audio;
+                config.volume = limpo.volume;
+                config.telas = {0};
+                config.cameras.clear();
+                config.salvar();
+
+                qualidadeEscolhida = config.qualidade;
+                audioLigado = config.audio;
+                volumeDaChamada = config.volume;
+                alto.definirVolume(static_cast<float>(volumeDaChamada) / 100.0f);
+                telasLigadas = config.telas;
+                aplicarCameras({});
+                avisoConfig = L"Preferências restauradas.";
+                return;
+            }
+            return;
+        }
+        for (size_t i = 0; i < btRemoverServidor.size() && i < config.servidores.size(); ++i) {
+            if (dentro(btRemoverServidor[i], x, y)) {
+                config.servidores.erase(config.servidores.begin() + static_cast<long>(i));
+                config.salvar();
+                return;
+            }
+        }
+        for (size_t i = 0; i < btServidoresConfig.size() && i < config.servidores.size(); ++i) {
+            if (dentro(btServidoresConfig[i], x, y)) {
+                campoServidor.valor = paraW(config.servidores[i]);
+                config.servidor = config.servidores[i];
+                config.salvar();
+                abaConfig = 0;
+                return;
+            }
+        }
+        return;
+    }
+
+    if (modal == Modal::Fonte) {
         if (dentro(btModalFechar, x, y)) { fecharModal(); return; }
         // Trocar de aba volta a rolagem ao topo: a lista e outra.
         if (dentro(btAbaTelas, x, y)) { abaModal = 0; rolagemModal = 0; return; }
@@ -2551,6 +2657,11 @@ void Aplicacao::Interno::clique(float x, float y) {
         return;
     }
 
+    if (dentro(btEngrenagem, x, y)) {
+        abrirConfig();
+        return;
+    }
+
     // Cartao de transmissao: poe aquela no palco.
     for (size_t i = 0; i < btTransmissoes.size() && i < idsTransmissoes.size(); ++i) {
         if (dentro(btTransmissoes[i], x, y)) {
@@ -2613,6 +2724,35 @@ bool Aplicacao::Interno::desenharBotao(const D2D1_RECT_F& area, const std::wstri
     return habilitado;
 }
 
+
+// O campo sem o rótulo por cima.
+//
+// O desenharCampo original escreve o nome do campo ACIMA da área, o que serve
+// na tela de entrada, onde ele mesmo posiciona tudo. No modal o rótulo já vem
+// desenhado separado, e chamar o outro escreveria duas vezes.
+void Aplicacao::Interno::desenharCampoSimples(Campo& campo) {
+    render.retangulo(campo.area, tema::kPainel2, tema::kRaioBotao);
+    render.contorno(campo.area, campo.focado ? tema::kVerdeLinha : tema::kLinha,
+                    tema::kRaioBotao);
+
+    const auto interna = D2D1::RectF(campo.area.left + 14, campo.area.top, campo.area.right - 14,
+                                     campo.area.bottom);
+    if (campo.valor.empty()) {
+        render.texto(campo.dica, interna, tema::kApagado, Fonte::Corpo);
+        return;
+    }
+
+    if (campo.tudoSelecionado) {
+        const float larguraTexto = render.larguraDoTexto(campo.valor, Fonte::Corpo);
+        render.retangulo(D2D1::RectF(interna.left - 3, interna.top + 9,
+                                     interna.left + larguraTexto + 3, interna.bottom - 9),
+                         tema::kVerdeSuave, 4);
+    }
+    const bool piscar =
+        campo.focado && !campo.tudoSelecionado && (::GetTickCount64() / 500) % 2 == 0;
+    render.texto(campo.valor + (piscar ? L"|" : L""), interna, tema::kTexto, Fonte::Corpo);
+}
+
 void Aplicacao::Interno::desenharCampo(Campo& campo, const std::wstring& rotulo) {
     render.texto(rotulo, D2D1::RectF(campo.area.left, campo.area.top - 22, campo.area.right,
                                      campo.area.top - 4),
@@ -2649,10 +2789,62 @@ void Aplicacao::Interno::desenharBarraTitulo() {
     render.logo(D2D1::RectF(12, 7, 12 + 24, tema::kAlturaTitulo - 7));
     render.texto(L"GreenLabs", D2D1::RectF(44, 0, 220, tema::kAlturaTitulo), tema::kTexto,
                  Fonte::Botao);
-    render.texto(L"v" GREENLABS_VERSAO_W L"  nativo", D2D1::RectF(124, 0, 280, tema::kAlturaTitulo), tema::kApagado,
-                 Fonte::Pequena);
+    render.texto(L"v" GREENLABS_VERSAO_W, D2D1::RectF(124, 0, 200, tema::kAlturaTitulo),
+                 tema::kApagado, Fonte::Pequena);
 
     const float b = tema::kLarguraBotaoTitulo;
+
+    // Estado e ping, como na barra do Electron: bolinha, palavra, pastilha.
+    //
+    // Ficam à esquerda dos botões de janela, e não no painel, porque é
+    // informação de sessão inteira - vale igual estando no palco, na tela de
+    // entrada ou em tela cheia.
+    {
+        const bool ligado = conectado.load();
+        const float base = larg - 3 * b - 16;
+
+        std::wstring pingTexto;
+        if (ligado) {
+            pingTexto = std::to_wstring(sinal.pingMs()) + L"ms";
+            const float largura = render.larguraDoTexto(pingTexto, Fonte::Pequena) + 18;
+            const auto pastilha = D2D1::RectF(base - largura, 9, base, tema::kAlturaTitulo - 9);
+            render.retangulo(pastilha, tema::kVerdeSuave, 7);
+            render.contorno(pastilha, tema::kVerdeLinha, 7);
+            render.texto(pingTexto, pastilha, tema::kVerde, Fonte::Pequena,
+                         DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        const std::wstring estado = ligado ? L"Conectado" : L"Desconectado";
+        const float larguraEstado = render.larguraDoTexto(estado, Fonte::Pequena);
+        const float larguraPing =
+            pingTexto.empty() ? 0.0f : render.larguraDoTexto(pingTexto, Fonte::Pequena) + 26;
+        const float direitaEstado = base - larguraPing;
+
+        render.retangulo(D2D1::RectF(direitaEstado - larguraEstado - 16,
+                                     tema::kAlturaTitulo / 2 - 3,
+                                     direitaEstado - larguraEstado - 10,
+                                     tema::kAlturaTitulo / 2 + 3),
+                         ligado ? tema::kVerde : tema::kVermelho, 3);
+        render.texto(estado,
+                     D2D1::RectF(direitaEstado - larguraEstado - 4, 0, direitaEstado,
+                                 tema::kAlturaTitulo),
+                     ligado ? tema::kTexto : tema::kApagado, Fonte::Pequena);
+
+        // Engrenagem: abre a configuração. Só aparece dentro da chamada porque
+        // na tela de entrada os mesmos campos já estão na frente da pessoa.
+        if (telaAtual == Tela::AoVivo) {
+            btEngrenagem = D2D1::RectF(direitaEstado - larguraEstado - 58, 6,
+                                       direitaEstado - larguraEstado - 22,
+                                       tema::kAlturaTitulo - 6);
+            const bool sob = apontando(btEngrenagem);
+            render.retangulo(btEngrenagem, sob ? tema::kPainel3 : tema::kTransparente, 9);
+            render.texto(L"⚙", btEngrenagem, sob ? tema::kTexto : tema::kApagado, Fonte::Botao,
+                         DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            btEngrenagem = {};
+        }
+    }
+
     btFechar = D2D1::RectF(larg - b, 0, larg, tema::kAlturaTitulo);
     btMaximizar = D2D1::RectF(larg - 2 * b, 0, larg - b, tema::kAlturaTitulo);
     btMinimizar = D2D1::RectF(larg - 3 * b, 0, larg - 2 * b, tema::kAlturaTitulo);
@@ -3293,7 +3485,7 @@ void Aplicacao::Interno::desenharAoVivo() {
 // ---------------------------------------------------------------- o modal
 
 void Aplicacao::Interno::abrirModal() {
-    modalAberto = true;
+    modal = Modal::Fonte;
     abaModal = 0;
     rolagemModal = 0;
     alturaConteudoModal = 0;
@@ -3322,7 +3514,7 @@ void Aplicacao::Interno::abrirModal() {
 }
 
 void Aplicacao::Interno::fecharModal() {
-    modalAberto = false;
+    modal = Modal::Nenhum;
     for (auto& p : previasDoModal) {
         if (p) p->parar();
     }
@@ -3675,6 +3867,228 @@ void Aplicacao::Interno::desenharModal() {
     }
 }
 
+
+// A moldura que os dois modais dividem.
+//
+// Fundo escuro por cima da janela, cartão no meio, cabeçalho com o quadrado do
+// ícone, título, subtítulo e o X, e a fileira de abas. O que muda de um modal
+// para o outro é só o que vai dentro — e por isso os dois são idênticos por
+// construção, e não por eu ter copiado as medidas de um para o outro e
+// lembrado de manter as duas cópias iguais.
+Aplicacao::Interno::MolduraModal Aplicacao::Interno::desenharMoldura(
+    const wchar_t* icone, const std::wstring& titulo, const std::wstring& subtitulo,
+    float alturaPe, const std::vector<std::wstring>& abas, int abaAtiva,
+    std::vector<D2D1_RECT_F>& areasDasAbas) {
+    const float larg = render.largura();
+    const float alt = render.altura();
+
+    render.retangulo(D2D1::RectF(0, 0, larg, alt), tema::kSombraModal);
+
+    const float alturaCabecalho = 72;
+    const float alturaAbas = abas.empty() ? 0.0f : 42.0f;
+
+    const float largModal = (std::min)(560.0f, larg - 48.0f);
+    const float alturaMinima = alturaCabecalho + alturaAbas + alturaPe + 120;
+    const float altModal = (std::max)(alturaMinima, (std::min)(alt - 48.0f, 640.0f));
+    const float x = (larg - largModal) / 2;
+    const float y = (std::max)(8.0f, (alt - altModal) / 2);
+    const auto cartao = D2D1::RectF(x, y, x + largModal, y + altModal);
+
+    render.retangulo(cartao, tema::kFundoModal, 24);
+    render.contorno(cartao, tema::kLinha, 24);
+
+    render.linha(x, y + alturaCabecalho, x + largModal, y + alturaCabecalho, tema::kLinha);
+
+    const auto quadradoIcone = D2D1::RectF(x + 20, y + 18, x + 56, y + 54);
+    render.retangulo(quadradoIcone, tema::kVerdeSuave, 10);
+    render.texto(icone, quadradoIcone, tema::kVerde, Fonte::Corpo, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    render.texto(titulo, D2D1::RectF(x + 68, y + 17, x + largModal - 62, y + 39), tema::kTexto,
+                 Fonte::Subtitulo);
+    render.texto(subtitulo, D2D1::RectF(x + 68, y + 39, x + largModal - 62, y + 57),
+                 tema::kApagado, Fonte::Pequena);
+
+    btModalFechar = D2D1::RectF(x + largModal - 52, y + 18, x + largModal - 16, y + 54);
+    render.retangulo(btModalFechar, apontando(btModalFechar) ? tema::kPainel3 : tema::kPainel2, 12);
+    render.contorno(btModalFechar, tema::kLinha, 12);
+    render.texto(L"✕", btModalFechar, tema::kTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    areasDasAbas.clear();
+    const float topoAbas = y + alturaCabecalho;
+    if (!abas.empty()) {
+        render.linha(x, topoAbas + alturaAbas, x + largModal, topoAbas + alturaAbas, tema::kLinha);
+        float esquerda = x + 20;
+        for (size_t i = 0; i < abas.size(); ++i) {
+            const float largura = render.larguraDoTexto(abas[i], Fonte::Pequena) + 28;
+            const auto area =
+                D2D1::RectF(esquerda, topoAbas + 4, esquerda + largura, topoAbas + alturaAbas);
+            const bool ativa = static_cast<int>(i) == abaAtiva;
+            const bool sob = apontando(area);
+            render.texto(abas[i], area,
+                         ativa ? tema::kVerde : (sob ? tema::kTexto : tema::kApagado),
+                         Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+            if (ativa) {
+                render.retangulo(D2D1::RectF(area.left, area.bottom - 2, area.right, area.bottom),
+                                 tema::kVerde, 1);
+            }
+            areasDasAbas.push_back(area);
+            esquerda = area.right + 8;
+        }
+    }
+
+    MolduraModal moldura;
+    moldura.cartao = cartao;
+    moldura.basePe = y + altModal;
+    moldura.corpo = D2D1::RectF(x + 20, topoAbas + alturaAbas + 16, x + largModal - 20,
+                                moldura.basePe - alturaPe - 14);
+    return moldura;
+}
+
+void Aplicacao::Interno::abrirConfig() {
+    modal = Modal::Config;
+    abaConfig = 0;
+    campoNome.valor = paraW(config.nome);
+    campoServidor.valor = paraW(config.servidor);
+    campoSala.valor = paraW(config.sala);
+    avisoConfig.clear();
+}
+
+// Configuração: conexão e servidores salvos.
+//
+// Sem a aba Hospedar do Electron. Lá ela sobe o servidor num processo filho do
+// Node; aqui não há esse processo, e mostrar um botão que nunca funciona é pior
+// do que não mostrar - é a mesma regra que o próprio Electron usa para esconder
+// a aba no navegador.
+void Aplicacao::Interno::desenharConfig() {
+    std::vector<D2D1_RECT_F> areasDasAbas;
+    const float alturaPe = 76;
+    const auto moldura = desenharMoldura(L"⚙", L"Configuração",
+                                         L"Conexão e servidores salvos.", alturaPe,
+                                         {L"Conexão", L"Servidores"}, abaConfig, areasDasAbas);
+    btAbasConfig = areasDasAbas;
+
+    const auto& corpo = moldura.corpo;
+
+    // Pé: um botão só, de largura cheia, como o "Concluir" do Electron.
+    btConfigConcluir = D2D1::RectF(corpo.left, moldura.basePe - 60, corpo.right,
+                                   moldura.basePe - 18);
+    render.linha(moldura.cartao.left, moldura.basePe - alturaPe, moldura.cartao.right,
+                 moldura.basePe - alturaPe, tema::kLinha);
+    render.retangulo(btConfigConcluir,
+                     apontando(btConfigConcluir) ? tema::kVerde : tema::kVerdeForte, 11);
+    render.texto(L"CONCLUIR", btConfigConcluir, tema::kFundo, Fonte::Botao,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    render.recortar(corpo);
+    float y = corpo.top;
+
+    auto rotulo = [&](const wchar_t* texto) {
+        render.texto(texto, D2D1::RectF(corpo.left, y, corpo.right, y + 14), tema::kApagado,
+                     Fonte::Pequena);
+        y += 18;
+    };
+
+    if (abaConfig == 0) {
+        rotulo(L"SEU APELIDO");
+        campoNome.area = D2D1::RectF(corpo.left, y, corpo.right, y + 44);
+        desenharCampoSimples(campoNome);
+        y += 56;
+
+        rotulo(L"SERVIDOR");
+        campoServidor.area = D2D1::RectF(corpo.left, y, corpo.right, y + 44);
+        desenharCampoSimples(campoServidor);
+        y += 56;
+
+        rotulo(L"SALA");
+        campoSala.area = D2D1::RectF(corpo.left, y, corpo.right, y + 44);
+        desenharCampoSimples(campoSala);
+        y += 60;
+
+        // Dois botões lado a lado, como no ConnectionTab do Electron.
+        const float meio = (corpo.left + corpo.right) / 2;
+        btSalvarPadrao = D2D1::RectF(corpo.left, y, meio - 5, y + 40);
+        btRestaurar = D2D1::RectF(meio + 5, y, corpo.right, y + 40);
+
+        render.retangulo(btSalvarPadrao,
+                         apontando(btSalvarPadrao) ? tema::kPainel3 : tema::kPainel2, 11);
+        render.contorno(btSalvarPadrao, tema::kLinha, 11);
+        render.texto(L"Salvar como padrão", btSalvarPadrao, tema::kTexto, Fonte::Pequena,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+
+        render.retangulo(btRestaurar, apontando(btRestaurar) ? tema::kPainel3 : tema::kPainel2, 11);
+        render.contorno(btRestaurar, tema::kLinha, 11);
+        render.texto(L"Restaurar de fábrica", btRestaurar, tema::kApagado, Fonte::Pequena,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+        y += 52;
+
+        if (!avisoConfig.empty()) {
+            render.texto(avisoConfig, D2D1::RectF(corpo.left, y, corpo.right, y + 20),
+                         tema::kVerde, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+            y += 24;
+        }
+
+        // O aviso do servidor mora AQUI, e só aqui.
+        //
+        // Ele ocupava uma faixa larga no pé da janela inteira, no cliente em
+        // Electron, enquanto ninguém estivesse conectado - bem na hora em que a
+        // pessoa está olhando o palco vazio tentando entender o que fazer. O
+        // lugar dele é ao lado do campo do servidor, que é o momento em que se
+        // escolhe em quem confiar.
+        y += 8;
+        render.linha(corpo.left, y, corpo.right, y, tema::kLinha);
+        y += 14;
+        render.texto(L"ENTRE SÓ EM SERVIDOR DE CONFIANÇA",
+                     D2D1::RectF(corpo.left, y, corpo.right, y + 16), tema::kAmarelo,
+                     Fonte::Pequena);
+        y += 20;
+        render.texto(L"Quando vocês não conseguem se conectar direto, sua tela e seu som passam "
+                     L"pelo servidor. Quem controla esse servidor consegue gravar o que passa "
+                     L"por ele.",
+                     D2D1::RectF(corpo.left, y, corpo.right, y + 60), tema::kApagado,
+                     Fonte::Pequena);
+        y += 64;
+    } else {
+        btServidoresConfig.clear();
+        btRemoverServidor.clear();
+
+        if (config.servidores.empty()) {
+            render.texto(L"Nenhum servidor salvo ainda.",
+                         D2D1::RectF(corpo.left, y + 20, corpo.right, y + 44), tema::kApagado,
+                         Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            for (const auto& endereco : config.servidores) {
+                const auto area = D2D1::RectF(corpo.left, y, corpo.right, y + 46);
+                const bool atual = endereco == config.servidor;
+                const bool sob = !atual && apontando(area);
+                render.retangulo(area, atual ? tema::kVerdeSuave
+                                             : (sob ? tema::kPainel3 : tema::kPainel2),
+                                 11);
+                render.contorno(area, atual ? tema::kVerdeLinha : tema::kLinha, 11);
+
+                render.texto(paraW(endereco),
+                             D2D1::RectF(area.left + 14, area.top, area.right - 88, area.bottom),
+                             atual ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+                render.texto(atual ? L"em uso" : L"usar",
+                             D2D1::RectF(area.left, area.top, area.right - 44, area.bottom),
+                             atual ? tema::kVerde : tema::kApagado, Fonte::Pequena,
+                             DWRITE_TEXT_ALIGNMENT_TRAILING);
+
+                const auto remover =
+                    D2D1::RectF(area.right - 36, area.top + 12, area.right - 14, area.top + 34);
+                render.texto(L"✕", remover, apontando(remover) ? tema::kVermelho : tema::kApagado,
+                             Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+                btServidoresConfig.push_back(area);
+                btRemoverServidor.push_back(remover);
+                y += 54;
+            }
+        }
+    }
+
+    alturaConteudoConfig = y - corpo.top;
+    render.soltarRecorte();
+}
+
 void Aplicacao::Interno::desenhar() {
     render.comecarQuadro();
     render.limpar(tema::kFundo);
@@ -3693,7 +4107,8 @@ void Aplicacao::Interno::desenhar() {
 
     // O modal por último, por cima de tudo - inclusive da barra de título, que
     // é o comportamento de qualquer janela modal.
-    if (modalAberto) desenharModal();
+    if (modal == Modal::Fonte) desenharModal();
+    else if (modal == Modal::Config) desenharConfig();
     render.terminarQuadro();
 }
 
