@@ -341,10 +341,18 @@ void CameraCapture::Interno::laco() {
             static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &fluxo, &marcas,
             &instante, &amostra);
         if (FAILED(resultado)) {
+            // Camera ja aberta por outro programa entrega o dispositivo e falha na
+            // primeira leitura. Sem apagar o "lendo" aqui, ativa() continuava
+            // dizendo que sim, a camera entrava na composicao e o quadro dela
+            // nunca chegava - com o Blt recebendo superficie nula.
             aviso("leitura da camera falhou: {}", hr(resultado));
+            lendo.store(false);
             break;
         }
-        if (marcas & MF_SOURCE_READERF_ENDOFSTREAM) break;
+        if (marcas & MF_SOURCE_READERF_ENDOFSTREAM) {
+            lendo.store(false);
+            break;
+        }
         if (!amostra) continue;  // prazo estourado, sem quadro: normal
 
         ComPtr<IMFMediaBuffer> buffer;
