@@ -28,18 +28,12 @@ struct Config {
     // Windows: abaixa so a chamada, deixando jogo e musica como estao.
     int volume = 100;
 
-    // Telas extras que entram lado a lado com a principal, por indice.
-    std::vector<int> telasExtras;
+    // As telas que vao na transmissao, por indice de monitor. Vazia significa
+    // so as cameras - "so a camera" nao e um modo separado.
+    std::vector<int> telas;
 
-    // Transmitir so a camera, sem tela nenhuma.
-    bool soCamera = false;
-
-    // Caminho simbolico da camera escolhida, ou vazio para nenhuma.
-    //
-    // O caminho, e nao o indice: com indice, plugar um adaptador de captura
-    // trocaria silenciosamente a camera escolhida pela nova. Vazio e o padrao
-    // porque camera e coisa que se liga de proposito, nunca por omissao.
-    std::string camera;
+    // As cameras que vao na transmissao, pelo caminho do dispositivo.
+    std::vector<std::string> cameras;
 
     // Servidores já usados, do mais recente para o mais antigo. Quem entra numa
     // sala hoje volta nela amanhã, e digitar o endereço de novo toda vez é o

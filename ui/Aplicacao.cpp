@@ -258,18 +258,19 @@ struct Aplicacao::Interno {
     /// As texturas dela pertencem ao dispositivo da captura, e trocar de
     /// monitor cria um novo. Deixar a câmera viva por cima disso é ficar com
     /// ponteiro para memória de uma GPU que já não é a nossa.
-    void soltarCameraDoDispositivo() {
-        camera.parar();
-        cameraNaTelaPronta = false;
-        render.esquecerVideo("camera");
+    void soltarCamerasDoDispositivo() {
+        for (auto& c : camerasAbertas) {
+            c->captura.parar();
+            render.esquecerVideo("cam:" + c->id);
+        }
+        camerasAbertas.clear();
     }
 
     /// Reabre a câmera escolhida no dispositivo atual, se houver uma.
-    void reabrirCamera() {
-        if (cameraEscolhida.empty()) return;
-        if (!camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto())) {
-            cameraEscolhida.clear();
-        }
+    void reabrirCameras() {
+        const auto escolhidas = camerasEscolhidas;
+        soltarCamerasDoDispositivo();
+        aplicarCameras(escolhidas);
     }
     void lacoDecodificacao();
     std::vector<std::shared_ptr<ConexaoPar>> destinosVideo;
@@ -297,22 +298,33 @@ struct Aplicacao::Interno {
     // Por isso elas usam iniciarCom, e por isso um monitor ligado em outra
     // placa não pode entrar - o que acontece em notebook híbrido.
     std::vector<std::unique_ptr<ScreenCapture>> telasExtras;
-    std::vector<int> monitoresExtras;
-
-    // Transmitir só a câmera, sem tela nenhuma.
+    // As telas que vão na transmissão, por índice de monitor.
     //
-    // Não é um caso especial no meio do caminho: quando ligado, a câmera vira a
-    // imagem principal em vez de ir para o canto, e o encoder é montado no
-    // tamanho dela. Tudo o mais - encoder, rede, áudio - segue igual.
-    bool soCamera = false;
+    // Pode ser vazia: nesse caso vão só as câmeras, e "só a câmera" deixa de
+    // ser um modo com botão próprio para ser o que ele sempre foi - nenhuma
+    // tela marcada. Um modo a menos para explicar, e um a menos para manter.
+    std::vector<int> telasLigadas;
 
-    /// Verdadeiro quando há imagem de tela para transmitir.
-    bool comTela() const { return !soCamera; }
+    // As câmeras que vão na transmissão, pelo caminho do dispositivo.
+    std::vector<std::string> camerasEscolhidas;
 
-    /// Abre a duplicação dos monitores extras no dispositivo da principal.
+    bool telaLigada(int indice) const {
+        return std::find(telasLigadas.begin(), telasLigadas.end(), indice) != telasLigadas.end();
+    }
+    bool cameraLigada(const std::string& id) const {
+        return std::find(camerasEscolhidas.begin(), camerasEscolhidas.end(), id) !=
+               camerasEscolhidas.end();
+    }
+
+    /// Abre a duplicação das telas ligadas que não são a principal.
+    ///
+    /// A principal já é capturada pelo `tela`, que é também de onde sai o
+    /// dispositivo D3D de todo o resto. As outras entram por iniciarCom, no
+    /// mesmo dispositivo: o Video Processor compõe numa passada, e ele não
+    /// atravessa dispositivos.
     void abrirTelasExtras() {
         fecharTelasExtras();
-        for (int indice : monitoresExtras) {
+        for (int indice : telasLigadas) {
             if (indice == monitorEscolhido) continue;
             auto captura = std::make_unique<ScreenCapture>();
             if (captura->iniciarCom(tela.dispositivo(), tela.contexto(),
@@ -339,8 +351,6 @@ struct Aplicacao::Interno {
 
     bool montarEncoder(uint32_t largura, uint32_t altura, const Qualidade& q);
     void trocarPrincipal(int novo);
-    void alternarTela(int indice);
-    void alternarSoCamera();
     int qualidadeEscolhida = 1;  // 1080p 30fps
 
     // Mandar o som do sistema junto com a tela. Só vale para o que sai daqui:
@@ -356,49 +366,73 @@ struct Aplicacao::Interno {
     // seria descartada em silêncio. A câmera entra COMPOSTA no mesmo quadro,
     // pelo Video Processor, e por isso quem assiste pelo Electron ou pelo
     // celular a vê sem que nada mude do lado deles.
-    CameraCapture camera;
-    std::vector<CameraInfo> cameras;
-    std::string cameraEscolhida;  // vazio = desligada
-    std::vector<D2D1_RECT_F> btCameras;
+    // Uma câmera aberta.
+    //
+    // São várias porque a pessoa pode ligar todas as que tem - a webcam da
+    // mesa e a do celular por Iriun, por exemplo, e as duas entram no quadro.
+    // Cada uma traz o próprio conversor para a tela: a câmera entrega NV12 e o
+    // desenho quer BGRA, e o tamanho de uma não serve para a outra.
+    struct CameraAberta {
+        std::string id;
+        std::string nome;
+        CameraCapture captura;
 
-    /// Liga ou desliga a câmera sem derrubar a conexão.
+        ColorConverter paraTela;
+        bool paraTelaPronta = false;
+        uint32_t paraTelaL = 0;
+        uint32_t paraTelaA = 0;
+
+        /// O quadro mais recente já em BGRA, pronto para desenhar. Nulo
+        /// enquanto a câmera não entregar nada.
+        ID3D11Texture2D* previa(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto) {
+            ID3D11Texture2D* nv12 = captura.quadro();
+            if (!nv12) return nullptr;
+            const uint32_t l = captura.largura();
+            const uint32_t a = captura.altura();
+            if (l == 0 || a == 0) return nullptr;
+            if (!paraTelaPronta || paraTelaL != l || paraTelaA != a) {
+                paraTelaPronta =
+                    paraTela.iniciar(dispositivo, contexto, l, a, l, a, ColorConverter::Saida::Bgra);
+                paraTelaL = l;
+                paraTelaA = a;
+                if (!paraTelaPronta) return nullptr;
+            }
+            return paraTela.converter(nv12);
+        }
+    };
+
+    // As que estão abertas agora, na ordem em que foram escolhidas.
+    std::vector<std::unique_ptr<CameraAberta>> camerasAbertas;
+
+    // O que o computador tem, lido no arranque. Enumerar não acende luzinha.
+    std::vector<CameraInfo> cameras;
+
+    /// Acha uma câmera aberta pelo caminho do dispositivo.
+    CameraAberta* cameraAberta(const std::string& id) {
+        for (auto& c : camerasAbertas) {
+            if (c->id == id) return c.get();
+        }
+        return nullptr;
+    }
+
+    /// Quantas estão abertas e entregando imagem.
+    size_t camerasVivas() const {
+        size_t total = 0;
+        for (const auto& c : camerasAbertas) {
+            if (c->captura.ativa()) ++total;
+        }
+        return total;
+    }
+
+    /// Abre e fecha câmeras até a lista de abertas bater com a escolhida.
     ///
-    /// Só mexe no encoder e no conversor, pelo mesmo caminho da troca de
-    /// qualidade: derrubar as conexões para acender uma webcam faria todo mundo
-    /// na sala perder a imagem por dois segundos.
-    void aplicarCamera();
+    /// Chamada depois de qualquer mudança na escolha. Não derruba a conexão:
+    /// só o encoder e o conversor são refeitos, pelo mesmo caminho da troca de
+    /// qualidade - derrubar a chamada inteira para acender uma webcam faria
+    /// todo mundo na sala perder a imagem por dois segundos.
+    void aplicarCameras(const std::vector<std::string>& escolhidas);
 
     // Prévia da câmera na interface.
-    //
-    // A câmera entrega NV12 e o desenho quer BGRA, então precisa de um
-    // conversor próprio - o do encoder vai no sentido contrário e está montado
-    // no tamanho da tela, não no da webcam.
-    //
-    // Sem isto a pessoa escolhia a câmera e não via nada: ela ia para dentro do
-    // quadro codificado, que só quem está do outro lado enxerga. Escolher a
-    // câmera sem poder se enquadrar é escolher no escuro.
-    ColorConverter cameraNaTela;
-    bool cameraNaTelaPronta = false;
-    uint32_t cameraNaTelaL = 0;
-    uint32_t cameraNaTelaA = 0;
-
-    ID3D11Texture2D* previaDaCamera() {
-        ID3D11Texture2D* nv12 = camera.quadro();
-        if (!nv12) return nullptr;
-
-        const uint32_t l = camera.largura();
-        const uint32_t a = camera.altura();
-        if (l == 0 || a == 0) return nullptr;
-
-        if (!cameraNaTelaPronta || cameraNaTelaL != l || cameraNaTelaA != a) {
-            cameraNaTelaPronta = cameraNaTela.iniciar(tela.dispositivo(), tela.contexto(), l, a, l,
-                                                      a, ColorConverter::Saida::Bgra);
-            cameraNaTelaL = l;
-            cameraNaTelaA = a;
-            if (!cameraNaTelaPronta) return nullptr;
-        }
-        return cameraNaTela.converter(nv12);
-    }
 
     // Volume do que chega da chamada, de 0 a 100.
     int volumeDaChamada = 100;
@@ -484,6 +518,43 @@ struct Aplicacao::Interno {
         reiniciarEncode();
     }
 
+    // ---- modal "Escolha o que transmitir"
+    //
+    // É a mesma janela do cliente em Electron: um cartão no meio da tela, com
+    // abas para telas e câmeras, miniaturas ao vivo e o interruptor do som no
+    // pé. Escolher o que vai no ar deixou de ser uma lista solta na lateral e
+    // virou um momento - que é o que a pessoa espera ao clicar em TRANSMITIR.
+    //
+    // A escolha fica AQUI enquanto o modal está aberto, e só vale ao confirmar.
+    // Aplicar a cada clique acenderia e apagaria webcam a cada indecisão.
+    bool modalAberto = false;
+    int abaModal = 0;  // 0 telas, 1 câmeras
+    std::vector<int> telasNoModal;
+    std::vector<std::string> camerasNoModal;
+    bool audioNoModal = true;
+    int qualidadeNoModal = 1;
+
+    D2D1_RECT_F btModalFechar{}, btModalConfirmar{}, btModalAudio{};
+    D2D1_RECT_F btAbaTelas{}, btAbaCameras{};
+    std::vector<D2D1_RECT_F> btCartoesModal;
+
+    // Rolagem da grade do modal, medida como a do painel lateral.
+    float rolagemModal = 0;
+    float alturaConteudoModal = 0;
+    D2D1_RECT_F areaRolavelModal{};
+
+    // As duplicações abertas só para o modal mostrar miniatura de cada monitor.
+    // Fecham quando ele fecha: manter duplicação de tudo aberta o tempo todo
+    // custaria uma cópia por monitor por quadro, à toa.
+    std::vector<std::unique_ptr<ScreenCapture>> previasDoModal;
+    std::vector<ComPtr<ID3D11Texture2D>> quadrosDoModal;
+
+    void abrirModal();
+    void fecharModal();
+    void confirmarModal();
+    void desenharModal();
+    void bombearPreviasDoModal();
+
     // Tela cheia: o palco ocupando a janela inteira, sem painel.
     //
     // É o que se quer quando a chamada vira "assistir alguém jogar" - e era a
@@ -542,8 +613,8 @@ struct Aplicacao::Interno {
     // Botões, guardados entre o desenho e o clique.
     D2D1_RECT_F btMinimizar{}, btMaximizar{}, btFechar{};
     D2D1_RECT_F btEntrar{}, btTransmitir{}, btSair{};
-    std::vector<D2D1_RECT_F> btMonitores;
-    D2D1_RECT_F btSoCamera{};
+    // A linha "o que vai no ar" no painel: clicar abre o modal.
+    D2D1_RECT_F btEscolher{};
     std::vector<D2D1_RECT_F> btQualidades;
     std::vector<D2D1_RECT_F> btTransmissoes;
     std::vector<std::string> idsTransmissoes;
@@ -712,9 +783,23 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
                 ::ScreenToClient(janela, &p);
                 const auto x = static_cast<float>(p.x);
                 const auto y = static_cast<float>(p.y);
-                if (x >= d->areaRolavel.left && x <= d->areaRolavel.right &&
-                    y >= d->areaRolavel.top && y <= d->areaRolavel.bottom) {
-                    d->rolar(static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA);
+                const float passos = static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA;
+
+                // Com o modal aberto a roda é dele: rolar o painel atrás de uma
+                // janela modal é rolar o que não dá para ver.
+                if (d->modalAberto) {
+                    const auto& area = d->areaRolavelModal;
+                    if (x >= area.left - 20 && x <= area.right + 20 && y >= area.top &&
+                        y <= area.bottom) {
+                        const float limite = d->alturaConteudoModal - (area.bottom - area.top);
+                        d->rolagemModal -= passos * 48.0f;
+                        if (d->rolagemModal < 0) d->rolagemModal = 0;
+                        if (limite > 0 && d->rolagemModal > limite) d->rolagemModal = limite;
+                        else if (limite <= 0) d->rolagemModal = 0;
+                    }
+                } else if (x >= d->areaRolavel.left && x <= d->areaRolavel.right &&
+                           y >= d->areaRolavel.top && y <= d->areaRolavel.bottom) {
+                    d->rolar(passos);
                 }
             }
             return 0;
@@ -741,9 +826,12 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
         // e todo reprodutor usa, e teclar Esc é o primeiro reflexo de quem se
         // vê preso numa janela sem bordas.
         case WM_KEYDOWN:
-            if (d && d->telaAtual == Tela::AoVivo) {
-                if (w == VK_F11) { d->alternarTelaCheia(); return 0; }
-                if (w == VK_ESCAPE && d->telaCheia) { d->alternarTelaCheia(); return 0; }
+            if (d) {
+                if (w == VK_ESCAPE && d->modalAberto) { d->fecharModal(); return 0; }
+                if (d->telaAtual == Tela::AoVivo) {
+                    if (w == VK_F11) { d->alternarTelaCheia(); return 0; }
+                    if (w == VK_ESCAPE && d->telaCheia) { d->alternarTelaCheia(); return 0; }
+                }
             }
             return ::DefWindowProcW(janela, msg, w, l);
 
@@ -816,13 +904,21 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     // A lista de câmeras é montada agora, mas nenhuma é aberta: enumerar não
     // acende a luzinha de ninguém. A escolhida só é aberta quando a
     // transmissão começa.
-    d_->soCamera = d_->config.soCamera;
-    d_->monitoresExtras = d_->config.telasExtras;
+    d_->telasLigadas = d_->config.telas;
+
+    // Primeira abertura: a tela principal já vem marcada.
+    //
+    // Sem isto o aplicativo abre sem nada escolhido, e apertar TRANSMITIR não
+    // faz nada até a pessoa entrar no modal e marcar alguma coisa - o que é
+    // exigir uma decisão antes de mostrar que o programa funciona. Mostrar a
+    // tela é o motivo de ele existir; que seja o padrão.
+    if (d_->config.telas.empty() && d_->config.cameras.empty()) {
+        d_->telasLigadas = {0};
+    }
 
     d_->cameras = CameraCapture::listar();
     for (const auto& c : d_->cameras) {
         info("camera encontrada: {} ({})", c.nome, c.id);
-        if (c.id == d_->config.camera) d_->cameraEscolhida = c.id;
     }
     if (d_->cameras.empty()) info("nenhuma camera no computador");
 
@@ -855,7 +951,7 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     // A câmera guardada abre junto com o dispositivo, e não só quando a
     // transmissão começa: quem deixou a câmera ligada da última vez espera
     // se ver na tela ao abrir o programa, não depois de apertar TRANSMITIR.
-    d_->reabrirCamera();
+    d_->reabrirCameras();
 
     Signaling::Ouvintes ouvintes;
     // Saida de audio e decodificador de pe antes de qualquer pacote chegar.
@@ -945,7 +1041,7 @@ void Aplicacao::Interno::refazerDispositivo() {
 
     const bool estavaTransmitindo = transmitindo;
     pararEncodeSomente();
-    soltarCameraDoDispositivo();
+    soltarCamerasDoDispositivo();
 
     {
         std::lock_guard travaTela(travaCaptura);
@@ -984,7 +1080,7 @@ void Aplicacao::Interno::refazerDispositivo() {
         }
     }
 
-    reabrirCamera();
+    reabrirCameras();
 
     // A thread do decodificador renasce sozinha no próximo quadro que chegar:
     // é o mesmo caminho da primeira vez.
@@ -1001,7 +1097,7 @@ int Aplicacao::rodar() {
                 d_->pararDecodificacao();
                 // A camera segue aberta fora do ar, para a previa. Fechar aqui
                 // e o que apaga a luzinha ao sair do programa.
-                d_->camera.parar();
+                d_->soltarCamerasDoDispositivo();
                 d_->sinal.sair();
                 return static_cast<int>(msg.wParam);
             }
@@ -1029,6 +1125,9 @@ int Aplicacao::rodar() {
         if (d_->precisaRemontar) d_->remontarVideo();
 
         d_->bombearCaptura();
+
+        // As miniaturas do modal so andam enquanto ele esta aberto.
+        if (d_->modalAberto) d_->bombearPreviasDoModal();
 
         // A GPU pode ser reiniciada pelo Windows a qualquer momento - driver
         // que trava, atualização, jogo pesado abrindo. Quando isso acontece,
@@ -1241,11 +1340,16 @@ void Aplicacao::Interno::bombearCaptura() {
                 // A câmera e as telas extras podem estar nulas: elas entregam
                 // no ritmo delas, e uma entrada nula é pulada em vez de abrir
                 // buraco preto. O resto do quadro sai igual.
+                // A ORDEM tem de ser exatamente a que o comecarTransmissao usou
+                // para montar os pedaços: tela principal (se ligada), telas
+                // extras, câmeras.
                 std::vector<ID3D11Texture2D*> entradas;
-                entradas.reserve(2 + telasExtras.size());
-                entradas.push_back(quadroAtual);
+                entradas.reserve(2 + telasExtras.size() + camerasAbertas.size());
+                if (telaLigada(monitorEscolhido)) entradas.push_back(quadroAtual);
                 for (auto& copia : copiasExtras) entradas.push_back(copia.Get());
-                if (camera.ativa()) entradas.push_back(camera.quadro());
+                for (auto& c : camerasAbertas) {
+                    if (c->captura.ativa()) entradas.push_back(c->captura.quadro());
+                }
 
                 if (auto* nv12 = conversor.compor(entradas)) {
                     encoder.codificar(nv12,
@@ -1317,109 +1421,91 @@ bool Aplicacao::Interno::comecarTransmissao() {
 
     const Qualidade& q = kQualidades[qualidadeEscolhida];
 
-    // ---- só a câmera
-    //
-    // Caminho separado, e curto: a câmera vira a imagem principal em vez de ir
-    // para o canto, e o encoder é montado no tamanho dela. Tratar isso como
-    // "uma tela de zero pixels com a câmera por cima" daria um monte de casos
-    // especiais espalhados pelo resto da função.
-    if (soCamera) {
-        if (!camera.ativa() && !cameraEscolhida.empty()) {
-            camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto());
-        }
-        if (!camera.ativa()) {
-            aviso = L"Escolha uma câmera para transmitir sem a tela.";
-            return false;
-        }
-
-        const uint32_t entradaL = camera.largura();
-        const uint32_t entradaA = camera.altura();
-        const double escalaCam = (std::min)(
-            1.0, (std::min)(static_cast<double>(q.largura) / entradaL,
-                            static_cast<double>(q.altura) / entradaA));
-        const uint32_t saidaL = static_cast<uint32_t>(entradaL * escalaCam) & ~1u;
-        const uint32_t saidaA = static_cast<uint32_t>(entradaA * escalaCam) & ~1u;
-
-        // A entrada é NV12 aqui, e não BGRA: quem manda a imagem é a câmera.
-        // O conversor faz NV12 -> NV12, que continua valendo a pena - é ele
-        // quem redimensiona, e de graça.
-        if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), entradaL, entradaA, saidaL,
-                               saidaA, ColorConverter::Saida::Nv12, 0)) {
-            aviso = L"Não foi possível preparar a imagem da câmera.";
-            return false;
-        }
-        conversor.desligarComposicao();
-        info("transmitindo so a camera: {}x{}", saidaL, saidaA);
-        return montarEncoder(saidaL, saidaA, q);
-    }
-
-    const auto& m = tela.monitor();
-
-    // A ENTRADA é o tamanho físico da textura, não o lógico.
-    //
-    // Num monitor girado para retrato o DXGI diz 1080x1920 (o que a pessoa vê),
-    // mas entrega uma textura 1920x1080 com o conteúdo deitado. Passar o lógico
-    // aqui era pedir ao Video Processor para ler algo que não existe - e o
-    // resultado era a tela chegando virada do outro lado.
-    const uint32_t entradaL = m.larguraFisica();
-    const uint32_t entradaA = m.alturaFisica();
-
-    // A SAÍDA respeita a proporção da tela, dentro do que a qualidade permite.
-    //
-    // Antes eu esticava qualquer tela para o tamanho fixo do preset, então um
-    // monitor em pé era espremido para 16:9 e chegava achatado. Aqui a escala é
-    // a mesma nos dois eixos, e o que sobra é resolução, não deformação.
-    // E nunca AMPLIA.
-    //
-    // Sem o teto em 1, um monitor 1024x768 no preset de 1080p era esticado para
-    // 1440x1080: mais pixels para codificar, mais banda gasta, e nenhum detalhe
-    // a mais - o que chegava do outro lado era a mesma imagem, borrada. A
-    // qualidade escolhida é um limite, não uma meta.
     // Telas extras abrem ANTES da conta do tamanho: é o tamanho delas que entra
-    // na soma. Cada uma no mesmo dispositivo da principal - o Video Processor
-    // compõe as duas numa passada, e ele não atravessa dispositivos.
+    // na soma.
     abrirTelasExtras();
 
-    // Larguras alinhadas por uma altura comum.
-    //
-    // Duas telas lado a lado precisam da mesma altura, senão uma fica flutuando
-    // com faixa preta em cima ou embaixo. A altura comum é a maior das lógicas;
-    // cada tela contribui com a largura que a proporção dela pede nessa altura.
-    struct Parte {
-        double largura;
+    // Uma entrada por imagem que vai no quadro, na ordem em que serão
+    // compostas e na MESMA ordem em que bombearCaptura vai entregá-las.
+    struct Fonte {
+        double largura;   // já normalizada para a altura comum
+        double altura;
         uint32_t graus;
     };
-    std::vector<Parte> partes;
-    uint32_t alturaComum = m.altura;
-    for (const auto& extra : telasExtras) {
-        if (extra->capturando()) alturaComum = (std::max)(alturaComum, extra->monitor().altura);
+    std::vector<Fonte> fontes;
+
+    const bool principalLigada = telaLigada(monitorEscolhido);
+    if (principalLigada) {
+        const auto& m = tela.monitor();
+        fontes.push_back({static_cast<double>(m.largura), static_cast<double>(m.altura), m.graus});
     }
-    partes.push_back({static_cast<double>(m.largura) * alturaComum / m.altura, m.graus});
     for (const auto& extra : telasExtras) {
         if (!extra->capturando()) continue;
         const auto& e = extra->monitor();
-        partes.push_back({static_cast<double>(e.largura) * alturaComum / e.altura, e.graus});
+        fontes.push_back({static_cast<double>(e.largura), static_cast<double>(e.altura), e.graus});
+    }
+
+    const size_t quantasTelas = fontes.size();
+
+    // As câmeras entram como fonte quando não há tela nenhuma: aí são elas a
+    // imagem. Com tela, elas vão nos cantos, o que é calculado depois.
+    std::vector<CameraAberta*> camerasNoQuadro;
+    for (auto& c : camerasAbertas) {
+        if (c->captura.ativa()) camerasNoQuadro.push_back(c.get());
+    }
+
+    if (quantasTelas == 0 && camerasNoQuadro.empty()) {
+        aviso = L"Escolha o que transmitir.";
+        return false;
+    }
+
+    if (quantasTelas == 0) {
+        for (auto* c : camerasNoQuadro) {
+            fontes.push_back({static_cast<double>(c->captura.largura()),
+                              static_cast<double>(c->captura.altura()), 0});
+        }
+    }
+
+    // Larguras alinhadas por uma altura comum.
+    //
+    // Lado a lado sem isso, uma imagem fica flutuando com faixa preta em cima
+    // ou embaixo. A altura comum é a maior das lógicas; cada imagem contribui
+    // com a largura que a proporção dela pede nessa altura.
+    double alturaComum = 0;
+    for (const auto& f : fontes) alturaComum = (std::max)(alturaComum, f.altura);
+    if (alturaComum <= 0) {
+        aviso = L"Não foi possível medir o que transmitir.";
+        return false;
     }
 
     double larguraTotal = 0;
-    for (const auto& p : partes) larguraTotal += p.largura;
+    for (auto& f : fontes) {
+        f.largura = f.largura * alturaComum / f.altura;
+        larguraTotal += f.largura;
+    }
 
-    // A SAÍDA respeita a proporção do conjunto, dentro do que a qualidade
-    // permite. E nunca AMPLIA.
-    //
-    // Antes eu esticava qualquer tela para o tamanho fixo do preset, então um
-    // monitor em pé era espremido para 16:9 e chegava achatado. Aqui a escala é
-    // a mesma nos dois eixos, e o que sobra é resolução, não deformação.
-    //
-    // Sem o teto em 1, um monitor 1024x768 no preset de 1080p era esticado para
-    // 1440x1080: mais pixels para codificar, mais banda gasta, e nenhum detalhe
-    // a mais - o que chegava do outro lado era a mesma imagem, borrada. A
-    // qualidade escolhida é um limite, não uma meta.
+    // A saída respeita a proporção do conjunto, dentro do que a qualidade
+    // permite. E nunca AMPLIA: sem o teto em 1, um monitor 1024x768 no preset
+    // de 1080p era esticado para 1440x1080 - mais pixels para codificar, mais
+    // banda gasta, e a mesma imagem, borrada. A qualidade é um limite, não uma
+    // meta.
     const double escala =
         (std::min)(1.0, (std::min)(static_cast<double>(q.largura) / larguraTotal,
                                    static_cast<double>(q.altura) / alturaComum));
     const uint32_t saidaL = static_cast<uint32_t>(larguraTotal * escala) & ~1u;
     const uint32_t saidaA = static_cast<uint32_t>(alturaComum * escala) & ~1u;
+
+    // A ENTRADA do conversor é o tamanho FÍSICO da primeira imagem - é só uma
+    // dica de tamanho para o Video Processor, e cada fluxo diz o resto.
+    uint32_t entradaL = saidaL;
+    uint32_t entradaA = saidaA;
+    if (principalLigada) {
+        entradaL = tela.monitor().larguraFisica();
+        entradaA = tela.monitor().alturaFisica();
+    } else if (!camerasNoQuadro.empty()) {
+        entradaL = camerasNoQuadro.front()->captura.largura();
+        entradaA = camerasNoQuadro.front()->captura.altura();
+    }
 
     if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), entradaL, entradaA, saidaL, saidaA,
                            ColorConverter::Saida::Nv12, 0)) {
@@ -1431,56 +1517,52 @@ bool Aplicacao::Interno::comecarTransmissao() {
     // um deitado é o caso comum de quem tem dois.
     std::vector<ColorConverter::Pedaco> pedacos;
     double x = 0;
-    for (const auto& p : partes) {
+    for (const auto& f : fontes) {
         ColorConverter::Pedaco pedaco;
         pedaco.esquerda = static_cast<int32_t>(x * escala);
         pedaco.topo = 0;
-        pedaco.direita = static_cast<int32_t>((x + p.largura) * escala);
+        pedaco.direita = static_cast<int32_t>((x + f.largura) * escala);
         pedaco.baixo = static_cast<int32_t>(saidaA);
-        pedaco.graus = p.graus;
+        pedaco.graus = f.graus;
         pedacos.push_back(pedaco);
-        x += p.largura;
+        x += f.largura;
     }
 
-    // A câmera entra por último, no canto de baixo à direita do quadro inteiro.
-    //
-    // Ela já costuma estar aberta - abre quando é escolhida, para a prévia.
-    // Aqui só é aberta quando a transmissão começa antes de alguém ter mexido
-    // na lista, que é o caso de quem já tinha a câmera guardada no config.
-    if (!cameraEscolhida.empty()) {
-        if (!camera.ativa()) {
-            camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto());
-        }
-        if (camera.ativa()) {
-            // Um quarto da largura com uma tela, menos com duas: numa
-            // composição de dois monitores, um quarto do total já é do tamanho
-            // de meia tela.
-            const double fatia = (partes.size() > 1) ? 6.0 : 4.0;
-            const int32_t margem = static_cast<int32_t>(saidaL / 48);
-            const int32_t larguraCam = static_cast<int32_t>(saidaL / fatia);
-            const int32_t alturaCam = static_cast<int32_t>(
-                static_cast<double>(larguraCam) * camera.altura() / camera.largura());
+    // Com tela, as câmeras vão numa fileira no canto de baixo à direita, da
+    // direita para a esquerda. Sem tela elas já são as fontes acima.
+    if (quantasTelas > 0 && !camerasNoQuadro.empty()) {
+        // Quanto mais coisa no quadro, menor cada câmera: um quarto da largura
+        // numa composição de dois monitores já é meia tela.
+        const double fatia = 4.0 + 2.0 * static_cast<double>(quantasTelas - 1) +
+                             1.0 * static_cast<double>(camerasNoQuadro.size() - 1);
+        const int32_t margem = static_cast<int32_t>(saidaL / 48);
+        const int32_t larguraCam = static_cast<int32_t>(saidaL / fatia);
 
+        int32_t direita = static_cast<int32_t>(saidaL) - margem;
+        for (auto* c : camerasNoQuadro) {
+            const int32_t alturaCam = static_cast<int32_t>(static_cast<double>(larguraCam) *
+                                                           c->captura.altura() /
+                                                           c->captura.largura());
             ColorConverter::Pedaco canto;
-            canto.direita = static_cast<int32_t>(saidaL) - margem;
+            canto.direita = direita;
             canto.baixo = static_cast<int32_t>(saidaA) - margem;
-            canto.esquerda = canto.direita - larguraCam;
+            canto.esquerda = direita - larguraCam;
             canto.topo = canto.baixo - alturaCam;
             pedacos.push_back(canto);
+            direita = canto.esquerda - margem / 2;
         }
     }
 
     if (pedacos.size() > 1 && !conversor.prepararComposicao(pedacos)) {
-        // A placa não deu conta de compor. Cai para a tela principal sozinha,
+        // A placa não deu conta de compor. Cai para a primeira imagem sozinha,
         // que é melhor do que não transmitir nada.
-        gl::aviso("nao foi possivel compor {} imagens; indo so com a tela principal",
-                  pedacos.size());
+        gl::aviso("nao foi possivel compor {} imagens; indo so com a primeira", pedacos.size());
         fecharTelasExtras();
         conversor.desligarComposicao();
     }
 
-    info("transmitindo {} tela(s){}: {}x{}", partes.size(),
-         camera.ativa() ? " e a camera" : "", saidaL, saidaA);
+    info("transmitindo {} tela(s) e {} camera(s): {}x{}", quantasTelas, camerasNoQuadro.size(),
+         saidaL, saidaA);
     return montarEncoder(saidaL, saidaA, q);
 }
 
@@ -1697,26 +1779,58 @@ void Aplicacao::Interno::alternarTelaCheia() {
 // pessoa precisa se ver para saber se está enquadrada, e "clico e não acontece
 // nada até eu transmitir" é o mesmo que não ter câmera. Escolher "Desligada"
 // fecha o dispositivo de verdade - a luzinha apaga.
-void Aplicacao::Interno::aplicarCamera() {
-    config.camera = cameraEscolhida;
-    config.salvar();
-
-    if (cameraEscolhida.empty()) {
-        camera.parar();
-        cameraNaTelaPronta = false;
-        render.esquecerVideo("camera");
-    } else if (!camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto())) {
-        // Câmera ocupada por outro programa, ou desligada entre a listagem e o
-        // clique. Volta a escolha para "Desligada" em vez de deixar a linha
-        // marcada mostrando nada.
-        cameraEscolhida.clear();
-        config.camera.clear();
-        config.salvar();
-        aviso = L"Não foi possível abrir essa câmera. Ela pode estar em uso.";
+// Abre e fecha câmeras até a lista de abertas bater com a escolhida.
+//
+// A câmera abre na hora em que é MARCADA, e não quando a transmissão começa:
+// a pessoa precisa se ver para saber se está enquadrada, e "marco e não
+// acontece nada até eu transmitir" é o mesmo que não ter câmera. Desmarcar
+// fecha o dispositivo de verdade - a luzinha apaga.
+void Aplicacao::Interno::aplicarCameras(const std::vector<std::string>& escolhidas) {
+    // Fecha o que saiu da lista.
+    for (auto it = camerasAbertas.begin(); it != camerasAbertas.end();) {
+        const bool continua =
+            std::find(escolhidas.begin(), escolhidas.end(), (*it)->id) != escolhidas.end();
+        if (continua) {
+            ++it;
+            continue;
+        }
+        (*it)->captura.parar();
+        render.esquecerVideo("cam:" + (*it)->id);
+        it = camerasAbertas.erase(it);
     }
 
-    // Só depois: é o conversor do encoder que precisa saber que agora há uma
-    // segunda entrada, e ele só existe transmitindo.
+    // Abre o que entrou, na ordem da escolha - é a mesma ordem em que elas vão
+    // aparecer no quadro.
+    std::vector<std::string> abertas;
+    for (const auto& id : escolhidas) {
+        if (auto* ja = cameraAberta(id)) {
+            abertas.push_back(ja->id);
+            continue;
+        }
+        auto nova = std::make_unique<CameraAberta>();
+        nova->id = id;
+        for (const auto& c : cameras) {
+            if (c.id == id) nova->nome = c.nome;
+        }
+        if (!nova->captura.iniciar(id, tela.dispositivo(), tela.contexto())) {
+            // Câmera ocupada por outro programa, ou desligada entre a listagem
+            // e o clique. Sai da escolha em vez de ficar marcada mostrando nada.
+            aviso = L"Não foi possível abrir \"" + paraW(nova->nome) +
+                    L"\". Ela pode estar em uso por outro programa.";
+            continue;
+        }
+        abertas.push_back(id);
+        camerasAbertas.push_back(std::move(nova));
+    }
+
+    // A lista guardada é a das que REALMENTE abriram: deixar na configuração
+    // uma câmera que falha toda vez faria o aviso voltar a cada abertura.
+    camerasEscolhidas = abertas;
+    config.cameras = abertas;
+    config.salvar();
+
+    // Só depois: é o conversor do encoder que precisa saber quantas entradas
+    // existem agora, e ele só existe transmitindo.
     reiniciarEncode();
 }
 
@@ -2267,7 +2381,7 @@ void Aplicacao::Interno::trocarPrincipal(int novo) {
 
     // A câmera guarda texturas do dispositivo D3D atual, e trocar
     // de monitor cria outro. Ela volta logo abaixo, no novo.
-    soltarCameraDoDispositivo();
+    soltarCamerasDoDispositivo();
 
     // O renderizador vive no dispositivo D3D11 da captura. Trocar de
     // monitor destrói esse dispositivo, então ele precisa soltar
@@ -2321,85 +2435,60 @@ void Aplicacao::Interno::trocarPrincipal(int novo) {
         aviso = L"A troca de monitor falhou. Reabra o aplicativo.";
         return;
     }
-    reabrirCamera();
+    reabrirCameras();
     if (estavaTransmitindo) comecarTransmissao();
 }
 
-// Liga ou desliga uma tela na composição.
-//
-// Uma regra só: clicar liga, clicar de novo desliga. A primeira da lista é a
-// principal - é dela que sai o dispositivo D3D - e desligar a principal promove
-// a próxima. Não dá para desligar a última: sem tela e sem câmera não há o que
-// transmitir, e um botão que deixa a pessoa sem imagem nenhuma não é escolha, é
-// armadilha.
-void Aplicacao::Interno::alternarTela(int indice) {
-    if (indice < 0 || indice >= static_cast<int>(monitores.size())) return;
-
-    // Clicar numa tela sai do modo "só a câmera": são a mesma escolha.
-    if (soCamera) {
-        soCamera = false;
-        monitoresExtras.clear();
-        config.salvar();
-        if (indice == monitorEscolhido) {
-            reiniciarEncode();
-            return;
-        }
-        trocarPrincipal(indice);
-        return;
-    }
-
-    const auto naLista = std::find(monitoresExtras.begin(), monitoresExtras.end(), indice);
-    if (naLista != monitoresExtras.end()) {
-        monitoresExtras.erase(naLista);
-        config.telasExtras = monitoresExtras;
-        config.salvar();
-        reiniciarEncode();
-        return;
-    }
-
-    if (indice == monitorEscolhido) {
-        // Desligar a principal: a próxima extra assume. Sem extras, só dá para
-        // desligar indo para "só a câmera", e isso é o outro botão.
-        if (monitoresExtras.empty()) {
-            aviso = cameras.empty()
-                        ? L"É a única tela ligada."
-                        : L"É a única tela ligada. Use \"Só a câmera\" para transmitir sem tela.";
-            return;
-        }
-        const int assume = monitoresExtras.front();
-        monitoresExtras.erase(monitoresExtras.begin());
-        trocarPrincipal(assume);
-        return;
-    }
-
-    // Tela nova entrando na composição, sem mexer no dispositivo.
-    monitoresExtras.push_back(indice);
-    std::sort(monitoresExtras.begin(), monitoresExtras.end());
-    config.telasExtras = monitoresExtras;
-    config.salvar();
-    reiniciarEncode();
-}
-
-// Liga e desliga o modo "só a câmera".
-void Aplicacao::Interno::alternarSoCamera() {
-    soCamera = !soCamera;
-    config.soCamera = soCamera;
-    if (soCamera) {
-        // Este modo precisa de uma câmera. Sem nenhuma escolhida, pega a
-        // primeira - deixar o modo ligado sem transmitir nada seria pior.
-        monitoresExtras.clear();
-        config.telasExtras.clear();
-        if (cameraEscolhida.empty() && !cameras.empty()) {
-            cameraEscolhida = cameras.front().id;
-            config.camera = cameraEscolhida;
-            reabrirCamera();
-        }
-    }
-    config.salvar();
-    reiniciarEncode();
-}
-
 void Aplicacao::Interno::clique(float x, float y) {
+    // O modal come todos os cliques enquanto está aberto. É o que faz dele um
+    // modal: nada atrás dele responde.
+    if (modalAberto) {
+        if (dentro(btModalFechar, x, y)) { fecharModal(); return; }
+        // Trocar de aba volta a rolagem ao topo: a lista e outra.
+        if (dentro(btAbaTelas, x, y)) { abaModal = 0; rolagemModal = 0; return; }
+        if (dentro(btAbaCameras, x, y)) { abaModal = 1; rolagemModal = 0; return; }
+        if (dentro(btModalAudio, x, y)) { audioNoModal = !audioNoModal; return; }
+
+        for (size_t i = 0; i < btQualidades.size(); ++i) {
+            if (dentro(btQualidades[i], x, y)) {
+                qualidadeNoModal = static_cast<int>(i);
+                return;
+            }
+        }
+
+        for (size_t i = 0; i < btCartoesModal.size(); ++i) {
+            if (!dentro(btCartoesModal[i], x, y)) continue;
+            if (abaModal == 0) {
+                const int indice = static_cast<int>(i);
+                const auto achou = std::find(telasNoModal.begin(), telasNoModal.end(), indice);
+                if (achou != telasNoModal.end()) telasNoModal.erase(achou);
+                else telasNoModal.push_back(indice);
+            } else if (i < cameras.size()) {
+                const std::string& id = cameras[i].id;
+                const auto achou = std::find(camerasNoModal.begin(), camerasNoModal.end(), id);
+                if (achou != camerasNoModal.end()) {
+                    camerasNoModal.erase(achou);
+                } else {
+                    camerasNoModal.push_back(id);
+                }
+                // A câmera abre na hora em que é marcada: sem isso o cartão
+                // ficaria marcado mostrando "sem imagem ainda", e a pessoa não
+                // teria como se enquadrar antes de aparecer.
+                aplicarCameras(camerasNoModal);
+                // aplicarCameras devolve so as que realmente abriram: uma que
+                // falhou nao pode continuar marcada no modal.
+                camerasNoModal = camerasEscolhidas;
+            }
+            return;
+        }
+
+        if (dentro(btModalConfirmar, x, y) &&
+            !(telasNoModal.empty() && camerasNoModal.empty())) {
+            confirmarModal();
+        }
+        return;
+    }
+
     if (dentro(btFechar, x, y)) {
         ::PostMessageW(janela, WM_CLOSE, 0, 0);
         return;
@@ -2449,52 +2538,17 @@ void Aplicacao::Interno::clique(float x, float y) {
             return;
         }
         if (dentro(btTransmitir, x, y)) {
+            // Parar e imediato; comecar passa pela escolha do que vai no ar.
             if (transmitindo) pararTransmissao();
-            else comecarTransmissao();
+            else abrirModal();
             return;
         }
         return;
     }
 
-    for (size_t i = 0; i < btCameras.size(); ++i) {
-        if (!dentro(btCameras[i], x, y)) continue;
-        // A primeira linha é "Desligada"; as seguintes são as câmeras na ordem
-        // em que foram enumeradas.
-        const std::string nova = (i == 0) ? std::string{} : cameras[i - 1].id;
-        if (nova != cameraEscolhida) {
-            cameraEscolhida = nova;
-            aplicarCamera();
-        }
+    if (dentro(btEscolher, x, y)) {
+        abrirModal();
         return;
-    }
-
-    if (!cameras.empty() && dentro(btSoCamera, x, y)) {
-        soCamera = !soCamera;
-        if (soCamera) {
-            // Só a câmera precisa de uma câmera. Se não havia nenhuma
-            // escolhida, pega a primeira em vez de deixar a pessoa com um modo
-            // ligado que não transmite nada.
-            if (cameraEscolhida.empty()) {
-                cameraEscolhida = cameras.front().id;
-                aplicarCamera();
-            }
-            monitoresExtras.clear();
-        }
-        config.salvar();
-        reiniciarEncode();
-        return;
-    }
-
-    if (!cameras.empty() && dentro(btSoCamera, x, y)) {
-        alternarSoCamera();
-        return;
-    }
-
-    for (size_t i = 0; i < btMonitores.size(); ++i) {
-        if (dentro(btMonitores[i], x, y)) {
-            alternarTela(static_cast<int>(i));
-            return;
-        }
     }
 
     // Cartao de transmissao: poe aquela no palco.
@@ -2771,23 +2825,29 @@ void Aplicacao::Interno::desenharAoVivo() {
         // transmissão precisa ser um quadro só, e o que aparece aqui precisa
         // aparecer mesmo sem transmissão nenhuma acontecendo. O que importa é
         // que o enquadramento seja o mesmo, e é.
-        if (ID3D11Texture2D* cam = previaDaCamera()) {
-            const D2D1_RECT_F v = render.areaDoVideo("previa");
-            const bool temTela = render.temQuadro("previa") && v.right > v.left;
-            const D2D1_RECT_F base = temTela ? v : dentroDoPalco;
+        const D2D1_RECT_F v = render.areaDoVideo("previa");
+        const bool temTela = render.temQuadro("previa") && v.right > v.left;
+        const D2D1_RECT_F base = (temTela && telaLigada(monitorEscolhido)) ? v : dentroDoPalco;
 
-            const float larguraBase = base.right - base.left;
-            const float margem = larguraBase / 48.0f;
-            const float larguraCam = larguraBase / 4.0f;
-            const float alturaCam =
-                larguraCam * static_cast<float>(camera.altura()) / camera.largura();
+        const float larguraBase = base.right - base.left;
+        const float margem = larguraBase / 48.0f;
+        const size_t quantas = camerasVivas();
+        const float fatia = 4.0f + 1.0f * static_cast<float>(quantas > 0 ? quantas - 1 : 0);
+        const float larguraCam = larguraBase / fatia;
 
-            const auto canto = D2D1::RectF(base.right - margem - larguraCam,
-                                           base.bottom - margem - alturaCam,
-                                           base.right - margem, base.bottom - margem);
+        float direita = base.right - margem;
+        for (auto& c : camerasAbertas) {
+            ID3D11Texture2D* cam = c->previa(tela.dispositivo(), tela.contexto());
+            if (!cam) continue;
+
+            const float alturaCam = larguraCam * static_cast<float>(c->captura.altura()) /
+                                    c->captura.largura();
+            const auto canto = D2D1::RectF(direita - larguraCam, base.bottom - margem - alturaCam,
+                                           direita, base.bottom - margem);
             render.retangulo(canto, tema::kFundo, 6);
-            render.video("camera", cam, canto);
+            render.video("cam:" + c->id, cam, canto);
             render.contorno(canto, tema::kVerdeLinha, 6);
+            direita = canto.left - margem / 2;
         }
     }
 
@@ -2830,12 +2890,27 @@ void Aplicacao::Interno::desenharAoVivo() {
             texto = L"●  " + (escolhida ? escolhida->nome : L"Alguem na sala");
             if (doOutroLargura > 0) texto += L"  ·  " + std::to_wstring(doOutroLargura) + L"p";
             corTexto = tema::kVerde;
-        } else if (transmitindo) {
-            texto = camera.ativa() ? L"●  AO VIVO  ·  sua tela e sua câmera"
-                                   : L"●  AO VIVO  ·  sua tela";
-            corTexto = tema::kVerde;
         } else {
-            texto = camera.ativa() ? L"sua tela e sua câmera" : L"sua tela";
+            // O que está indo, dito em português: "2 telas e 1 câmera".
+            const size_t quantasCameras = camerasVivas();
+            std::wstring oQue;
+            if (!telasLigadas.empty()) {
+                oQue = std::to_wstring(telasLigadas.size()) +
+                       (telasLigadas.size() == 1 ? L" tela" : L" telas");
+            }
+            if (quantasCameras > 0) {
+                if (!oQue.empty()) oQue += L" e ";
+                oQue += std::to_wstring(quantasCameras) +
+                        (quantasCameras == 1 ? L" câmera" : L" câmeras");
+            }
+            if (oQue.empty()) oQue = L"nada escolhido";
+
+            if (transmitindo) {
+                texto = L"●  AO VIVO  ·  " + oQue;
+                corTexto = tema::kVerde;
+            } else {
+                texto = oQue;
+            }
         }
 
         // Ancorada no VÍDEO, não no palco.
@@ -2925,84 +3000,39 @@ void Aplicacao::Interno::desenharAoVivo() {
         return area;
     };
 
-    secao(monitores.size() > 1 ? L"TELAS  ·  CLIQUE PARA JUNTAR" : L"TELA");
-    btMonitores.clear();
-    for (size_t i = 0; i < monitores.size(); ++i) {
-        // "Monitor 1" em vez de "\\.\DISPLAY2": o caminho do dispositivo não
-        // diz nada a quem está escolhendo onde a tela vai ser capturada.
-        const std::wstring nome = L"Monitor " + std::to_wstring(i + 1);
-        const std::wstring tamanho = std::to_wstring(monitores[i].largura) + L"×" +
-                                     std::to_wstring(monitores[i].altura);
-        const int indice = static_cast<int>(i);
-        const bool ligado = !soCamera && (indice == monitorEscolhido ||
-                                          std::find(monitoresExtras.begin(),
-                                                    monitoresExtras.end(),
-                                                    indice) != monitoresExtras.end());
-        btMonitores.push_back(item(nome, tamanho, ligado));
-    }
-
-    // Só a câmera, sem tela nenhuma.
+    // ---- o que está indo no ar
     //
-    // Fica junto das telas porque é a mesma pergunta - o que vai na imagem - e
-    // é excludente com elas: escolher esta desliga todas, e clicar numa tela
-    // desliga esta.
-    btSoCamera = {};
-    if (!cameras.empty()) {
-        btSoCamera = item(L"Só a câmera", L"sem tela", soCamera);
-    }
-
-    y += 6;
-    secao(L"QUALIDADE");
-    btQualidades.clear();
-    for (size_t i = 0; i < std::size(kQualidades); ++i) {
-        btQualidades.push_back(item(kQualidades[i].rotulo,
-                                    std::to_wstring(kQualidades[i].bitrate / 1000) + L" kbps",
-                                    static_cast<int>(i) == qualidadeEscolhida));
-    }
-
-    // Câmera.
-    //
-    // Fica junto de monitor e qualidade porque é a mesma pergunta: o que sai
-    // daqui. E "Desligada" é a primeira linha, e não um interruptor separado,
-    // porque desligar a câmera é escolher uma fonte como outra qualquer - e
-    // assim quem tem duas webcams troca entre elas com um clique.
-    //
-    // A câmera vai COMPOSTA no canto do quadro, não numa segunda faixa: o
-    // servidor abre um transceiver de vídeo por pessoa. O efeito colateral é
-    // bom - quem assiste pelo Electron ou pelo celular já a vê hoje, sem
-    // atualizar nada.
-    y += 6;
-    secao(L"CÂMERA");
-    btCameras.clear();
-    btCameras.push_back(item(L"Desligada", L"", cameraEscolhida.empty()));
-    for (const auto& c : cameras) {
-        btCameras.push_back(item(paraW(c.nome), L"no canto", c.id == cameraEscolhida));
-    }
-    if (cameras.empty()) {
-        render.texto(L"Nenhuma câmera encontrada",
-                     D2D1::RectF(esq + 11, y, dir, y + 20), tema::kApagado, Fonte::Pequena);
-        y += 24;
-    }
-
-    // Interruptor do som. Fica logo abaixo da qualidade porque é a mesma
-    // decisão - o que sai daqui - mas com forma diferente, porque é liga/desliga
-    // e não escolha entre opções.
-    y += 6;
-    btAudio = D2D1::RectF(esq, y, dir, y + 34);
-    if (apontando(btAudio)) { /* mãozinha; o realce viria por cima do verde */ }
-    render.retangulo(btAudio, audioLigado ? tema::kVerdeSuave : tema::kPainel2, 8);
-    render.texto(audioLigado ? L"Som do sistema" : L"Sem som",
-                 D2D1::RectF(btAudio.left + 11, btAudio.top, btAudio.right - 64, btAudio.bottom),
-                 audioLigado ? tema::kVerde : tema::kApagado, Fonte::Pequena);
+    // Uma linha só, e um botão para mudar. A escolha de telas e câmeras mudou
+    // de lugar: era uma pilha de listas aqui na lateral e virou o modal, que é
+    // onde ela cabe - com miniatura ao vivo de cada tela, em vez de "Monitor 1"
+    // e "Monitor 2" para adivinhar.
+    secao(L"O QUE VAI NO AR");
     {
-        const float tl = btAudio.right - 51;
-        const float tt = btAudio.top + 9;
-        render.retangulo(D2D1::RectF(tl, tt, tl + 36, tt + 16),
-                         audioLigado ? tema::kVerde : tema::kLinha, 8);
-        const float bola = audioLigado ? tl + 22 : tl + 2;
-        render.retangulo(D2D1::RectF(bola, tt + 2, bola + 12, tt + 14), tema::kPainel, 6);
+        std::wstring resumo;
+        if (!telasLigadas.empty()) {
+            resumo = std::to_wstring(telasLigadas.size()) +
+                     (telasLigadas.size() == 1 ? L" tela" : L" telas");
+        }
+        const size_t vivas = camerasVivas();
+        if (vivas > 0) {
+            if (!resumo.empty()) resumo += L" e ";
+            resumo += std::to_wstring(vivas) + (vivas == 1 ? L" câmera" : L" câmeras");
+        }
+        if (resumo.empty()) resumo = L"nada escolhido";
+
+        const auto area = D2D1::RectF(esq, y, dir, y + 40);
+        const bool sob = apontando(area);
+        render.retangulo(area, sob ? tema::kPainel3 : tema::kPainel2, 10);
+        render.contorno(area, sob ? tema::kLinhaForte : tema::kLinha, 10);
+        render.texto(resumo,
+                     D2D1::RectF(area.left + 12, area.top, area.right - 68, area.bottom),
+                     tema::kTexto, Fonte::Pequena);
+        render.texto(L"mudar",
+                     D2D1::RectF(area.left, area.top, area.right - 12, area.bottom), tema::kVerde,
+                     Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        btEscolher = area;
+        y += 46;
     }
-    y += 40;
 
     // Volume do que CHEGA da chamada.
     //
@@ -3215,6 +3245,392 @@ void Aplicacao::Interno::desenharAoVivo() {
     }
 }
 
+
+// ---------------------------------------------------------------- o modal
+
+void Aplicacao::Interno::abrirModal() {
+    modalAberto = true;
+    abaModal = 0;
+    rolagemModal = 0;
+    alturaConteudoModal = 0;
+    telasNoModal = telasLigadas;
+    camerasNoModal = camerasEscolhidas;
+    audioNoModal = audioLigado;
+    qualidadeNoModal = qualidadeEscolhida;
+
+    // Miniatura ao vivo de cada monitor.
+    //
+    // Duplicar um monitor não acende nada nem aparece para ninguém - dá para
+    // abrir todas enquanto o modal está aberto e ver de verdade o que há em
+    // cada tela antes de escolher. É o que a janela do Electron faz, e sem isso
+    // a escolha vira adivinhação entre "Monitor 1" e "Monitor 2".
+    previasDoModal.clear();
+    quadrosDoModal.clear();
+    previasDoModal.resize(monitores.size());
+    quadrosDoModal.resize(monitores.size());
+    for (size_t i = 0; i < monitores.size(); ++i) {
+        if (static_cast<int>(i) == monitorEscolhido) continue;  // esse já é o `tela`
+        auto captura = std::make_unique<ScreenCapture>();
+        if (captura->iniciarCom(tela.dispositivo(), tela.contexto(), static_cast<uint32_t>(i))) {
+            previasDoModal[i] = std::move(captura);
+        }
+    }
+}
+
+void Aplicacao::Interno::fecharModal() {
+    modalAberto = false;
+    for (auto& p : previasDoModal) {
+        if (p) p->parar();
+    }
+    previasDoModal.clear();
+    quadrosDoModal.clear();
+    for (size_t i = 0; i < monitores.size(); ++i) {
+        render.esquecerVideo("modal:" + std::to_string(i));
+    }
+}
+
+void Aplicacao::Interno::confirmarModal() {
+    telasLigadas = telasNoModal;
+    std::sort(telasLigadas.begin(), telasLigadas.end());
+    qualidadeEscolhida = qualidadeNoModal;
+    audioLigado = audioNoModal;
+
+    config.telas = telasLigadas;
+    config.qualidade = qualidadeEscolhida;
+    config.audio = audioLigado;
+
+    // O dispositivo D3D vem de um monitor, mesmo quando ele não vai no ar. Só
+    // precisa trocar quando o que ele usa deixou de existir na lista - e essa é
+    // a operação cara, que refaz encoder, decodificador e interface.
+    const bool precisaTrocarDono = !telasLigadas.empty() && !telaLigada(monitorEscolhido);
+    const int novoDono = telasLigadas.empty() ? monitorEscolhido : telasLigadas.front();
+
+    fecharModal();
+
+    // As câmeras primeiro: aplicarCameras já salva e refaz o encode, e na ordem
+    // contrária o encode seria refeito duas vezes.
+    aplicarCameras(camerasNoModal);
+
+    if (precisaTrocarDono) {
+        trocarPrincipal(novoDono);
+    } else if (transmitindo) {
+        reiniciarEncode();
+    } else {
+        config.salvar();
+    }
+
+    // Confirmar com algo marcado e fora do ar é o mesmo que apertar
+    // TRANSMITIR - é para isso que a pessoa abriu esta janela.
+    if (!transmitindo && (!telasLigadas.empty() || !camerasEscolhidas.empty())) {
+        comecarTransmissao();
+    }
+}
+
+// Mantém as miniaturas do modal vivas: uma cópia por monitor por quadro, e só
+// enquanto ele está aberto.
+void Aplicacao::Interno::bombearPreviasDoModal() {
+    for (size_t i = 0; i < previasDoModal.size(); ++i) {
+        auto& captura = previasDoModal[i];
+        if (!captura) continue;
+
+        QuadroCapturado quadro;
+        const auto estado = captura->proximoQuadro(0, quadro);
+        if (estado == ResultadoQuadro::PrecisaReiniciar) {
+            captura->reiniciar();
+            continue;
+        }
+        if (estado != ResultadoQuadro::Ok || !quadro.textura) continue;
+
+        D3D11_TEXTURE2D_DESC origem{};
+        quadro.textura->GetDesc(&origem);
+        if (quadrosDoModal[i]) {
+            D3D11_TEXTURE2D_DESC atual{};
+            quadrosDoModal[i]->GetDesc(&atual);
+            if (atual.Width != origem.Width || atual.Height != origem.Height) {
+                quadrosDoModal[i].Reset();
+            }
+        }
+        if (!quadrosDoModal[i]) {
+            D3D11_TEXTURE2D_DESC nova = origem;
+            nova.Usage = D3D11_USAGE_DEFAULT;
+            nova.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            nova.CPUAccessFlags = 0;
+            nova.MiscFlags = 0;
+            nova.MipLevels = 1;
+            nova.ArraySize = 1;
+            tela.dispositivo()->CreateTexture2D(&nova, nullptr, &quadrosDoModal[i]);
+        }
+        if (quadrosDoModal[i]) {
+            tela.contexto()->CopyResource(quadrosDoModal[i].Get(), quadro.textura);
+        }
+        captura->liberarQuadro();
+    }
+}
+
+// A janela de escolher o que transmitir.
+//
+// Medidas e cores saíram do .picker-modal do cliente em Electron, uma a uma:
+// largura de 540, cantos de 24, cabeçalho e abas separados por linha, corpo em
+// grade de dois, interruptor de som no pé e um botão verde de largura cheia.
+void Aplicacao::Interno::desenharModal() {
+    const float larg = render.largura();
+    const float alt = render.altura();
+
+    // O fundo escurece a janela inteira - é o que diz "resolva isto primeiro".
+    render.retangulo(D2D1::RectF(0, 0, larg, alt), tema::kSombraModal);
+
+    // O pé tem altura fixa porque o conteúdo dele é fixo: rótulo, pastilhas de
+    // qualidade, interruptor de som e o botão. Ele estava em 152 e o botão caía
+    // POR CIMA do interruptor - dá para ver na janela: "MARQUE PELO MENOS UM"
+    // escrito em cima de "Mandar o som do computador junto".
+    //
+    //   14 rótulo + 20 até as pastilhas + 30 pastilhas
+    // + 42 respiro + 44 interruptor
+    // + 18 respiro + 42 botão + 18 margem
+    const float alturaPe = 198;
+    const float alturaCabecalho = 72;
+    const float alturaAbas = 42;
+
+    // A janela manda. Numa janela baixa o modal encolhe junto, e o mínimo
+    // garante que cabeçalho, abas e pé continuem inteiros mesmo que sobre
+    // pouco para a grade - que é a parte que rola.
+    const float largModal = (std::min)(560.0f, larg - 48.0f);
+    const float alturaMinima = alturaCabecalho + alturaAbas + alturaPe + 120;
+    const float altModal =
+        (std::max)(alturaMinima, (std::min)(alt - 48.0f, 640.0f));
+    const float x = (larg - largModal) / 2;
+    const float y = (std::max)(8.0f, (alt - altModal) / 2);
+    const auto modal = D2D1::RectF(x, y, x + largModal, y + altModal);
+
+    render.retangulo(modal, tema::kFundoModal, 24);
+    render.contorno(modal, tema::kLinha, 24);
+
+    // ---- cabeçalho
+    render.linha(x, y + alturaCabecalho, x + largModal, y + alturaCabecalho, tema::kLinha);
+
+    const auto quadradoIcone = D2D1::RectF(x + 20, y + 18, x + 56, y + 54);
+    render.retangulo(quadradoIcone, tema::kVerdeSuave, 10);
+    render.texto(L"▣", quadradoIcone, tema::kVerde, Fonte::Corpo,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    render.texto(L"Escolha o que transmitir",
+                 D2D1::RectF(x + 68, y + 17, x + largModal - 62, y + 39), tema::kTexto,
+                 Fonte::Subtitulo);
+    render.texto(L"Suas telas e suas câmeras. Dá para marcar mais de uma.",
+                 D2D1::RectF(x + 68, y + 39, x + largModal - 62, y + 57), tema::kApagado,
+                 Fonte::Pequena);
+
+    btModalFechar = D2D1::RectF(x + largModal - 52, y + 18, x + largModal - 16, y + 54);
+    render.retangulo(btModalFechar, apontando(btModalFechar) ? tema::kPainel3 : tema::kPainel2, 12);
+    render.contorno(btModalFechar, tema::kLinha, 12);
+    render.texto(L"✕", btModalFechar, tema::kTexto, Fonte::Pequena,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // ---- abas
+    const float topoAbas = y + alturaCabecalho;
+    render.linha(x, topoAbas + alturaAbas, x + largModal, topoAbas + alturaAbas, tema::kLinha);
+
+    auto aba = [&](float esquerda, const std::wstring& rotulo, bool ativa) {
+        const float largura = render.larguraDoTexto(rotulo, Fonte::Pequena) + 28;
+        const auto area =
+            D2D1::RectF(esquerda, topoAbas + 4, esquerda + largura, topoAbas + alturaAbas);
+        const bool sob = apontando(area);
+        render.texto(rotulo, area, ativa ? tema::kVerde : (sob ? tema::kTexto : tema::kApagado),
+                     Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+        if (ativa) {
+            render.retangulo(D2D1::RectF(area.left, area.bottom - 2, area.right, area.bottom),
+                             tema::kVerde, 1);
+        }
+        return area;
+    };
+
+    btAbaTelas = aba(x + 20, L"Telas (" + std::to_wstring(monitores.size()) + L")", abaModal == 0);
+    btAbaCameras = aba(btAbaTelas.right + 8,
+                       L"Câmeras (" + std::to_wstring(cameras.size()) + L")", abaModal == 1);
+
+    // ---- pé, medido de baixo para cima para o corpo saber onde parar
+    const float basePe = y + altModal;
+    const float topoPe = basePe - alturaPe;
+    render.linha(x, topoPe, x + largModal, topoPe, tema::kLinha);
+
+    float qy = topoPe + 14;
+    render.texto(L"QUALIDADE", D2D1::RectF(x + 20, qy, x + largModal - 20, qy + 14), tema::kApagado,
+                 Fonte::Pequena);
+    qy += 20;
+    btQualidades.clear();
+    float qx = x + 20;
+    for (size_t i = 0; i < std::size(kQualidades); ++i) {
+        const std::wstring rotulo = kQualidades[i].rotulo;
+        const float largura = render.larguraDoTexto(rotulo, Fonte::Pequena) + 26;
+        const auto area = D2D1::RectF(qx, qy, qx + largura, qy + 30);
+        const bool ativa = static_cast<int>(i) == qualidadeNoModal;
+        const bool sob = !ativa && apontando(area);
+        render.retangulo(area, ativa ? tema::kVerdeSuave : (sob ? tema::kPainel3 : tema::kPainel2),
+                         9);
+        if (ativa) render.contorno(area, tema::kVerdeLinha, 9);
+        render.texto(rotulo, area, ativa ? tema::kVerde : tema::kTexto, Fonte::Pequena,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+        btQualidades.push_back(area);
+        qx += largura + 8;
+    }
+
+    // Som do sistema, no mesmo desenho do .check-row do Electron.
+    const float ay = qy + 42;
+    btModalAudio = D2D1::RectF(x + 20, ay, x + largModal - 20, ay + 44);
+    render.retangulo(btModalAudio, apontando(btModalAudio) ? tema::kPainel3 : tema::kPainel2, 12);
+    render.contorno(btModalAudio, tema::kLinha, 12);
+    {
+        const float tl = btModalAudio.left + 14;
+        const float tt = btModalAudio.top + 10;
+        render.retangulo(D2D1::RectF(tl, tt, tl + 44, tt + 24),
+                         audioNoModal ? tema::kVerde : tema::kLinha, 12);
+        const float bola = audioNoModal ? tl + 23 : tl + 3;
+        render.retangulo(D2D1::RectF(bola, tt + 3, bola + 18, tt + 21), tema::kTexto, 9);
+    }
+    render.texto(L"Mandar o som do computador junto",
+                 D2D1::RectF(btModalAudio.left + 74, btModalAudio.top, btModalAudio.right - 14,
+                             btModalAudio.bottom),
+                 tema::kTexto, Fonte::Pequena);
+
+    const int marcadas = static_cast<int>(telasNoModal.size() + camerasNoModal.size());
+    // Ancorado ABAIXO do interruptor, e não medido de baixo para cima: era daí
+    // que vinha a sobreposição.
+    btModalConfirmar =
+        D2D1::RectF(x + 20, btModalAudio.bottom + 18, x + largModal - 20, btModalAudio.bottom + 60);
+    const bool podeConfirmar = marcadas > 0;
+    render.retangulo(btModalConfirmar,
+                     podeConfirmar
+                         ? (apontando(btModalConfirmar) ? tema::kVerde : tema::kVerdeForte)
+                         : tema::kPainel2,
+                     11);
+
+    std::wstring rotuloConfirmar = L"MARQUE PELO MENOS UM";
+    if (marcadas == 1) rotuloConfirmar = L"TRANSMITIR";
+    else if (marcadas > 1) rotuloConfirmar = L"TRANSMITIR OS " + std::to_wstring(marcadas);
+
+    render.texto(rotuloConfirmar, btModalConfirmar,
+                 podeConfirmar ? tema::kFundo : tema::kApagado, Fonte::Botao,
+                 DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    // ---- corpo: a grade de cartões
+    const float topoCorpo = topoAbas + alturaAbas + 16;
+    const auto corpo = D2D1::RectF(x + 20, topoCorpo, x + largModal - 20, topoPe - 14);
+
+    // A grade rola: numa janela baixa, ou com muitas câmeras, ela não cabe. O
+    // limite vem da medida do quadro anterior, pelo mesmo motivo do painel -
+    // medir e limitar no mesmo quadro daria um solavanco a cada roda.
+    areaRolavelModal = corpo;
+    const float visivelModal = corpo.bottom - corpo.top;
+    const float limiteModal =
+        alturaConteudoModal > visivelModal ? alturaConteudoModal - visivelModal : 0.0f;
+    if (rolagemModal > limiteModal) rolagemModal = limiteModal;
+
+    render.recortar(corpo);
+
+    btCartoesModal.clear();
+    const float largCartao = (corpo.right - corpo.left - 12) / 2;
+    const float altMini = largCartao * 9.0f / 16.0f;
+    const float altCartao = altMini + 38;
+
+    int coluna = 0;
+    float cy = corpo.top - rolagemModal;
+
+    auto cartao = [&](const std::wstring& nome, const std::wstring& detalhe, bool marcado,
+                      const std::string& chave, ID3D11Texture2D* imagem) {
+        const float cx = corpo.left + coluna * (largCartao + 12);
+        const auto area = D2D1::RectF(cx, cy, cx + largCartao, cy + altCartao);
+        const bool sob = apontando(area);
+
+        render.retangulo(area, tema::kPainel2, 14);
+        render.contorno(area,
+                        marcado ? tema::kVerdeLinha : (sob ? tema::kLinhaForte : tema::kLinha), 14);
+
+        const auto areaMini =
+            D2D1::RectF(area.left + 8, area.top + 8, area.right - 8, area.top + 8 + altMini);
+        render.retangulo(areaMini, tema::kFundo, 8);
+        if (imagem || render.temQuadro(chave)) {
+            render.video(chave, imagem, areaMini);
+        } else {
+            render.texto(L"sem imagem ainda", areaMini, tema::kApagado, Fonte::Pequena,
+                         DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
+
+        // A marca de escolhido fica SOBRE a miniatura: é da imagem que se está
+        // falando, e no canto do cartão ela competiria com o nome.
+        const auto marca =
+            D2D1::RectF(areaMini.right - 28, areaMini.top + 6, areaMini.right - 6, areaMini.top + 28);
+        render.retangulo(marca, marcado ? tema::kVerde : tema::kSombraModal, 11);
+        if (marcado) {
+            render.texto(L"✓", marca, tema::kFundo, Fonte::Pequena,
+                         DWRITE_TEXT_ALIGNMENT_CENTER);
+        } else {
+            render.contorno(marca, tema::kLinhaForte, 11);
+        }
+
+        render.texto(nome,
+                     D2D1::RectF(area.left + 10, areaMini.bottom + 3, area.right - 10,
+                                 areaMini.bottom + 21),
+                     marcado ? tema::kVerde : tema::kTexto, Fonte::Pequena);
+        render.texto(detalhe,
+                     D2D1::RectF(area.left + 10, areaMini.bottom + 19, area.right - 10,
+                                 area.bottom - 2),
+                     tema::kApagado, Fonte::Pequena);
+
+        btCartoesModal.push_back(area);
+        if (++coluna == 2) {
+            coluna = 0;
+            cy += altCartao + 12;
+        }
+    };
+
+    if (abaModal == 0) {
+        for (size_t i = 0; i < monitores.size(); ++i) {
+            const int indice = static_cast<int>(i);
+            const bool marcada =
+                std::find(telasNoModal.begin(), telasNoModal.end(), indice) != telasNoModal.end();
+            ID3D11Texture2D* imagem =
+                (indice == monitorEscolhido)
+                    ? previaDaTela()
+                    : (quadrosDoModal.size() > i ? quadrosDoModal[i].Get() : nullptr);
+            cartao(L"Monitor " + std::to_wstring(i + 1),
+                   std::to_wstring(monitores[i].largura) + L"×" +
+                       std::to_wstring(monitores[i].altura),
+                   marcada, "modal:" + std::to_string(i), imagem);
+        }
+    } else if (cameras.empty()) {
+        render.texto(L"Nenhuma câmera encontrada neste computador.",
+                     D2D1::RectF(corpo.left, corpo.top + 20, corpo.right, corpo.top + 44),
+                     tema::kApagado, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else {
+        for (const auto& c : cameras) {
+            const bool marcada = std::find(camerasNoModal.begin(), camerasNoModal.end(), c.id) !=
+                                 camerasNoModal.end();
+            CameraAberta* aberta = cameraAberta(c.id);
+            ID3D11Texture2D* imagem =
+                aberta ? aberta->previa(tela.dispositivo(), tela.contexto()) : nullptr;
+            cartao(paraW(c.nome), marcada ? L"ligada" : L"marque para ver", marcada, "cam:" + c.id,
+                   imagem);
+        }
+    }
+
+    // Se a última fileira ficou pela metade, ela ainda ocupa altura.
+    if (coluna != 0) cy += altCartao + 12;
+    alturaConteudoModal = (cy + rolagemModal) - corpo.top;
+
+    render.soltarRecorte();
+
+    // Trilho de rolagem, fininho e encostado na borda: ele existe para dizer
+    // "há mais coisa aqui embaixo", não para ser agarrado.
+    if (alturaConteudoModal > visivelModal) {
+        const float fracao = visivelModal / alturaConteudoModal;
+        const float alturaPolegar = visivelModal * fracao;
+        const float andado = (limiteModal > 0) ? (rolagemModal / limiteModal) : 0.0f;
+        const float y0 = corpo.top + (visivelModal - alturaPolegar) * andado;
+        render.retangulo(D2D1::RectF(corpo.right + 6, y0, corpo.right + 9, y0 + alturaPolegar),
+                         tema::kLinhaForte, 2);
+    }
+}
+
 void Aplicacao::Interno::desenhar() {
     render.comecarQuadro();
     render.limpar(tema::kFundo);
@@ -3230,6 +3646,10 @@ void Aplicacao::Interno::desenhar() {
     // A barra some em tela cheia: ela é a única coisa que ainda desenharia por
     // cima da imagem depois que o painel sai.
     if (!telaCheia) desenharBarraTitulo();
+
+    // O modal por último, por cima de tudo - inclusive da barra de título, que
+    // é o comportamento de qualquer janela modal.
+    if (modalAberto) desenharModal();
     render.terminarQuadro();
 }
 
