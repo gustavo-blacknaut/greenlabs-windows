@@ -28,6 +28,12 @@ struct Config {
     // Windows: abaixa so a chamada, deixando jogo e musica como estao.
     int volume = 100;
 
+    // Telas extras que entram lado a lado com a principal, por indice.
+    std::vector<int> telasExtras;
+
+    // Transmitir so a camera, sem tela nenhuma.
+    bool soCamera = false;
+
     // Caminho simbolico da camera escolhida, ou vazio para nenhuma.
     //
     // O caminho, e nao o indice: com indice, plugar um adaptador de captura

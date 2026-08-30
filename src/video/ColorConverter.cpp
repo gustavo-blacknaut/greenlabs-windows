@@ -32,10 +32,11 @@ struct ColorConverter::Interno {
     uint32_t largura = 0;
     uint32_t altura = 0;
 
-    // Segunda entrada, para a câmera. Desligada enquanto ninguém a pedir.
-    bool comSobreposicao = false;
-    uint32_t larguraCamera = 0;
-    uint32_t alturaCamera = 0;
+    // Quantas imagens entram no quadro. Uma é o caminho de sempre.
+    UINT pedacos = 1;
+
+    // Para não repetir a mesma linha de erro a cada quadro.
+    HRESULT ultimoErroVista = S_OK;
 };
 
 ColorConverter::ColorConverter() : d_(std::make_unique<Interno>()) {}
@@ -190,75 +191,85 @@ bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* con
     return true;
 }
 
-// Onde a câmera entra no quadro: canto inferior direito, com uma margem
-// proporcional ao tamanho da saída.
+// Monta onde cada imagem cai dentro do quadro final.
 //
-// Um quarto da largura é o que o olho aceita sem a câmera roubar a cena. Fixo
-// em pixels não serviria: 240 px num 4K é um selo, num 720p é meia tela.
-bool ColorConverter::prepararSobreposicao(uint32_t larguraCamera, uint32_t alturaCamera) {
-    if (!d_->processador || larguraCamera == 0 || alturaCamera == 0) return false;
+// Uma tela sozinha ocupa tudo; duas telas ficam lado a lado; a câmera vai num
+// canto. Quem decide o recorte é quem chama - aqui só se diz ao Video
+// Processor, uma vez, e ele repete a cada quadro sem custo.
+bool ColorConverter::prepararComposicao(const std::vector<Pedaco>& pedacos) {
+    if (!d_->processador || pedacos.empty()) return false;
 
-    // A placa precisa aceitar NV12 na entrada para a câmera existir aqui: no
-    // caminho do encoder a entrada principal é BGRA, então este formato ainda
-    // não foi conferido.
+    // A placa precisa aceitar NV12 na entrada: no caminho do encoder a entrada
+    // principal é BGRA, então esse formato ainda não foi conferido - e é o da
+    // câmera.
     UINT suporte = 0;
     d_->enumerador->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &suporte);
-    if (!(suporte & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
-        aviso("o Video Processor desta placa nao aceita NV12 na entrada; sem camera no quadro");
-        return false;
-    }
+    const bool aceitaNv12 = (suporte & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) != 0;
 
     D3D11_VIDEO_PROCESSOR_CAPS capacidades{};
-    if (FAILED(d_->enumerador->GetVideoProcessorCaps(&capacidades)) ||
-        capacidades.MaxStreamStates < 2 || capacidades.MaxInputStreams < 2) {
-        aviso("o Video Processor desta placa so aceita uma entrada; sem camera no quadro");
+    if (FAILED(d_->enumerador->GetVideoProcessorCaps(&capacidades))) return false;
+
+    const size_t cabem = (std::min)(static_cast<size_t>(capacidades.MaxInputStreams),
+                                    static_cast<size_t>(capacidades.MaxStreamStates));
+    if (pedacos.size() > cabem) {
+        aviso("o Video Processor desta placa aceita {} entradas, e foram pedidas {}", cabem,
+              pedacos.size());
+        return false;
+    }
+    if (pedacos.size() > 1 && !aceitaNv12) {
+        aviso("o Video Processor desta placa nao aceita NV12 na entrada; sem composicao");
         return false;
     }
 
-    d_->larguraCamera = larguraCamera;
-    d_->alturaCamera = alturaCamera;
+    for (size_t i = 0; i < pedacos.size(); ++i) {
+        const RECT destino{pedacos[i].esquerda, pedacos[i].topo, pedacos[i].direita,
+                           pedacos[i].baixo};
+        const auto fluxo = static_cast<UINT>(i);
+        // Dizer o destino de TODOS, inclusive o primeiro: com mais de uma
+        // entrada o processador não presume mais que a primeira é o fundo.
+        d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), fluxo, TRUE,
+                                                           &destino);
+        d_->videoContexto->VideoProcessorSetStreamFrameFormat(
+            d_->processador.Get(), fluxo, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+        d_->videoContexto->VideoProcessorSetStreamAutoProcessingMode(d_->processador.Get(), fluxo,
+                                                                     FALSE);
 
-    // A entrada principal ocupa o quadro inteiro. Precisa ser dito: com duas
-    // entradas o processador não presume mais que a primeira é o fundo.
-    const RECT cheio{0, 0, static_cast<LONG>(d_->largura), static_cast<LONG>(d_->altura)};
-    d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), 0, TRUE, &cheio);
+        // Giro por imagem: a duplicacao entrega na orientacao FISICA do painel,
+        // e um monitor em pe chega deitado. O Video Processor gira de graca, na
+        // mesma passada - fazer isso com shader custaria uma passada inteira.
+        if (pedacos[i].graus != 0) {
+            ComPtr<ID3D11VideoContext1> videoContexto1;
+            if (SUCCEEDED(d_->videoContexto.As(&videoContexto1))) {
+                const auto giro = (pedacos[i].graus == 90)    ? D3D11_VIDEO_PROCESSOR_ROTATION_90
+                                  : (pedacos[i].graus == 180) ? D3D11_VIDEO_PROCESSOR_ROTATION_180
+                                                              : D3D11_VIDEO_PROCESSOR_ROTATION_270;
+                videoContexto1->VideoProcessorSetStreamRotation(d_->processador.Get(), fluxo, TRUE,
+                                                               giro);
+            }
+        }
+    }
 
-    // A câmera entra com a proporção dela, e não esticada: uma webcam 4:3
-    // achatada em 16:9 deixa todo mundo com a cara larga.
-    const LONG margem = static_cast<LONG>(d_->largura / 48);
-    const LONG larguraDestino = static_cast<LONG>(d_->largura / 4);
-    const LONG alturaDestino = static_cast<LONG>(
-        static_cast<double>(larguraDestino) * alturaCamera / larguraCamera);
+    // O que sobrar entre os pedaços fica preto, e não com lixo do quadro
+    // anterior. Com duas telas de proporções diferentes lado a lado sempre
+    // sobra faixa.
+    const D3D11_VIDEO_COLOR preto{{0.0f, 0.0f, 0.0f, 1.0f}};
+    d_->videoContexto->VideoProcessorSetOutputBackgroundColor(d_->processador.Get(), FALSE, &preto);
 
-    RECT canto{};
-    canto.right = static_cast<LONG>(d_->largura) - margem;
-    canto.bottom = static_cast<LONG>(d_->altura) - margem;
-    canto.left = canto.right - larguraDestino;
-    canto.top = canto.bottom - alturaDestino;
-
-    d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), 1, TRUE, &canto);
-    d_->videoContexto->VideoProcessorSetStreamFrameFormat(d_->processador.Get(), 1,
-                                                          D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-    d_->videoContexto->VideoProcessorSetStreamAutoProcessingMode(d_->processador.Get(), 1, FALSE);
-
-    d_->comSobreposicao = true;
-    info("camera no quadro: {}x{} no canto, sobre {}x{}", larguraDestino, alturaDestino,
-         d_->largura, d_->altura);
+    d_->pedacos = static_cast<UINT>(pedacos.size());
     return true;
 }
 
-void ColorConverter::desligarSobreposicao() {
-    if (!d_->comSobreposicao) return;
-    d_->comSobreposicao = false;
-    if (d_->processador && d_->videoContexto) {
-        d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), 1, FALSE,
+void ColorConverter::desligarComposicao() {
+    if (d_->pedacos <= 1) return;
+    for (UINT i = 1; i < d_->pedacos; ++i) {
+        d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), i, FALSE,
                                                            nullptr);
     }
+    d_->pedacos = 1;
 }
 
-ID3D11Texture2D* ColorConverter::converter(ID3D11Texture2D* entradaBgra,
-                                           ID3D11Texture2D* sobreposicao) {
-    if (!d_->processador || !entradaBgra) return nullptr;
+ID3D11Texture2D* ColorConverter::compor(const std::vector<ID3D11Texture2D*>& entradas) {
+    if (!d_->processador || entradas.empty()) return nullptr;
 
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC descricao{};
     descricao.FourCC = 0;
@@ -266,42 +277,49 @@ ID3D11Texture2D* ColorConverter::converter(ID3D11Texture2D* entradaBgra,
     descricao.Texture2D.MipSlice = 0;
     descricao.Texture2D.ArraySlice = 0;
 
-    ComPtr<ID3D11VideoProcessorInputView> vistaEntrada;
-    HRESULT resultado = d_->videoDevice->CreateVideoProcessorInputView(
-        entradaBgra, d_->enumerador.Get(), &descricao, &vistaEntrada);
-    if (FAILED(resultado)) {
-        erro("CreateVideoProcessorInputView falhou: {}", hr(resultado));
-        return nullptr;
-    }
+    // As vistas são criadas por quadro. Guardá-las não adiantaria: as texturas
+    // andam em rodízio, e a vista fica presa à textura de onde saiu.
+    //
+    // Elas precisam continuar VIVAS até o Blt terminar, e por isso ficam neste
+    // vetor em vez de numa variável dentro do laço.
+    std::vector<ComPtr<ID3D11VideoProcessorInputView>> vistas(entradas.size());
+    std::vector<D3D11_VIDEO_PROCESSOR_STREAM> fluxos(entradas.size());
 
-    D3D11_VIDEO_PROCESSOR_STREAM fluxos[2]{};
-    fluxos[0].Enable = TRUE;
-    fluxos[0].pInputSurface = vistaEntrada.Get();
-    UINT total = 1;
-
-    // A vista da câmera é criada por quadro, como a principal. Guardá-la entre
-    // quadros não daria nada: a textura alterna entre duas a cada quadro, e a
-    // vista está presa à textura de onde saiu.
-    ComPtr<ID3D11VideoProcessorInputView> vistaCamera;
-    if (d_->comSobreposicao && sobreposicao) {
-        resultado = d_->videoDevice->CreateVideoProcessorInputView(
-            sobreposicao, d_->enumerador.Get(), &descricao, &vistaCamera);
-        if (SUCCEEDED(resultado)) {
-            fluxos[1].Enable = TRUE;
-            fluxos[1].pInputSurface = vistaCamera.Get();
-            total = 2;
-        } else {
-            // Um aviso por quadro encheria o log; o quadro sai sem a câmera e
-            // a transmissão continua, que é o que importa.
-            fluxos[1].Enable = FALSE;
+    UINT total = 0;
+    for (size_t i = 0; i < entradas.size(); ++i) {
+        fluxos[i] = {};
+        // Entrada que ainda não chegou é pulada, e o resto do quadro sai
+        // normalmente. É o caso do primeiro segundo, quando a câmera ou o
+        // segundo monitor ainda não entregaram nada.
+        if (!entradas[i]) {
+            fluxos[i].Enable = FALSE;
+            total = static_cast<UINT>(i + 1);
+            continue;
         }
+        const HRESULT resultado = d_->videoDevice->CreateVideoProcessorInputView(
+            entradas[i], d_->enumerador.Get(), &descricao, &vistas[i]);
+        if (FAILED(resultado)) {
+            // Uma linha por quadro encheria o log; só a primeira interessa.
+            if (d_->ultimoErroVista != resultado) {
+                d_->ultimoErroVista = resultado;
+                erro("CreateVideoProcessorInputView falhou: {}", hr(resultado));
+            }
+            fluxos[i].Enable = FALSE;
+            total = static_cast<UINT>(i + 1);
+            continue;
+        }
+        fluxos[i].Enable = TRUE;
+        fluxos[i].pInputSurface = vistas[i].Get();
+        total = static_cast<UINT>(i + 1);
     }
+
+    if (total == 0) return nullptr;
 
     const size_t indice = d_->proximaSaida;
     d_->proximaSaida = (d_->proximaSaida + 1) % Interno::kSaidas;
 
-    resultado = d_->videoContexto->VideoProcessorBlt(
-        d_->processador.Get(), d_->vistaSaida[indice].Get(), 0, total, fluxos);
+    const HRESULT resultado = d_->videoContexto->VideoProcessorBlt(
+        d_->processador.Get(), d_->vistaSaida[indice].Get(), 0, total, fluxos.data());
     if (FAILED(resultado)) {
         erro("VideoProcessorBlt falhou: {}", hr(resultado));
         return nullptr;

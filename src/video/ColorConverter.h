@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -40,26 +41,43 @@ public:
                  uint32_t larguraSaida, uint32_t alturaSaida,
                  Saida formatoSaida = Saida::Nv12, uint32_t graus = 0);
 
-    // Liga a segunda entrada: a câmera, desenhada num canto do quadro.
+    // Onde cada imagem cai dentro do quadro final, em pixels da saída.
+    struct Pedaco {
+        int32_t esquerda = 0;
+        int32_t topo = 0;
+        int32_t direita = 0;
+        int32_t baixo = 0;
+
+        // Giro do monitor de onde esta imagem veio. Cada tela tem o seu: um
+        // monitor em pe ao lado de um deitado e o caso comum de quem tem dois.
+        uint32_t graus = 0;
+    };
+
+    // Monta a composição: uma entrada por pedaço, na mesma ordem.
     //
     // É o Video Processor quem compõe, na mesma passada da conversão de cor.
-    // Fazer a composição depois, num shader ou na CPU, custaria uma passada
-    // inteira sobre 1080p por quadro; aqui custa zero, porque a unidade de
-    // função fixa da placa já está lendo os dois de qualquer jeito.
+    // Fazer isso depois, num shader ou na CPU, custaria uma passada inteira
+    // sobre o quadro; aqui custa zero, porque a unidade de função fixa da placa
+    // já está lendo tudo de qualquer jeito.
     //
-    // Devolve falso quando a placa não aceita duas entradas ou não aceita NV12
-    // na entrada — e aí quem chama transmite só a tela, sem câmera.
-    bool prepararSobreposicao(uint32_t larguraCamera, uint32_t alturaCamera);
-    void desligarSobreposicao();
+    // É assim que duas telas cabem lado a lado e a câmera cabe no canto, sem
+    // nada disso virar uma segunda faixa de vídeo — que o servidor não aceita.
+    //
+    // Devolve falso quando a placa não aceita tantas entradas ou não aceita os
+    // formatos; aí quem chama compõe menos coisa.
+    bool prepararComposicao(const std::vector<Pedaco>& pedacos);
+    void desligarComposicao();
 
     // A textura devolvida pertence ao conversor e é reaproveitada a cada
     // quadro — quem consome precisa fazê-lo antes da próxima chamada.
     //
-    // sobreposicao é opcional: quando vem, entra no canto combinado em
-    // prepararSobreposicao. Passar nullptr desenha só a entrada principal, o
-    // que é o caso de todo quadro em que a câmera ainda não entregou nada.
-    ID3D11Texture2D* converter(ID3D11Texture2D* entrada,
-                               ID3D11Texture2D* sobreposicao = nullptr);
+    // Sem composição montada, usa só a primeira entrada, no quadro inteiro.
+    // Entrada nula é pulada: é o caso de todo quadro em que uma das telas (ou
+    // a câmera) ainda não entregou nada, e o resto continua saindo.
+    ID3D11Texture2D* compor(const std::vector<ID3D11Texture2D*>& entradas);
+
+    // Atalho para o caminho de uma imagem só, que é o da exibição.
+    ID3D11Texture2D* converter(ID3D11Texture2D* entrada) { return compor({entrada}); }
 
     uint32_t largura() const;
     uint32_t altura() const;
