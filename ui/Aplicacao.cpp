@@ -252,6 +252,25 @@ struct Aplicacao::Interno {
         temVideo.notify_all();
         if (threadVideo.joinable()) threadVideo.join();
     }
+
+    /// Solta a câmera antes de o dispositivo D3D morrer.
+    ///
+    /// As texturas dela pertencem ao dispositivo da captura, e trocar de
+    /// monitor cria um novo. Deixar a câmera viva por cima disso é ficar com
+    /// ponteiro para memória de uma GPU que já não é a nossa.
+    void soltarCameraDoDispositivo() {
+        camera.parar();
+        cameraNaTelaPronta = false;
+        render.esquecerVideo("camera");
+    }
+
+    /// Reabre a câmera escolhida no dispositivo atual, se houver uma.
+    void reabrirCamera() {
+        if (cameraEscolhida.empty()) return;
+        if (!camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto())) {
+            cameraEscolhida.clear();
+        }
+    }
     void lacoDecodificacao();
     std::vector<std::shared_ptr<ConexaoPar>> destinosVideo;
     Signaling sinal;
@@ -293,6 +312,38 @@ struct Aplicacao::Interno {
     /// qualidade: derrubar as conexões para acender uma webcam faria todo mundo
     /// na sala perder a imagem por dois segundos.
     void aplicarCamera();
+
+    // Prévia da câmera na interface.
+    //
+    // A câmera entrega NV12 e o desenho quer BGRA, então precisa de um
+    // conversor próprio - o do encoder vai no sentido contrário e está montado
+    // no tamanho da tela, não no da webcam.
+    //
+    // Sem isto a pessoa escolhia a câmera e não via nada: ela ia para dentro do
+    // quadro codificado, que só quem está do outro lado enxerga. Escolher a
+    // câmera sem poder se enquadrar é escolher no escuro.
+    ColorConverter cameraNaTela;
+    bool cameraNaTelaPronta = false;
+    uint32_t cameraNaTelaL = 0;
+    uint32_t cameraNaTelaA = 0;
+
+    ID3D11Texture2D* previaDaCamera() {
+        ID3D11Texture2D* nv12 = camera.quadro();
+        if (!nv12) return nullptr;
+
+        const uint32_t l = camera.largura();
+        const uint32_t a = camera.altura();
+        if (l == 0 || a == 0) return nullptr;
+
+        if (!cameraNaTelaPronta || cameraNaTelaL != l || cameraNaTelaA != a) {
+            cameraNaTelaPronta = cameraNaTela.iniciar(tela.dispositivo(), tela.contexto(), l, a, l,
+                                                      a, ColorConverter::Saida::Bgra);
+            cameraNaTelaL = l;
+            cameraNaTelaA = a;
+            if (!cameraNaTelaPronta) return nullptr;
+        }
+        return cameraNaTela.converter(nv12);
+    }
 
     // Volume do que chega da chamada, de 0 a 100.
     int volumeDaChamada = 100;
@@ -742,6 +793,11 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
         aviso("comecando sem captura de tela; sera aberta quando der");
     }
 
+    // A câmera guardada abre junto com o dispositivo, e não só quando a
+    // transmissão começa: quem deixou a câmera ligada da última vez espera
+    // se ver na tela ao abrir o programa, não depois de apertar TRANSMITIR.
+    d_->reabrirCamera();
+
     Signaling::Ouvintes ouvintes;
     // Saida de audio e decodificador de pe antes de qualquer pacote chegar.
     // Abrir COM e criar thread dentro do callback da rede e trabalho pesado no
@@ -830,6 +886,7 @@ void Aplicacao::Interno::refazerDispositivo() {
 
     const bool estavaTransmitindo = transmitindo;
     pararEncodeSomente();
+    soltarCameraDoDispositivo();
 
     {
         std::lock_guard travaTela(travaCaptura);
@@ -868,6 +925,8 @@ void Aplicacao::Interno::refazerDispositivo() {
         }
     }
 
+    reabrirCamera();
+
     // A thread do decodificador renasce sozinha no próximo quadro que chegar:
     // é o mesmo caminho da primeira vez.
     if (estavaTransmitindo) comecarTransmissao();
@@ -881,6 +940,9 @@ int Aplicacao::rodar() {
             if (msg.message == WM_QUIT) {
                 d_->pararTransmissao();
                 d_->pararDecodificacao();
+                // A camera segue aberta fora do ar, para a previa. Fechar aqui
+                // e o que apaga a luzinha ao sair do programa.
+                d_->camera.parar();
                 d_->sinal.sair();
                 return static_cast<int>(msg.wParam);
             }
@@ -1174,17 +1236,20 @@ bool Aplicacao::Interno::comecarTransmissao() {
         return false;
     }
 
-    // A câmera é aberta depois do conversor de propósito: só aí se sabe o
-    // tamanho do quadro final, que é o que define onde ela cabe no canto.
+    // A sobreposição é preparada depois do conversor de propósito: só aí se
+    // sabe o tamanho do quadro final, que é o que define onde a câmera cabe no
+    // canto.
+    //
+    // A câmera em si já costuma estar aberta - ela abre quando é escolhida,
+    // para a prévia. Aqui ela só é aberta quando a transmissão começa antes de
+    // alguém ter mexido na lista, que é o caso de quem já tinha a câmera
+    // guardada no config.
     if (!cameraEscolhida.empty()) {
-        if (camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto())) {
-            if (!conversor.prepararSobreposicao(camera.largura(), camera.altura())) {
-                camera.parar();
-            }
-        } else {
-            // Câmera ocupada ou desligada não impede a transmissão da tela.
-            // Some da interface por si só, porque a lista é relida na hora.
-            cameraEscolhida.clear();
+        if (!camera.ativa()) {
+            camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto());
+        }
+        if (camera.ativa()) {
+            conversor.prepararSobreposicao(camera.largura(), camera.altura());
         }
     }
 
@@ -1295,7 +1360,6 @@ void Aplicacao::Interno::pararTransmissao() {
              chamadasAudio.load());
     }
     audio.parar();
-    camera.parar();
     enviandoAudio.store(false);
     if (threadAudio.joinable()) threadAudio.join();
     escritaAudio.store(0);
@@ -1344,11 +1408,6 @@ void Aplicacao::Interno::pararEncodeSomente() {
     enviandoAudio.store(false);
     if (threadAudio.joinable()) threadAudio.join();
 
-    // A câmera para junto com o encoder: sem transmissão ela não é vista por
-    // ninguém, e deixá-la aberta manteria a luzinha acesa - que é a coisa que
-    // mais assusta quem instala um programa de tela.
-    camera.parar();
-
     std::lock_guard travaTela(travaCaptura);
     encoder.parar();
     audioEnc.parar();
@@ -1394,13 +1453,32 @@ void Aplicacao::Interno::alternarTelaCheia() {
     }
 }
 
-// Acender ou apagar a câmera é uma troca de fonte como outra qualquer.
+// Acender ou apagar a câmera.
 //
-// Fora do ar não há o que refazer: a câmera é aberta no comecarTransmissao,
-// junto com o conversor que define onde ela cabe. Guardar a escolha basta.
+// Ela abre na hora em que é escolhida, e não só quando a transmissão começa: a
+// pessoa precisa se ver para saber se está enquadrada, e "clico e não acontece
+// nada até eu transmitir" é o mesmo que não ter câmera. Escolher "Desligada"
+// fecha o dispositivo de verdade - a luzinha apaga.
 void Aplicacao::Interno::aplicarCamera() {
     config.camera = cameraEscolhida;
     config.salvar();
+
+    if (cameraEscolhida.empty()) {
+        camera.parar();
+        cameraNaTelaPronta = false;
+        render.esquecerVideo("camera");
+    } else if (!camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto())) {
+        // Câmera ocupada por outro programa, ou desligada entre a listagem e o
+        // clique. Volta a escolha para "Desligada" em vez de deixar a linha
+        // marcada mostrando nada.
+        cameraEscolhida.clear();
+        config.camera.clear();
+        config.salvar();
+        aviso = L"Não foi possível abrir essa câmera. Ela pode estar em uso.";
+    }
+
+    // Só depois: é o conversor do encoder que precisa saber que agora há uma
+    // segunda entrada, e ele só existe transmitindo.
     reiniciarEncode();
 }
 
@@ -2015,6 +2093,10 @@ void Aplicacao::Interno::clique(float x, float y) {
                 // renegociacao seguinte falhava.
                 pararEncodeSomente();
 
+                // A câmera guarda texturas do dispositivo D3D atual, e trocar
+                // de monitor cria outro. Ela volta logo abaixo, no novo.
+                soltarCameraDoDispositivo();
+
                 // O renderizador vive no dispositivo D3D11 da captura. Trocar de
                 // monitor destrói esse dispositivo, então ele precisa soltar
                 // tudo ANTES - senão fica com uma cadeia de troca apontando para
@@ -2067,6 +2149,7 @@ void Aplicacao::Interno::clique(float x, float y) {
                     aviso = L"A troca de monitor falhou. Reabra o aplicativo.";
                     return;
                 }
+                reabrirCamera();
                 if (estavaTransmitindo) comecarTransmissao();
             }
             return;
@@ -2338,6 +2421,33 @@ void Aplicacao::Interno::desenharAoVivo() {
         render.video(escolhida->id, escolhida->quadro, dentroDoPalco);
     } else {
         render.video("previa", previaDaTela(), dentroDoPalco);
+
+        // A câmera por cima da própria tela, no mesmo canto em que ela vai
+        // dentro do quadro que os outros recebem.
+        //
+        // Aqui é uma segunda imagem desenhada em cima; lá é uma composição do
+        // Video Processor. São caminhos diferentes de propósito - o que sai na
+        // transmissão precisa ser um quadro só, e o que aparece aqui precisa
+        // aparecer mesmo sem transmissão nenhuma acontecendo. O que importa é
+        // que o enquadramento seja o mesmo, e é.
+        if (ID3D11Texture2D* cam = previaDaCamera()) {
+            const D2D1_RECT_F v = render.areaDoVideo("previa");
+            const bool temTela = render.temQuadro("previa") && v.right > v.left;
+            const D2D1_RECT_F base = temTela ? v : dentroDoPalco;
+
+            const float larguraBase = base.right - base.left;
+            const float margem = larguraBase / 48.0f;
+            const float larguraCam = larguraBase / 4.0f;
+            const float alturaCam =
+                larguraCam * static_cast<float>(camera.altura()) / camera.largura();
+
+            const auto canto = D2D1::RectF(base.right - margem - larguraCam,
+                                           base.bottom - margem - alturaCam,
+                                           base.right - margem, base.bottom - margem);
+            render.retangulo(canto, tema::kFundo, 6);
+            render.video("camera", cam, canto);
+            render.contorno(canto, tema::kVerdeLinha, 6);
+        }
     }
 
     if (!render.temQuadro(escolhida ? escolhida->id : std::string("previa"))) {
@@ -2380,10 +2490,11 @@ void Aplicacao::Interno::desenharAoVivo() {
             if (doOutroLargura > 0) texto += L"  ·  " + std::to_wstring(doOutroLargura) + L"p";
             corTexto = tema::kVerde;
         } else if (transmitindo) {
-            texto = L"●  AO VIVO  ·  sua tela";
+            texto = camera.ativa() ? L"●  AO VIVO  ·  sua tela e sua câmera"
+                                   : L"●  AO VIVO  ·  sua tela";
             corTexto = tema::kVerde;
         } else {
-            texto = L"sua tela";
+            texto = camera.ativa() ? L"sua tela e sua câmera" : L"sua tela";
         }
 
         // Ancorada no VÍDEO, não no palco.
