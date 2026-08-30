@@ -59,6 +59,10 @@ inline constexpr D2D1_COLOR_F kTransparente = cor(0x000000, 0.0f);
 inline constexpr float kAlturaTitulo = 38.0f;
 inline constexpr float kLarguraBotaoTitulo = 46.0f;
 
+// A barra de acoes, o cartao logo abaixo da barra de titulo: marca, estado da
+// sala e as acoes do aplicativo.
+inline constexpr float kAlturaAcoes = 56.0f;
+
 inline constexpr float kRaioCartao = 18.0f;
 inline constexpr float kRaioBotao = 12.0f;
 inline constexpr float kEspaco = 14.0f;

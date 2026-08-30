@@ -35,6 +35,9 @@ struct Config {
     // As cameras que vao na transmissao, pelo caminho do dispositivo.
     std::vector<std::string> cameras;
 
+    // Em quantos quadros o palco se divide: 1, 2 ou 4.
+    int divisoes = 1;
+
     // Servidores já usados, do mais recente para o mais antigo. Quem entra numa
     // sala hoje volta nela amanhã, e digitar o endereço de novo toda vez é o
     // tipo de atrito que faz a pessoa desistir.

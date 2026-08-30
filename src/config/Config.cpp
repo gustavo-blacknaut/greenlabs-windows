@@ -77,6 +77,8 @@ Config Config::carregar() {
     for (const Json& item : json.filho("telas").itens()) {
         if (item.tipo() == Json::Tipo::Numero) c.telas.push_back(static_cast<int>(item.comoNumero()));
     }
+    c.divisoes = static_cast<int>(json.numero("divisoes", padrao.divisoes));
+    if (c.divisoes != 1 && c.divisoes != 2 && c.divisoes != 4) c.divisoes = 1;
     for (const Json& item : json.filho("cameras").itens()) {
         if (item.tipo() == Json::Tipo::Texto && !item.comoTexto().empty()) {
             c.cameras.push_back(item.comoTexto());
@@ -113,6 +115,7 @@ void Config::salvar() const {
     Json listaTelas = Json::lista();
     for (int t : telas) listaTelas.adicionar(Json{t});
     json["telas"] = listaTelas;
+    json["divisoes"] = Json{divisoes};
 
     Json listaCameras = Json::lista();
     for (const auto& c : cameras) listaCameras.adicionar(Json{c});
