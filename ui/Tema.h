@@ -35,6 +35,10 @@ inline constexpr D2D1_COLOR_F kPainel3     = cor(0xFFFFFF, 0.085f);  // --panel-
 inline constexpr D2D1_COLOR_F kLinha       = cor(0xFFFFFF, 0.08f);   // --line
 inline constexpr D2D1_COLOR_F kApagado     = cor(0x93A3B3);          // --muted
 inline constexpr D2D1_COLOR_F kVermelho    = cor(0xFF6B6B);
+// O vermelho do botao de parar em repouso: mais escuro que o de realce, pelo
+// mesmo motivo do verde - quem esta transmitindo nao precisa de um botao
+// gritando na lateral o tempo todo.
+inline constexpr D2D1_COLOR_F kVermelhoSuave = cor(0xB3413F);
 // O amarelo do aviso do servidor, o mesmo do .aviso-servidor do Electron.
 inline constexpr D2D1_COLOR_F kAmarelo     = cor(0xFFC857);
 
