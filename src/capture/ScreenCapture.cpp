@@ -247,6 +247,36 @@ bool ScreenCapture::iniciar(uint32_t indiceMonitor) {
 
 bool ScreenCapture::Interno::criarDuplicacao() {
     duplicacao.Reset();
+
+    // As medidas do monitor são relidas aqui, e não só no iniciar().
+    //
+    // A resolução muda enquanto o programa roda - jogo que troca o modo de
+    // vídeo, monitor reconectado, a pessoa mexendo nas configurações de tela.
+    // O DXGI derruba a duplicação nesses momentos, o laço a refaz, e antes
+    // disto o `info` continuava com o tamanho ANTIGO: o encoder seguia
+    // montado para 1920x1080 enquanto a tela já entregava 1024x768, e o que
+    // saía era imagem esticada ou nada.
+    //
+    // A rotação vem junto pelo mesmo motivo - girar o monitor também derruba a
+    // duplicação, e a saída chegava deitada até o programa ser reaberto.
+    DXGI_OUTPUT_DESC descricao{};
+    if (SUCCEEDED(saida->GetDesc(&descricao))) {
+        const auto largura = static_cast<uint32_t>(descricao.DesktopCoordinates.right -
+                                                   descricao.DesktopCoordinates.left);
+        const auto altura = static_cast<uint32_t>(descricao.DesktopCoordinates.bottom -
+                                                  descricao.DesktopCoordinates.top);
+        const uint32_t graus = grausDe(descricao.Rotation);
+        if (largura != info.largura || altura != info.altura || graus != info.graus) {
+            if (info.largura != 0) {
+                gl::info("o monitor mudou de {}x{} para {}x{}", info.largura, info.altura,
+                         largura, altura);
+            }
+            info.largura = largura;
+            info.altura = altura;
+            info.graus = graus;
+        }
+    }
+
     const HRESULT resultado = saida->DuplicateOutput(dispositivo.Get(), &duplicacao);
     if (FAILED(resultado)) {
         if (resultado == E_ACCESSDENIED) {
