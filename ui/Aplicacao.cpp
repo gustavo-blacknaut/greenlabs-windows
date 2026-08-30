@@ -22,6 +22,7 @@
 #include "audio/AudioCodec.h"
 #include "audio/AudioPlayer.h"
 #include "capture/AudioCapture.h"
+#include "capture/CameraCapture.h"
 #include "capture/Cursor.h"
 #include "config/Config.h"
 #include "capture/ProcessTree.h"
@@ -149,6 +150,9 @@ struct Aplicacao::Interno {
     // uma pessoa por vez.
     struct Transmissao {
         std::string id;
+        // Quem transmite. Vem do identificador da faixa; vazio enquanto o dono
+        // ainda nao apareceu na lista de participantes.
+        std::string dono;
         std::string nome;
         VideoDecoder decodificador;
         bool decodificadorPronto = false;
@@ -270,6 +274,26 @@ struct Aplicacao::Interno {
     bool audioLigado = true;
     D2D1_RECT_F btAudio{};
 
+    // Câmera.
+    //
+    // Ela NÃO vai numa segunda faixa de vídeo: o servidor abre um transceiver
+    // de vídeo por pessoa, e o id da faixa de saída é montado a partir do dono
+    // mais o tipo - duas faixas de vídeo do mesmo dono colidiriam e a segunda
+    // seria descartada em silêncio. A câmera entra COMPOSTA no mesmo quadro,
+    // pelo Video Processor, e por isso quem assiste pelo Electron ou pelo
+    // celular a vê sem que nada mude do lado deles.
+    CameraCapture camera;
+    std::vector<CameraInfo> cameras;
+    std::string cameraEscolhida;  // vazio = desligada
+    std::vector<D2D1_RECT_F> btCameras;
+
+    /// Liga ou desliga a câmera sem derrubar a conexão.
+    ///
+    /// Só mexe no encoder e no conversor, pelo mesmo caminho da troca de
+    /// qualidade: derrubar as conexões para acender uma webcam faria todo mundo
+    /// na sala perder a imagem por dois segundos.
+    void aplicarCamera();
+
     // Volume do que chega da chamada, de 0 a 100.
     int volumeDaChamada = 100;
     D2D1_RECT_F barraVolume{};
@@ -287,6 +311,61 @@ struct Aplicacao::Interno {
     }
     bool transmitindo = false;
     std::wstring aviso;
+
+    // Onde o ponteiro está.
+    //
+    // O desenho aqui é imediato: nada guarda estado de "este botão está sob o
+    // cursor". Guardar a posição do último movimento é o que permite a um botão
+    // se acender ao ser apontado - e sem isso a interface inteira parecia
+    // morta, porque nada respondia antes do clique.
+    float mouseX = -1;
+    float mouseY = -1;
+
+    // Recalculado a cada desenho, para o ponteiro virar mãozinha em cima do que
+    // é clicável. Sem isto não havia como saber o que era botão e o que era
+    // enfeite.
+    bool sobreClicavel = false;
+
+    bool sobre(const D2D1_RECT_F& area) const {
+        return mouseX >= area.left && mouseX <= area.right && mouseY >= area.top &&
+               mouseY <= area.bottom;
+    }
+
+    /// Marca a área como clicável para o quadro atual e diz se o ponteiro está
+    /// nela. Usar isto em vez de sobre() é o que mantém o cursor certo.
+    bool apontando(const D2D1_RECT_F& area) {
+        if (!sobre(area)) return false;
+        sobreClicavel = true;
+        return true;
+    }
+
+    // Rolagem do painel lateral.
+    //
+    // O painel empilhava monitores, qualidades, câmeras, som, volume, a sala
+    // inteira e um cartão por transmissão numa coluna de altura fixa. Com
+    // quatro pessoas na sala o fim da lista passava por baixo dos botões, e
+    // clicar num nome acertava o SAIR. Agora a lista rola e o que sai da área
+    // é recortado.
+    float rolagem = 0;
+    float alturaConteudo = 0;
+    float alturaVisivel = 0;
+    D2D1_RECT_F areaRolavel{};
+
+    void rolar(float passos) {
+        const float limite = alturaConteudo - alturaVisivel;
+        if (limite <= 0) { rolagem = 0; return; }
+        rolagem -= passos * 48.0f;
+        if (rolagem < 0) rolagem = 0;
+        if (rolagem > limite) rolagem = limite;
+    }
+
+    // Tela cheia: o palco ocupando a janela inteira, sem painel.
+    //
+    // É o que se quer quando a chamada vira "assistir alguém jogar" - e era a
+    // única coisa que o cliente em Electron fazia e este não.
+    bool telaCheia = false;
+    WINDOWPLACEMENT lugarAntes{sizeof(WINDOWPLACEMENT)};
+    void alternarTelaCheia();
 
     // O quadro mais recente da captura, para a prévia. A textura é da própria
     // duplicação e vale só até o próximo liberarQuadro().
@@ -463,13 +542,65 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
             }
             return 0;
 
-        // Arrastar na barra de volume. Sem estes dois, so daria para clicar num
-        // ponto - e ajustar volume e coisa que se faz arrastando e ouvindo.
-        case WM_MOUSEMOVE:
-            if (d && d->arrastandoVolume && (w & MK_LBUTTON)) {
-                d->ajustarVolumePor(static_cast<float>(GET_X_LPARAM(l)));
+        // Duplo clique no palco abre e fecha a tela cheia, como em todo
+        // reprodutor de vídeo. É onde a mão já está quando dá vontade.
+        case WM_LBUTTONDBLCLK:
+            if (d) {
+                const float x = static_cast<float>(GET_X_LPARAM(l));
+                const float y = static_cast<float>(GET_Y_LPARAM(l));
+                if (d->telaAtual == Tela::AoVivo && y > tema::kAlturaTitulo &&
+                    (d->telaCheia || x < d->render.largura() - tema::kLarguraPainelLateral -
+                                             2 * tema::kEspaco)) {
+                    d->alternarTelaCheia();
+                }
             }
             return 0;
+
+        // Guardar a posição a cada movimento é o que alimenta o realce do que
+        // está sob o ponteiro. O arrasto do volume vem junto: sem ele só daria
+        // para clicar num ponto, e volume é coisa que se acerta arrastando e
+        // ouvindo.
+        case WM_MOUSEMOVE:
+            if (d) {
+                d->mouseX = static_cast<float>(GET_X_LPARAM(l));
+                d->mouseY = static_cast<float>(GET_Y_LPARAM(l));
+                if (d->arrastandoVolume && (w & MK_LBUTTON)) d->ajustarVolumePor(d->mouseX);
+
+                // O Windows só manda WM_MOUSELEAVE para quem pediu, e o pedido
+                // vale uma vez só - por isso é renovado a cada movimento.
+                TRACKMOUSEEVENT rastro{sizeof(rastro), TME_LEAVE, janela, 0};
+                ::TrackMouseEvent(&rastro);
+            }
+            return 0;
+
+        // O ponteiro saiu da janela: nada mais está sob ele. Sem isto o último
+        // botão apontado ficava aceso para sempre depois que a mão saía.
+        case WM_MOUSELEAVE:
+            if (d) { d->mouseX = -1; d->mouseY = -1; }
+            return 0;
+
+        case WM_MOUSEWHEEL:
+            if (d) {
+                // A coordenada da roda vem em tela, não em cliente.
+                POINT p{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ::ScreenToClient(janela, &p);
+                const auto x = static_cast<float>(p.x);
+                const auto y = static_cast<float>(p.y);
+                if (x >= d->areaRolavel.left && x <= d->areaRolavel.right &&
+                    y >= d->areaRolavel.top && y <= d->areaRolavel.bottom) {
+                    d->rolar(static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA);
+                }
+            }
+            return 0;
+
+        // Mãozinha em cima do que é clicável. O que decide é o desenho do
+        // quadro anterior, que já sabe onde cada botão caiu.
+        case WM_SETCURSOR:
+            if (d && LOWORD(l) == HTCLIENT && d->sobreClicavel) {
+                ::SetCursor(::LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            return ::DefWindowProcW(janela, msg, w, l);
 
         case WM_LBUTTONUP:
             if (d && d->arrastandoVolume) {
@@ -479,6 +610,16 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
                 d->config.salvar();
             }
             return 0;
+
+        // F11 entra e sai da tela cheia; Esc só sai. É o par que todo navegador
+        // e todo reprodutor usa, e teclar Esc é o primeiro reflexo de quem se
+        // vê preso numa janela sem bordas.
+        case WM_KEYDOWN:
+            if (d && d->telaAtual == Tela::AoVivo) {
+                if (w == VK_F11) { d->alternarTelaCheia(); return 0; }
+                if (w == VK_ESCAPE && d->telaCheia) { d->alternarTelaCheia(); return 0; }
+            }
+            return ::DefWindowProcW(janela, msg, w, l);
 
         case WM_CHAR:
             if (d) d->tecla(static_cast<wchar_t>(w));
@@ -506,6 +647,9 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
 
     WNDCLASSEXW classe{};
     classe.cbSize = sizeof(classe);
+    // Sem CS_DBLCLKS o Windows nunca manda WM_LBUTTONDBLCLK: os dois cliques
+    // chegam como dois cliques soltos, e o duplo clique do palco não existiria.
+    classe.style = CS_DBLCLKS;
     classe.lpfnWndProc = procedimento;
     classe.hInstance = ::GetModuleHandleW(nullptr);
     classe.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
@@ -542,6 +686,16 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     d_->audioLigado = d_->config.audio;
     d_->volumeDaChamada = (d_->config.volume >= 0 && d_->config.volume <= 100) ? d_->config.volume : 100;
     d_->alto.definirVolume(static_cast<float>(d_->volumeDaChamada) / 100.0f);
+
+    // A lista de câmeras é montada agora, mas nenhuma é aberta: enumerar não
+    // acende a luzinha de ninguém. A escolhida só é aberta quando a
+    // transmissão começa.
+    d_->cameras = CameraCapture::listar();
+    for (const auto& c : d_->cameras) {
+        info("camera encontrada: {} ({})", c.nome, c.id);
+        if (c.id == d_->config.camera) d_->cameraEscolhida = c.id;
+    }
+    if (d_->cameras.empty()) info("nenhuma camera no computador");
 
     d_->monitores = ScreenCapture::listarMonitores();
     if (d_->monitores.empty()) {
@@ -869,7 +1023,10 @@ void Aplicacao::Interno::bombearCaptura() {
                 // fps escolhido. Limitar de novo aqui, com o mesmo intervalo,
                 // só faria perder um quadro sim outro não por arredondamento.
                 ultimoEncode = agoraCaptura;
-                if (auto* nv12 = conversor.converter(quadroAtual)) {
+                // A câmera entra aqui, no mesmo Blt que converte a cor. Quando
+                // ela ainda não entregou quadro nenhum, quadro() devolve nulo e
+                // sai só a tela - sem buraco preto no canto esperando por ela.
+                if (auto* nv12 = conversor.converter(quadroAtual, camera.quadro())) {
                     encoder.codificar(nv12,
                                       std::chrono::duration_cast<std::chrono::microseconds>(
                                           agoraCaptura.time_since_epoch())
@@ -954,8 +1111,14 @@ bool Aplicacao::Interno::comecarTransmissao() {
     // Antes eu esticava qualquer tela para o tamanho fixo do preset, então um
     // monitor em pé era espremido para 16:9 e chegava achatado. Aqui a escala é
     // a mesma nos dois eixos, e o que sobra é resolução, não deformação.
-    const double escala = std::min(static_cast<double>(q.largura) / m.largura,
-                                   static_cast<double>(q.altura) / m.altura);
+    // E nunca AMPLIA.
+    //
+    // Sem o teto em 1, um monitor 1024x768 no preset de 1080p era esticado para
+    // 1440x1080: mais pixels para codificar, mais banda gasta, e nenhum detalhe
+    // a mais - o que chegava do outro lado era a mesma imagem, borrada. A
+    // qualidade escolhida é um limite, não uma meta.
+    const double escala = std::min(1.0, std::min(static_cast<double>(q.largura) / m.largura,
+                                                  static_cast<double>(q.altura) / m.altura));
     const uint32_t saidaL = static_cast<uint32_t>(m.largura * escala) & ~1u;
     const uint32_t saidaA = static_cast<uint32_t>(m.altura * escala) & ~1u;
 
@@ -963,6 +1126,20 @@ bool Aplicacao::Interno::comecarTransmissao() {
                            ColorConverter::Saida::Nv12, m.graus)) {
         aviso = L"Não foi possível preparar a conversão de cor.";
         return false;
+    }
+
+    // A câmera é aberta depois do conversor de propósito: só aí se sabe o
+    // tamanho do quadro final, que é o que define onde ela cabe no canto.
+    if (!cameraEscolhida.empty()) {
+        if (camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto())) {
+            if (!conversor.prepararSobreposicao(camera.largura(), camera.altura())) {
+                camera.parar();
+            }
+        } else {
+            // Câmera ocupada ou desligada não impede a transmissão da tela.
+            // Some da interface por si só, porque a lista é relida na hora.
+            cameraEscolhida.clear();
+        }
     }
 
     ConfigEncoder cfg;
@@ -1072,6 +1249,7 @@ void Aplicacao::Interno::pararTransmissao() {
              chamadasAudio.load());
     }
     audio.parar();
+    camera.parar();
     enviandoAudio.store(false);
     if (threadAudio.joinable()) threadAudio.join();
     escritaAudio.store(0);
@@ -1120,6 +1298,11 @@ void Aplicacao::Interno::pararEncodeSomente() {
     enviandoAudio.store(false);
     if (threadAudio.joinable()) threadAudio.join();
 
+    // A câmera para junto com o encoder: sem transmissão ela não é vista por
+    // ninguém, e deixá-la aberta manteria a luzinha acesa - que é a coisa que
+    // mais assusta quem instala um programa de tela.
+    camera.parar();
+
     std::lock_guard travaTela(travaCaptura);
     encoder.parar();
     audioEnc.parar();
@@ -1132,6 +1315,47 @@ void Aplicacao::Interno::reiniciarEncode() {
     if (!transmitindo) return;
     pararEncodeSomente();
     comecarTransmissao();
+}
+
+// Tela cheia de verdade: a janela cobre o monitor em que ela está.
+//
+// Não é maximizar. Maximizada, a barra de tarefas continua na frente e a barra
+// de título continua ocupando a faixa de cima - e quem pede tela cheia quer a
+// imagem, não a moldura. O lugar de antes fica guardado para a volta ser exata,
+// inclusive quando a janela estava maximizada.
+void Aplicacao::Interno::alternarTelaCheia() {
+    if (!telaCheia) {
+        ::GetWindowPlacement(janela, &lugarAntes);
+
+        // O monitor de onde a janela está, e não o primário: em duas telas,
+        // levar a janela para a outra ao entrar em tela cheia é o tipo de coisa
+        // que faz a pessoa achar que o aplicativo travou.
+        HMONITOR monitor = ::MonitorFromWindow(janela, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info{sizeof(MONITORINFO)};
+        if (!::GetMonitorInfoW(monitor, &info)) return;
+
+        telaCheia = true;
+        ::SetWindowPos(janela, HWND_TOP, info.rcMonitor.left, info.rcMonitor.top,
+                       info.rcMonitor.right - info.rcMonitor.left,
+                       info.rcMonitor.bottom - info.rcMonitor.top,
+                       SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    } else {
+        telaCheia = false;
+        ::SetWindowPlacement(janela, &lugarAntes);
+        ::SetWindowPos(janela, nullptr, 0, 0, 0, 0,
+                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+                           SWP_FRAMECHANGED);
+    }
+}
+
+// Acender ou apagar a câmera é uma troca de fonte como outra qualquer.
+//
+// Fora do ar não há o que refazer: a câmera é aberta no comecarTransmissao,
+// junto com o conversor que define onde ela cabe. Guardar a escolha basta.
+void Aplicacao::Interno::aplicarCamera() {
+    config.camera = cameraEscolhida;
+    config.salvar();
+    reiniciarEncode();
 }
 
 void Aplicacao::Interno::conectar() {
@@ -1257,10 +1481,33 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
             }
             t = espaco.get();
 
-            // Em modo retransmissor o peerId é sempre "sfu", então o nome vem
-            // da lista de participantes: quem está na sala e não somos nós.
+            // Em modo retransmissor o peerId é sempre "sfu": as pessoas não
+            // falam entre si, então o nome não chega por metadado. Ele sai do
+            // próprio identificador da faixa, que o servidor monta como
+            // "greenlabs-<8 primeiros do dono>-video".
+            //
+            // Antes daqui saía "o primeiro participante que não sou eu", o que
+            // acerta com duas pessoas na sala e erra com três - e numa chamada
+            // de grupo o nome errado embaixo da tela é pior do que nome nenhum.
             if (peerId == kIdDoSFU) {
                 std::lock_guard tp(travaPares);
+                //
+                // Só serve o identificador com a forma que o servidor monta:
+                // "greenlabs-" mais oito caracteres do dono. A faixa que NÓS
+                // publicamos chega aqui como "greenlabs-tela", que não tem essa
+                // forma - e tomá-la por um dono poria o nome de alguém embaixo
+                // da nossa própria imagem.
+                if (t->dono.empty() && faixaId.rfind("greenlabs-", 0) == 0 &&
+                    faixaId.size() >= 18) {
+                    const std::string prefixo = faixaId.substr(10, 8);
+                    for (const auto& p : pares) {
+                        if (p.id != meuId && p.id.rfind(prefixo, 0) == 0) {
+                            t->dono = p.id;
+                            t->nome = p.nome;
+                            break;
+                        }
+                    }
+                }
                 if (t->nome.empty()) {
                     for (const auto& p : pares) {
                         if (p.id != meuId) { t->nome = p.nome; break; }
@@ -1268,6 +1515,7 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
                     if (t->nome.empty()) t->nome = "Alguem na sala";
                 }
             } else if (t->nome.empty()) {
+                t->dono = peerId;
                 t->nome = peerId;
             }
             t->visto = std::chrono::steady_clock::now();
@@ -1672,6 +1920,44 @@ void Aplicacao::Interno::clique(float x, float y) {
         return;
     }
 
+    // Em tela cheia não há painel: qualquer clique que não seja nos controles
+    // da barra (que também não existe) é clique no palco, e o palco não faz
+    // nada com um clique simples. Sair é duplo clique, Esc ou F11.
+    if (telaCheia) return;
+
+    // O que rola só aceita clique dentro da própria janela de rolagem. Sem
+    // isto, um item que rolou para debaixo dos botões continuava sendo clicado
+    // - invisível, mas ativo.
+    const bool naAreaRolavel =
+        y >= areaRolavel.top && y <= areaRolavel.bottom;
+    if (!naAreaRolavel) {
+        if (dentro(btSair, x, y)) {
+            pararTransmissao();
+            sinal.sair();
+            conectado.store(false);
+            telaAtual = Tela::Entrada;
+            return;
+        }
+        if (dentro(btTransmitir, x, y)) {
+            if (transmitindo) pararTransmissao();
+            else comecarTransmissao();
+            return;
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < btCameras.size(); ++i) {
+        if (!dentro(btCameras[i], x, y)) continue;
+        // A primeira linha é "Desligada"; as seguintes são as câmeras na ordem
+        // em que foram enumeradas.
+        const std::string nova = (i == 0) ? std::string{} : cameras[i - 1].id;
+        if (nova != cameraEscolhida) {
+            cameraEscolhida = nova;
+            aplicarCamera();
+        }
+        return;
+    }
+
     for (size_t i = 0; i < btMonitores.size(); ++i) {
         if (dentro(btMonitores[i], x, y)) {
             const int novo = static_cast<int>(i);
@@ -1783,25 +2069,18 @@ void Aplicacao::Interno::clique(float x, float y) {
         return;
     }
 
-    if (dentro(btTransmitir, x, y)) {
-        if (transmitindo) pararTransmissao();
-        else comecarTransmissao();
-        return;
-    }
-    if (dentro(btSair, x, y)) {
-        pararTransmissao();
-        sinal.sair();
-        conectado.store(false);
-        telaAtual = Tela::Entrada;
-    }
 }
 
 // ---------------------------------------------------------------- desenho
 
 bool Aplicacao::Interno::desenharBotao(const D2D1_RECT_F& area, const std::wstring& rotulo,
                                        bool destaque, bool habilitado) {
-    const auto fundo = destaque ? tema::kVerdeSuave : tema::kPainel2;
-    const auto borda = destaque ? tema::kVerdeLinha : tema::kLinha;
+    // Apontar um botão desabilitado não acende nada e não vira mãozinha: o
+    // ponteiro é a primeira coisa que diz se vale a pena clicar.
+    const bool sob = habilitado && apontando(area);
+
+    const auto fundo = destaque ? tema::kVerdeSuave : (sob ? tema::kPainel3 : tema::kPainel2);
+    const auto borda = destaque ? tema::kVerdeLinha : (sob ? tema::kVerdeLinha : tema::kLinha);
     const auto corTexto = !habilitado ? tema::kApagado : (destaque ? tema::kVerde : tema::kTexto);
 
     render.retangulo(area, fundo, tema::kRaioBotao);
@@ -1894,6 +2173,18 @@ void Aplicacao::Interno::desenharEntrada() {
     btEntrar = D2D1::RectF(x + 36, y + 380, x + 36 + larguraCampo, y + 428);
     desenharBotao(btEntrar, L"ENTRAR NA SALA", true);
 
+    // O aviso vem ANTES da lista, dentro do cartão.
+    //
+    // Ele morava embaixo do cartão, no mesmo lugar do rótulo "SERVIDORES
+    // SALVOS" - as duas frases se sobrepunham, e "Conectando..." aparecia
+    // escrito por cima do rótulo. Aqui ele fica onde a pessoa está olhando: no
+    // botão que acabou de apertar.
+    if (!aviso.empty()) {
+        render.texto(aviso, D2D1::RectF(x + 36, y + 432, x + largCartao - 36, y + 456),
+                     aviso.rfind(L"Conectando", 0) == 0 ? tema::kApagado : tema::kVermelho,
+                     Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
     // Servidores já usados, como atalho. Clicar preenche o campo.
     btServidores.clear();
     if (!config.servidores.empty()) {
@@ -1917,11 +2208,6 @@ void Aplicacao::Interno::desenharEntrada() {
         }
     }
 
-    if (!aviso.empty()) {
-        render.texto(aviso, D2D1::RectF(x + 36, y + altCartao + 12, x + largCartao - 36,
-                                        y + altCartao + 40),
-                     tema::kVermelho, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
-    }
 }
 
 // A tela ao vivo.
@@ -1938,14 +2224,20 @@ void Aplicacao::Interno::desenharEntrada() {
 void Aplicacao::Interno::desenharAoVivo() {
     const float larg = render.largura();
     const float alt = render.altura();
-    const float topo = tema::kAlturaTitulo + tema::kEspaco;
-    const float painelX = larg - tema::kLarguraPainelLateral - tema::kEspaco;
+
+    // Em tela cheia não há painel nem barra: o palco é a janela. Os controles
+    // não somem por elegância - é que numa tela cheia eles ficariam por cima da
+    // imagem, e a imagem é o motivo de alguém pedir tela cheia.
+    const float topo = telaCheia ? 0.0f : tema::kAlturaTitulo + tema::kEspaco;
+    const float painelX =
+        telaCheia ? larg : larg - tema::kLarguraPainelLateral - tema::kEspaco;
 
     // Fotografia das transmissões deste quadro. Copiar o essencial sob trava e
     // desenhar fora dela: o desenho é longo e a trava é disputada com a thread
     // que decodifica.
     struct NaTela {
         std::string id;
+        std::string dono;
         std::wstring nome;
         ID3D11Texture2D* quadro;
         uint32_t largura;
@@ -1956,7 +2248,7 @@ void Aplicacao::Interno::desenharAoVivo() {
         for (auto& [id, quem] : transmissoes) {
             if (!quem) continue;
             std::lock_guard tq(quem->travaQuadro);
-            aoVivo.push_back({id, paraW(quem->nome), quem->quadro, quem->largura});
+            aoVivo.push_back({id, quem->dono, paraW(quem->nome), quem->quadro, quem->largura});
         }
         // Palco vazio ou apontando para quem saiu: fica com a primeira que há.
         if (!aoVivo.empty()) {
@@ -1980,8 +2272,10 @@ void Aplicacao::Interno::desenharAoVivo() {
     // Sem barra inferior: os botões foram para o pé do painel lateral, e o
     // palco herdou os 64 px que ela ocupava. Numa tela de chamada, imagem é o
     // conteúdo e botão é moldura.
-    const auto palco = D2D1::RectF(tema::kEspaco, topo, painelX - tema::kEspaco,
-                                   alt - tema::kEspaco);
+    const auto palco = telaCheia
+                           ? D2D1::RectF(0, 0, larg, alt)
+                           : D2D1::RectF(tema::kEspaco, topo, painelX - tema::kEspaco,
+                                         alt - tema::kEspaco);
     // Palco mais escuro que o painel, e não igual.
     //
     // A imagem entra com a proporção dela, então sobra faixa em volta. Com o
@@ -2066,6 +2360,16 @@ void Aplicacao::Interno::desenharAoVivo() {
         render.texto(texto, etiqueta, corTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
+    // Em tela cheia acaba aqui. A saída fica escrita num canto, discreta:
+    // janela sem borda e sem botão é onde a pessoa se sente presa, e uma linha
+    // de texto resolve isso sem pôr moldura de volta na imagem.
+    if (telaCheia) {
+        render.texto(L"Esc  ou  F11  para sair da tela cheia",
+                     D2D1::RectF(larg - 320, alt - 40, larg - 20, alt - 18), tema::kApagado,
+                     Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        return;
+    }
+
     // ---- painel lateral
     const auto painel = D2D1::RectF(painelX, topo, larg - tema::kEspaco, alt - tema::kEspaco);
     render.retangulo(painel, tema::kPainel, tema::kRaioCartao);
@@ -2073,7 +2377,28 @@ void Aplicacao::Interno::desenharAoVivo() {
 
     const float esq = painel.left + 16;
     const float dir = painel.right - 16;
-    float y = painel.top + 16;
+
+    // A área que rola vai do topo do painel até onde os botões começam. Eles
+    // ficam ancorados na base e fora do recorte: botão que rola para fora da
+    // vista é botão que não existe na hora em que se precisa dele.
+    const float alturaDiagnostico = transmitindo ? 74.0f : 0.0f;
+    const float baseBotoes = painel.bottom - 16 - alturaDiagnostico;
+    const float topoRolavel = painel.top + 16;
+    const float fimRolavel = baseBotoes - 50;
+
+    areaRolavel = D2D1::RectF(painel.left, topoRolavel, painel.right, fimRolavel);
+    alturaVisivel = fimRolavel - topoRolavel;
+
+    // Limita a rolagem ao que o conteúdo do quadro ANTERIOR pedia. Medir e
+    // limitar no mesmo quadro seria tarde: o desenho já teria acontecido com o
+    // valor errado, e a lista daria um solavanco visível a cada roda.
+    const float limiteRolagem = alturaConteudo > alturaVisivel
+                                    ? alturaConteudo - alturaVisivel
+                                    : 0.0f;
+    if (rolagem > limiteRolagem) rolagem = limiteRolagem;
+
+    render.recortar(areaRolavel);
+    float y = topoRolavel - rolagem;
 
     auto secao = [&](const wchar_t* titulo) {
         render.texto(titulo, D2D1::RectF(esq, y, dir, y + 14), tema::kApagado, Fonte::Pequena);
@@ -2082,9 +2407,15 @@ void Aplicacao::Interno::desenharAoVivo() {
 
     // Item de lista: fundo quando escolhido, nada quando não. Sem contorno em
     // cima do fundo - é o que tirava o ar do painel.
+    //
+    // O realce sob o ponteiro é o meio-termo entre os dois: diz "isto responde
+    // ao clique" sem dizer "isto está escolhido".
     auto item = [&](const std::wstring& esquerda, const std::wstring& direita, bool ativo) {
         const auto area = D2D1::RectF(esq, y, dir, y + 30);
-        render.retangulo(area, ativo ? tema::kVerdeSuave : tema::kPainel2, 8);
+        const bool sob = !ativo && sobre(area) && sobre(areaRolavel);
+        if (sob) sobreClicavel = true;
+        render.retangulo(area, ativo ? tema::kVerdeSuave : (sob ? tema::kPainel3 : tema::kPainel2),
+                         8);
         render.texto(esquerda, D2D1::RectF(area.left + 11, area.top, area.right - 70, area.bottom),
                      ativo ? tema::kVerde : tema::kTexto, Fonte::Pequena);
         if (!direita.empty()) {
@@ -2116,11 +2447,36 @@ void Aplicacao::Interno::desenharAoVivo() {
                                     static_cast<int>(i) == qualidadeEscolhida));
     }
 
+    // Câmera.
+    //
+    // Fica junto de monitor e qualidade porque é a mesma pergunta: o que sai
+    // daqui. E "Desligada" é a primeira linha, e não um interruptor separado,
+    // porque desligar a câmera é escolher uma fonte como outra qualquer - e
+    // assim quem tem duas webcams troca entre elas com um clique.
+    //
+    // A câmera vai COMPOSTA no canto do quadro, não numa segunda faixa: o
+    // servidor abre um transceiver de vídeo por pessoa. O efeito colateral é
+    // bom - quem assiste pelo Electron ou pelo celular já a vê hoje, sem
+    // atualizar nada.
+    y += 6;
+    secao(L"CÂMERA");
+    btCameras.clear();
+    btCameras.push_back(item(L"Desligada", L"", cameraEscolhida.empty()));
+    for (const auto& c : cameras) {
+        btCameras.push_back(item(paraW(c.nome), L"no canto", c.id == cameraEscolhida));
+    }
+    if (cameras.empty()) {
+        render.texto(L"Nenhuma câmera encontrada",
+                     D2D1::RectF(esq + 11, y, dir, y + 20), tema::kApagado, Fonte::Pequena);
+        y += 24;
+    }
+
     // Interruptor do som. Fica logo abaixo da qualidade porque é a mesma
     // decisão - o que sai daqui - mas com forma diferente, porque é liga/desliga
     // e não escolha entre opções.
     y += 6;
     btAudio = D2D1::RectF(esq, y, dir, y + 34);
+    if (apontando(btAudio)) { /* mãozinha; o realce viria por cima do verde */ }
     render.retangulo(btAudio, audioLigado ? tema::kVerdeSuave : tema::kPainel2, 8);
     render.texto(audioLigado ? L"Som do sistema" : L"Sem som",
                  D2D1::RectF(btAudio.left + 11, btAudio.top, btAudio.right - 64, btAudio.bottom),
@@ -2202,9 +2558,10 @@ void Aplicacao::Interno::desenharAoVivo() {
     pessoa(meuNome, sinal.pingMs(), true, transmitindo && !escolhida);
 
     for (const auto& p : copia) {
-        const std::wstring nome = paraW(p.nome);
-        const bool estaNoPalco = escolhida && escolhida->nome == nome;
-        pessoa(nome, p.pingMs, false, estaNoPalco);
+        // Comparação por id, e não por nome: dois amigos com o mesmo apelido
+        // punham a marca do palco nos dois - e num grupo isso não é raro.
+        const bool estaNoPalco = escolhida && !escolhida->dono.empty() && escolhida->dono == p.id;
+        pessoa(paraW(p.nome), p.pingMs, false, estaNoPalco);
     }
 
     // ---- transmissões: um cartão com miniatura por pessoa transmitindo
@@ -2267,12 +2624,29 @@ void Aplicacao::Interno::desenharAoVivo() {
         }
     }
 
+    // Fim da parte que rola. A altura medida aqui é o que limita a rolagem no
+    // quadro seguinte.
+    alturaConteudo = (y + rolagem) - topoRolavel;
+    render.soltarRecorte();
+
+    // Trilho de rolagem, e só quando há o que rolar.
+    //
+    // Fininho e encostado na borda: ele existe para dizer "há mais coisa aqui
+    // embaixo", não para ser agarrado - quem rola usa a roda.
+    if (alturaConteudo > alturaVisivel) {
+        const float fracaoVisivel = alturaVisivel / alturaConteudo;
+        const float alturaPolegar = alturaVisivel * fracaoVisivel;
+        const float andado = (limiteRolagem > 0) ? (rolagem / limiteRolagem) : 0.0f;
+        const float y0 = topoRolavel + (alturaVisivel - alturaPolegar) * andado;
+        const float x0 = painel.right - 6;
+        render.retangulo(D2D1::RectF(x0, y0, x0 + 3, y0 + alturaPolegar), tema::kLinha, 2);
+    }
+
     // ---- pé do painel: botões e, abaixo deles, o diagnóstico
     //
     // Ancorados na base em vez de seguirem a lista. Com a sala cheia, o rodapé
     // calculado por posição fixa se sobrepunha aos nomes.
-    const float alturaDiagnostico = transmitindo ? 74.0f : 0.0f;
-    float base = painel.bottom - 16 - alturaDiagnostico;
+    const float base = baseBotoes;
 
     btSair = D2D1::RectF(esq, base - 38, esq + 84, base);
     desenharBotao(btSair, L"SAIR", false);
@@ -2332,10 +2706,17 @@ void Aplicacao::Interno::desenhar() {
     render.comecarQuadro();
     render.limpar(tema::kFundo);
 
+    // Zerado a cada quadro e remarcado por quem estiver sob o ponteiro. É o que
+    // decide o cursor: quem não desenha nada clicável no lugar do mouse deixa
+    // a seta como está.
+    sobreClicavel = false;
+
     if (telaAtual == Tela::Entrada) desenharEntrada();
     else desenharAoVivo();
 
-    desenharBarraTitulo();
+    // A barra some em tela cheia: ela é a única coisa que ainda desenharia por
+    // cima da imagem depois que o painel sai.
+    if (!telaCheia) desenharBarraTitulo();
     render.terminarQuadro();
 }
 

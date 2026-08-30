@@ -31,6 +31,11 @@ struct ColorConverter::Interno {
     uint32_t alturaEntrada = 0;
     uint32_t largura = 0;
     uint32_t altura = 0;
+
+    // Segunda entrada, para a câmera. Desligada enquanto ninguém a pedir.
+    bool comSobreposicao = false;
+    uint32_t larguraCamera = 0;
+    uint32_t alturaCamera = 0;
 };
 
 ColorConverter::ColorConverter() : d_(std::make_unique<Interno>()) {}
@@ -185,7 +190,74 @@ bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* con
     return true;
 }
 
-ID3D11Texture2D* ColorConverter::converter(ID3D11Texture2D* entradaBgra) {
+// Onde a câmera entra no quadro: canto inferior direito, com uma margem
+// proporcional ao tamanho da saída.
+//
+// Um quarto da largura é o que o olho aceita sem a câmera roubar a cena. Fixo
+// em pixels não serviria: 240 px num 4K é um selo, num 720p é meia tela.
+bool ColorConverter::prepararSobreposicao(uint32_t larguraCamera, uint32_t alturaCamera) {
+    if (!d_->processador || larguraCamera == 0 || alturaCamera == 0) return false;
+
+    // A placa precisa aceitar NV12 na entrada para a câmera existir aqui: no
+    // caminho do encoder a entrada principal é BGRA, então este formato ainda
+    // não foi conferido.
+    UINT suporte = 0;
+    d_->enumerador->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &suporte);
+    if (!(suporte & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
+        aviso("o Video Processor desta placa nao aceita NV12 na entrada; sem camera no quadro");
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_CAPS capacidades{};
+    if (FAILED(d_->enumerador->GetVideoProcessorCaps(&capacidades)) ||
+        capacidades.MaxStreamStates < 2 || capacidades.MaxInputStreams < 2) {
+        aviso("o Video Processor desta placa so aceita uma entrada; sem camera no quadro");
+        return false;
+    }
+
+    d_->larguraCamera = larguraCamera;
+    d_->alturaCamera = alturaCamera;
+
+    // A entrada principal ocupa o quadro inteiro. Precisa ser dito: com duas
+    // entradas o processador não presume mais que a primeira é o fundo.
+    const RECT cheio{0, 0, static_cast<LONG>(d_->largura), static_cast<LONG>(d_->altura)};
+    d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), 0, TRUE, &cheio);
+
+    // A câmera entra com a proporção dela, e não esticada: uma webcam 4:3
+    // achatada em 16:9 deixa todo mundo com a cara larga.
+    const LONG margem = static_cast<LONG>(d_->largura / 48);
+    const LONG larguraDestino = static_cast<LONG>(d_->largura / 4);
+    const LONG alturaDestino = static_cast<LONG>(
+        static_cast<double>(larguraDestino) * alturaCamera / larguraCamera);
+
+    RECT canto{};
+    canto.right = static_cast<LONG>(d_->largura) - margem;
+    canto.bottom = static_cast<LONG>(d_->altura) - margem;
+    canto.left = canto.right - larguraDestino;
+    canto.top = canto.bottom - alturaDestino;
+
+    d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), 1, TRUE, &canto);
+    d_->videoContexto->VideoProcessorSetStreamFrameFormat(d_->processador.Get(), 1,
+                                                          D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    d_->videoContexto->VideoProcessorSetStreamAutoProcessingMode(d_->processador.Get(), 1, FALSE);
+
+    d_->comSobreposicao = true;
+    info("camera no quadro: {}x{} no canto, sobre {}x{}", larguraDestino, alturaDestino,
+         d_->largura, d_->altura);
+    return true;
+}
+
+void ColorConverter::desligarSobreposicao() {
+    if (!d_->comSobreposicao) return;
+    d_->comSobreposicao = false;
+    if (d_->processador && d_->videoContexto) {
+        d_->videoContexto->VideoProcessorSetStreamDestRect(d_->processador.Get(), 1, FALSE,
+                                                           nullptr);
+    }
+}
+
+ID3D11Texture2D* ColorConverter::converter(ID3D11Texture2D* entradaBgra,
+                                           ID3D11Texture2D* sobreposicao) {
     if (!d_->processador || !entradaBgra) return nullptr;
 
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC descricao{};
@@ -202,15 +274,34 @@ ID3D11Texture2D* ColorConverter::converter(ID3D11Texture2D* entradaBgra) {
         return nullptr;
     }
 
-    D3D11_VIDEO_PROCESSOR_STREAM fluxo{};
-    fluxo.Enable = TRUE;
-    fluxo.pInputSurface = vistaEntrada.Get();
+    D3D11_VIDEO_PROCESSOR_STREAM fluxos[2]{};
+    fluxos[0].Enable = TRUE;
+    fluxos[0].pInputSurface = vistaEntrada.Get();
+    UINT total = 1;
+
+    // A vista da câmera é criada por quadro, como a principal. Guardá-la entre
+    // quadros não daria nada: a textura alterna entre duas a cada quadro, e a
+    // vista está presa à textura de onde saiu.
+    ComPtr<ID3D11VideoProcessorInputView> vistaCamera;
+    if (d_->comSobreposicao && sobreposicao) {
+        resultado = d_->videoDevice->CreateVideoProcessorInputView(
+            sobreposicao, d_->enumerador.Get(), &descricao, &vistaCamera);
+        if (SUCCEEDED(resultado)) {
+            fluxos[1].Enable = TRUE;
+            fluxos[1].pInputSurface = vistaCamera.Get();
+            total = 2;
+        } else {
+            // Um aviso por quadro encheria o log; o quadro sai sem a câmera e
+            // a transmissão continua, que é o que importa.
+            fluxos[1].Enable = FALSE;
+        }
+    }
 
     const size_t indice = d_->proximaSaida;
     d_->proximaSaida = (d_->proximaSaida + 1) % Interno::kSaidas;
 
     resultado = d_->videoContexto->VideoProcessorBlt(
-        d_->processador.Get(), d_->vistaSaida[indice].Get(), 0, 1, &fluxo);
+        d_->processador.Get(), d_->vistaSaida[indice].Get(), 0, total, fluxos);
     if (FAILED(resultado)) {
         erro("VideoProcessorBlt falhou: {}", hr(resultado));
         return nullptr;

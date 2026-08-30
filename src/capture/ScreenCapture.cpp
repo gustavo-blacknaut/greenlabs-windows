@@ -89,6 +89,10 @@ struct ScreenCapture::Interno {
     MonitorInfo info;
     bool quadroEmMaos = false;
 
+    // Para não repetir a mesma linha de erro a cada quadro.
+    HRESULT ultimoErro = S_OK;
+    std::chrono::steady_clock::time_point momentoDoErro{};
+
     // Posição e visibilidade do ponteiro persistem entre quadros: o DXGI só
     // avisa quando mudam. Guardar aqui evita o cursor sumir a cada quadro em
     // que o mouse ficou parado.
@@ -299,13 +303,32 @@ ResultadoQuadro ScreenCapture::proximoQuadro(uint32_t prazoMs, QuadroCapturado& 
     if (resultado == DXGI_ERROR_WAIT_TIMEOUT) {
         return ResultadoQuadro::SemMudanca;
     }
-    if (resultado == DXGI_ERROR_ACCESS_LOST) {
+    // INVALID_CALL junto com ACCESS_LOST, e de propósito.
+    //
+    // Ele aparece quando a duplicação entra num estado do qual não sai sozinha
+    // - troca de resolução, conteúdo protegido, o compositor sendo reiniciado.
+    // Antes ele caía no ramo de erro genérico: o laço tentava de novo trinta
+    // vezes por segundo, para sempre, cada tentativa escrevendo uma linha no
+    // log. Foram 257 linhas em treze segundos, e a captura não voltava nunca,
+    // porque nada nesse caminho refaz a duplicação. Refazer é o que resolve, e
+    // é exatamente o que PrecisaReiniciar manda fazer.
+    if (resultado == DXGI_ERROR_ACCESS_LOST || resultado == DXGI_ERROR_INVALID_CALL) {
         return ResultadoQuadro::PrecisaReiniciar;
     }
     if (FAILED(resultado)) {
-        erro("AcquireNextFrame falhou: {}", hr(resultado));
+        // Um erro por segundo, no máximo. O que interessa é saber que está
+        // acontecendo; repetir a mesma linha trinta vezes por segundo só
+        // esconde o resto do log.
+        const auto agora = std::chrono::steady_clock::now();
+        if (resultado != d_->ultimoErro ||
+            agora - d_->momentoDoErro >= std::chrono::seconds(1)) {
+            d_->ultimoErro = resultado;
+            d_->momentoDoErro = agora;
+            erro("AcquireNextFrame falhou: {}", hr(resultado));
+        }
         return ResultadoQuadro::Erro;
     }
+    d_->ultimoErro = S_OK;
 
     d_->quadroEmMaos = true;
 

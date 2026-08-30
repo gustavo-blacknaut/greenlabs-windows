@@ -60,6 +60,11 @@ public:
     void retangulo(const D2D1_RECT_F& area, const D2D1_COLOR_F& cor, float raio = 0.0f);
     void contorno(const D2D1_RECT_F& area, const D2D1_COLOR_F& cor, float raio = 0.0f,
                   float espessura = 1.0f);
+
+    // Limita o desenho a um retângulo. Todo recortar precisa do seu
+    // soltarRecorte no mesmo quadro.
+    void recortar(const D2D1_RECT_F& area);
+    void soltarRecorte();
     void linha(float x1, float y1, float x2, float y2, const D2D1_COLOR_F& cor,
                float espessura = 1.0f);
 
