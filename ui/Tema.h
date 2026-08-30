@@ -35,6 +35,18 @@ inline constexpr D2D1_COLOR_F kPainel3     = cor(0xFFFFFF, 0.085f);  // --panel-
 inline constexpr D2D1_COLOR_F kLinha       = cor(0xFFFFFF, 0.08f);   // --line
 inline constexpr D2D1_COLOR_F kApagado     = cor(0x93A3B3);          // --muted
 inline constexpr D2D1_COLOR_F kVermelho    = cor(0xFF6B6B);
+
+// O modal e o que fica atras dele.
+//
+// O Electron escurece a janela inteira com rgba(2,4,7,0.85) e desfoca o fundo.
+// Desfocar aqui custaria um passe de shader por quadro; escurecer sozinho ja
+// diz "resolva isto primeiro", que e o unico trabalho da camada.
+inline constexpr D2D1_COLOR_F kSombraModal = cor(0x020407, 0.85f);
+inline constexpr D2D1_COLOR_F kFundoModal  = cor(0x0D1119);          // .picker-modal
+// Uma linha mais visivel, para a borda do que esta sob o ponteiro.
+inline constexpr D2D1_COLOR_F kLinhaForte  = cor(0xFFFFFF, 0.18f);
+// O verde do botao principal em repouso; o kVerde puro fica para o realce.
+inline constexpr D2D1_COLOR_F kVerdeForte  = cor(0x2BE283);
 inline constexpr D2D1_COLOR_F kTransparente = cor(0x000000, 0.0f);
 
 // Barra de título sem moldura, do mesmo tamanho da do Electron.

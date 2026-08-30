@@ -74,10 +74,13 @@ Config Config::carregar() {
     c.monitor = static_cast<int>(json.numero("monitor", padrao.monitor));
     c.audio = json.booleano("audio", padrao.audio);
     c.volume = static_cast<int>(json.numero("volume", padrao.volume));
-    c.camera = json.texto("camera");
-    c.soCamera = json.booleano("soCamera", padrao.soCamera);
-    for (const Json& item : json.filho("telasExtras").itens()) {
-        if (item.tipo() == Json::Tipo::Numero) c.telasExtras.push_back(static_cast<int>(item.comoNumero()));
+    for (const Json& item : json.filho("telas").itens()) {
+        if (item.tipo() == Json::Tipo::Numero) c.telas.push_back(static_cast<int>(item.comoNumero()));
+    }
+    for (const Json& item : json.filho("cameras").itens()) {
+        if (item.tipo() == Json::Tipo::Texto && !item.comoTexto().empty()) {
+            c.cameras.push_back(item.comoTexto());
+        }
     }
 
     for (const Json& item : json.filho("servidores").itens()) {
@@ -107,11 +110,13 @@ void Config::salvar() const {
     json["monitor"] = Json{monitor};
     json["audio"] = Json{audio};
     json["volume"] = Json{volume};
-    json["camera"] = Json{camera};
-    json["soCamera"] = Json{soCamera};
-    Json extras = Json::lista();
-    for (int t : telasExtras) extras.adicionar(Json{t});
-    json["telasExtras"] = extras;
+    Json listaTelas = Json::lista();
+    for (int t : telas) listaTelas.adicionar(Json{t});
+    json["telas"] = listaTelas;
+
+    Json listaCameras = Json::lista();
+    for (const auto& c : cameras) listaCameras.adicionar(Json{c});
+    json["cameras"] = listaCameras;
 
     Json lista = Json::lista();
     for (const auto& s : servidores) lista.adicionar(Json{s});
