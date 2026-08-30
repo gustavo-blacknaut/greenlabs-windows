@@ -31,6 +31,7 @@
 #include "encoder/VideoEncoder.h"
 #include "network/Midia.h"
 #include "network/Signaling.h"
+#include "ui/Icones.h"
 #include "ui/Renderizador.h"
 #include "ui/Tema.h"
 #include "util/Log.h"
@@ -356,7 +357,6 @@ struct Aplicacao::Interno {
     // Mandar o som do sistema junto com a tela. Só vale para o que sai daqui:
     // o que chega dos outros toca sempre.
     bool audioLigado = true;
-    D2D1_RECT_F btAudio{};
 
     // Câmera.
     //
@@ -578,7 +578,7 @@ struct Aplicacao::Interno {
         D2D1_RECT_F corpo;
         float basePe;
     };
-    MolduraModal desenharMoldura(const wchar_t* icone, const std::wstring& titulo,
+    MolduraModal desenharMoldura(int qualIcone, const std::wstring& titulo,
                                  const std::wstring& subtitulo, float alturaPe,
                                  const std::vector<std::wstring>& abas, int abaAtiva,
                                  std::vector<D2D1_RECT_F>& areasDasAbas);
@@ -2603,6 +2603,15 @@ void Aplicacao::Interno::clique(float x, float y) {
         ::ShowWindow(janela, SW_MINIMIZE);
         return;
     }
+
+    // A engrenagem fica na BARRA, fora da area rolavel do painel - e mais
+    // abaixo ha um return antecipado para tudo que esta fora dela. Testar aqui,
+    // junto dos outros botoes da barra, e o que faz o clique chegar: antes ele
+    // era engolido por aquele return e a engrenagem simplesmente nao respondia.
+    if (dentro(btEngrenagem, x, y)) {
+        abrirConfig();
+        return;
+    }
     if (dentro(btMaximizar, x, y)) {
         const bool maximizada = ::IsZoomed(janela);
         ::ShowWindow(janela, maximizada ? SW_RESTORE : SW_MAXIMIZE);
@@ -2657,11 +2666,6 @@ void Aplicacao::Interno::clique(float x, float y) {
         return;
     }
 
-    if (dentro(btEngrenagem, x, y)) {
-        abrirConfig();
-        return;
-    }
-
     // Cartao de transmissao: poe aquela no palco.
     for (size_t i = 0; i < btTransmissoes.size() && i < idsTransmissoes.size(); ++i) {
         if (dentro(btTransmissoes[i], x, y)) {
@@ -2690,17 +2694,6 @@ void Aplicacao::Interno::clique(float x, float y) {
         arrastandoVolume = true;
         ::SetCapture(janela);
         ajustarVolumePor(x);
-        return;
-    }
-
-    if (dentro(btAudio, x, y)) {
-        audioLigado = !audioLigado;
-        config.audio = audioLigado;
-    config.volume = volumeDaChamada;
-        config.salvar();
-        // Mesma regra da qualidade: a captura de som nasce junto com a
-        // transmissão, então trocar no meio recomeça - sem derrubar a conexão.
-        reiniciarEncode();
         return;
     }
 
@@ -2838,8 +2831,7 @@ void Aplicacao::Interno::desenharBarraTitulo() {
                                        tema::kAlturaTitulo - 6);
             const bool sob = apontando(btEngrenagem);
             render.retangulo(btEngrenagem, sob ? tema::kPainel3 : tema::kTransparente, 9);
-            render.texto(L"⚙", btEngrenagem, sob ? tema::kTexto : tema::kApagado, Fonte::Botao,
-                         DWRITE_TEXT_ALIGNMENT_CENTER);
+            icone::engrenagem(render, btEngrenagem, sob ? tema::kTexto : tema::kApagado);
         } else {
             btEngrenagem = {};
         }
@@ -2849,10 +2841,17 @@ void Aplicacao::Interno::desenharBarraTitulo() {
     btMaximizar = D2D1::RectF(larg - 2 * b, 0, larg - b, tema::kAlturaTitulo);
     btMinimizar = D2D1::RectF(larg - 3 * b, 0, larg - 2 * b, tema::kAlturaTitulo);
 
-    render.texto(L"—", btMinimizar, tema::kApagado, Fonte::Botao, DWRITE_TEXT_ALIGNMENT_CENTER);
-    render.texto(::IsZoomed(janela) ? L"❐" : L"□", btMaximizar, tema::kApagado,
-                 Fonte::Botao, DWRITE_TEXT_ALIGNMENT_CENTER);
-    render.texto(L"✕", btFechar, tema::kVermelho, Fonte::Botao, DWRITE_TEXT_ALIGNMENT_CENTER);
+    // Realce nos tres, como em qualquer barra de titulo do Windows: o de fechar
+    // em vermelho, os outros discretos.
+    if (apontando(btMinimizar)) render.retangulo(btMinimizar, tema::kPainel3);
+    if (apontando(btMaximizar)) render.retangulo(btMaximizar, tema::kPainel3);
+    const bool sobFechar = apontando(btFechar);
+    if (sobFechar) render.retangulo(btFechar, tema::kVermelho);
+
+    icone::minimizar(render, btMinimizar, tema::kApagado);
+    if (::IsZoomed(janela)) icone::restaurar(render, btMaximizar, tema::kApagado);
+    else icone::maximizar(render, btMaximizar, tema::kApagado);
+    icone::fechar(render, btFechar, sobFechar ? tema::kTexto : tema::kVermelho);
 }
 
 void Aplicacao::Interno::desenharEntrada() {
@@ -3609,12 +3608,6 @@ void Aplicacao::Interno::bombearPreviasDoModal() {
 // largura de 540, cantos de 24, cabeçalho e abas separados por linha, corpo em
 // grade de dois, interruptor de som no pé e um botão verde de largura cheia.
 void Aplicacao::Interno::desenharModal() {
-    const float larg = render.largura();
-    const float alt = render.altura();
-
-    // O fundo escurece a janela inteira - é o que diz "resolva isto primeiro".
-    render.retangulo(D2D1::RectF(0, 0, larg, alt), tema::kSombraModal);
-
     // O pé tem altura fixa porque o conteúdo dele é fixo: rótulo, pastilhas de
     // qualidade, interruptor de som e o botão. Ele estava em 152 e o botão caía
     // POR CIMA do interruptor - dá para ver na janela: "MARQUE PELO MENOS UM"
@@ -3624,68 +3617,22 @@ void Aplicacao::Interno::desenharModal() {
     // + 42 respiro + 44 interruptor
     // + 18 respiro + 42 botão + 18 margem
     const float alturaPe = 198;
-    const float alturaCabecalho = 72;
-    const float alturaAbas = 42;
 
-    // A janela manda. Numa janela baixa o modal encolhe junto, e o mínimo
-    // garante que cabeçalho, abas e pé continuem inteiros mesmo que sobre
-    // pouco para a grade - que é a parte que rola.
-    const float largModal = (std::min)(560.0f, larg - 48.0f);
-    const float alturaMinima = alturaCabecalho + alturaAbas + alturaPe + 120;
-    const float altModal =
-        (std::max)(alturaMinima, (std::min)(alt - 48.0f, 640.0f));
-    const float x = (larg - largModal) / 2;
-    const float y = (std::max)(8.0f, (alt - altModal) / 2);
-    const auto modal = D2D1::RectF(x, y, x + largModal, y + altModal);
+    std::vector<D2D1_RECT_F> areasDasAbas;
+    const auto moldura = desenharMoldura(
+        0, L"Escolha o que transmitir", L"Suas telas e suas câmeras. Dá para marcar mais de uma.",
+        alturaPe, {L"Telas (" + std::to_wstring(monitores.size()) + L")",
+                   L"Câmeras (" + std::to_wstring(cameras.size()) + L")"},
+        abaModal, areasDasAbas);
 
-    render.retangulo(modal, tema::kFundoModal, 24);
-    render.contorno(modal, tema::kLinha, 24);
+    btAbaTelas = areasDasAbas[0];
+    btAbaCameras = areasDasAbas[1];
 
-    // ---- cabeçalho
-    render.linha(x, y + alturaCabecalho, x + largModal, y + alturaCabecalho, tema::kLinha);
+    const float x = moldura.cartao.left;
+    const float largModal = moldura.cartao.right - moldura.cartao.left;
 
-    const auto quadradoIcone = D2D1::RectF(x + 20, y + 18, x + 56, y + 54);
-    render.retangulo(quadradoIcone, tema::kVerdeSuave, 10);
-    render.texto(L"▣", quadradoIcone, tema::kVerde, Fonte::Corpo,
-                 DWRITE_TEXT_ALIGNMENT_CENTER);
-
-    render.texto(L"Escolha o que transmitir",
-                 D2D1::RectF(x + 68, y + 17, x + largModal - 62, y + 39), tema::kTexto,
-                 Fonte::Subtitulo);
-    render.texto(L"Suas telas e suas câmeras. Dá para marcar mais de uma.",
-                 D2D1::RectF(x + 68, y + 39, x + largModal - 62, y + 57), tema::kApagado,
-                 Fonte::Pequena);
-
-    btModalFechar = D2D1::RectF(x + largModal - 52, y + 18, x + largModal - 16, y + 54);
-    render.retangulo(btModalFechar, apontando(btModalFechar) ? tema::kPainel3 : tema::kPainel2, 12);
-    render.contorno(btModalFechar, tema::kLinha, 12);
-    render.texto(L"✕", btModalFechar, tema::kTexto, Fonte::Pequena,
-                 DWRITE_TEXT_ALIGNMENT_CENTER);
-
-    // ---- abas
-    const float topoAbas = y + alturaCabecalho;
-    render.linha(x, topoAbas + alturaAbas, x + largModal, topoAbas + alturaAbas, tema::kLinha);
-
-    auto aba = [&](float esquerda, const std::wstring& rotulo, bool ativa) {
-        const float largura = render.larguraDoTexto(rotulo, Fonte::Pequena) + 28;
-        const auto area =
-            D2D1::RectF(esquerda, topoAbas + 4, esquerda + largura, topoAbas + alturaAbas);
-        const bool sob = apontando(area);
-        render.texto(rotulo, area, ativa ? tema::kVerde : (sob ? tema::kTexto : tema::kApagado),
-                     Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
-        if (ativa) {
-            render.retangulo(D2D1::RectF(area.left, area.bottom - 2, area.right, area.bottom),
-                             tema::kVerde, 1);
-        }
-        return area;
-    };
-
-    btAbaTelas = aba(x + 20, L"Telas (" + std::to_wstring(monitores.size()) + L")", abaModal == 0);
-    btAbaCameras = aba(btAbaTelas.right + 8,
-                       L"Câmeras (" + std::to_wstring(cameras.size()) + L")", abaModal == 1);
-
-    // ---- pé, medido de baixo para cima para o corpo saber onde parar
-    const float basePe = y + altModal;
+    // ---- pé
+    const float basePe = moldura.basePe;
     const float topoPe = basePe - alturaPe;
     render.linha(x, topoPe, x + largModal, topoPe, tema::kLinha);
 
@@ -3749,8 +3696,7 @@ void Aplicacao::Interno::desenharModal() {
                  DWRITE_TEXT_ALIGNMENT_CENTER);
 
     // ---- corpo: a grade de cartões
-    const float topoCorpo = topoAbas + alturaAbas + 16;
-    const auto corpo = D2D1::RectF(x + 20, topoCorpo, x + largModal - 20, topoPe - 14);
+    const auto corpo = moldura.corpo;
 
     // A grade rola: numa janela baixa, ou com muitas câmeras, ela não cabe. O
     // limite vem da medida do quadro anterior, pelo mesmo motivo do painel -
@@ -3797,8 +3743,7 @@ void Aplicacao::Interno::desenharModal() {
             D2D1::RectF(areaMini.right - 28, areaMini.top + 6, areaMini.right - 6, areaMini.top + 28);
         render.retangulo(marca, marcado ? tema::kVerde : tema::kSombraModal, 11);
         if (marcado) {
-            render.texto(L"✓", marca, tema::kFundo, Fonte::Pequena,
-                         DWRITE_TEXT_ALIGNMENT_CENTER);
+            icone::visto(render, marca, tema::kFundo);
         } else {
             render.contorno(marca, tema::kLinhaForte, 11);
         }
@@ -3876,7 +3821,7 @@ void Aplicacao::Interno::desenharModal() {
 // construção, e não por eu ter copiado as medidas de um para o outro e
 // lembrado de manter as duas cópias iguais.
 Aplicacao::Interno::MolduraModal Aplicacao::Interno::desenharMoldura(
-    const wchar_t* icone, const std::wstring& titulo, const std::wstring& subtitulo,
+    int qualIcone, const std::wstring& titulo, const std::wstring& subtitulo,
     float alturaPe, const std::vector<std::wstring>& abas, int abaAtiva,
     std::vector<D2D1_RECT_F>& areasDasAbas) {
     const float larg = render.largura();
@@ -3901,7 +3846,8 @@ Aplicacao::Interno::MolduraModal Aplicacao::Interno::desenharMoldura(
 
     const auto quadradoIcone = D2D1::RectF(x + 20, y + 18, x + 56, y + 54);
     render.retangulo(quadradoIcone, tema::kVerdeSuave, 10);
-    render.texto(icone, quadradoIcone, tema::kVerde, Fonte::Corpo, DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (qualIcone == 0) icone::monitor(render, quadradoIcone, tema::kVerde, 17.0f, 1.7f);
+    else icone::engrenagem(render, quadradoIcone, tema::kVerde, 18.0f, 1.7f);
 
     render.texto(titulo, D2D1::RectF(x + 68, y + 17, x + largModal - 62, y + 39), tema::kTexto,
                  Fonte::Subtitulo);
@@ -3911,7 +3857,7 @@ Aplicacao::Interno::MolduraModal Aplicacao::Interno::desenharMoldura(
     btModalFechar = D2D1::RectF(x + largModal - 52, y + 18, x + largModal - 16, y + 54);
     render.retangulo(btModalFechar, apontando(btModalFechar) ? tema::kPainel3 : tema::kPainel2, 12);
     render.contorno(btModalFechar, tema::kLinha, 12);
-    render.texto(L"✕", btModalFechar, tema::kTexto, Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+    icone::fechar(render, btModalFechar, tema::kTexto);
 
     areasDasAbas.clear();
     const float topoAbas = y + alturaCabecalho;
@@ -3962,7 +3908,7 @@ void Aplicacao::Interno::abrirConfig() {
 void Aplicacao::Interno::desenharConfig() {
     std::vector<D2D1_RECT_F> areasDasAbas;
     const float alturaPe = 76;
-    const auto moldura = desenharMoldura(L"⚙", L"Configuração",
+    const auto moldura = desenharMoldura(1, L"Configuração",
                                          L"Conexão e servidores salvos.", alturaPe,
                                          {L"Conexão", L"Servidores"}, abaConfig, areasDasAbas);
     btAbasConfig = areasDasAbas;
@@ -4075,8 +4021,8 @@ void Aplicacao::Interno::desenharConfig() {
 
                 const auto remover =
                     D2D1::RectF(area.right - 36, area.top + 12, area.right - 14, area.top + 34);
-                render.texto(L"✕", remover, apontando(remover) ? tema::kVermelho : tema::kApagado,
-                             Fonte::Pequena, DWRITE_TEXT_ALIGNMENT_CENTER);
+                icone::fechar(render, remover,
+                              apontando(remover) ? tema::kVermelho : tema::kApagado, 9.0f);
 
                 btServidoresConfig.push_back(area);
                 btRemoverServidor.push_back(remover);
