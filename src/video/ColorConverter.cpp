@@ -285,17 +285,22 @@ ID3D11Texture2D* ColorConverter::compor(const std::vector<ID3D11Texture2D*>& ent
     std::vector<ComPtr<ID3D11VideoProcessorInputView>> vistas(entradas.size());
     std::vector<D3D11_VIDEO_PROCESSOR_STREAM> fluxos(entradas.size());
 
+    // Nenhuma superfície nula chega ao Blt.
+    //
+    // O desenho anterior mandava o fluxo com Enable = FALSE e pInputSurface
+    // nulo quando a imagem ainda não tinha chegado, contando com o processador
+    // ignorar o fluxo desligado. O driver da AMD não ignora: ele lê o ponteiro
+    // antes de olhar o Enable, e o processo morre com violação de acesso
+    // dentro do driver - sem log, sem registro no Windows, saída 139.
+    //
+    // Truncar na primeira que falta resolve sem caso especial. A ordem é
+    // [telas..., câmera], então o que cai fora é justamente o que veio por
+    // último - e volta sozinho no quadro seguinte.
     UINT total = 0;
     for (size_t i = 0; i < entradas.size(); ++i) {
         fluxos[i] = {};
-        // Entrada que ainda não chegou é pulada, e o resto do quadro sai
-        // normalmente. É o caso do primeiro segundo, quando a câmera ou o
-        // segundo monitor ainda não entregaram nada.
-        if (!entradas[i]) {
-            fluxos[i].Enable = FALSE;
-            total = static_cast<UINT>(i + 1);
-            continue;
-        }
+        if (!entradas[i]) break;
+
         const HRESULT resultado = d_->videoDevice->CreateVideoProcessorInputView(
             entradas[i], d_->enumerador.Get(), &descricao, &vistas[i]);
         if (FAILED(resultado)) {
@@ -304,9 +309,7 @@ ID3D11Texture2D* ColorConverter::compor(const std::vector<ID3D11Texture2D*>& ent
                 d_->ultimoErroVista = resultado;
                 erro("CreateVideoProcessorInputView falhou: {}", hr(resultado));
             }
-            fluxos[i].Enable = FALSE;
-            total = static_cast<UINT>(i + 1);
-            continue;
+            break;
         }
         fluxos[i].Enable = TRUE;
         fluxos[i].pInputSurface = vistas[i].Get();
