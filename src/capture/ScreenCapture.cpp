@@ -93,6 +93,10 @@ struct ScreenCapture::Interno {
     HRESULT ultimoErro = S_OK;
     std::chrono::steady_clock::time_point momentoDoErro{};
 
+    // O mesmo para a abertura da duplicação: quando ela está negada de verdade,
+    // o laço tenta duas vezes por segundo, para sempre.
+    HRESULT ultimoErroDuplicacao = S_OK;
+
     // Posição e visibilidade do ponteiro persistem entre quadros: o DXGI só
     // avisa quando mudam. Guardar aqui evita o cursor sumir a cada quadro em
     // que o mouse ficou parado.
@@ -326,6 +330,7 @@ bool ScreenCapture::Interno::criarDuplicacao() {
     }
 
     const HRESULT resultado = saida->DuplicateOutput(dispositivo.Get(), &duplicacao);
+    if (SUCCEEDED(resultado)) ultimoErroDuplicacao = S_OK;
     if (FAILED(resultado)) {
         if (resultado == E_ACCESSDENIED) {
             // Acontece durante o UAC, na tela de bloqueio e com jogo em tela
@@ -333,9 +338,13 @@ bool ScreenCapture::Interno::criarDuplicacao() {
             aviso("duplicacao negada agora (tela protegida ou jogo em tela cheia exclusiva)");
         } else if (resultado == DXGI_ERROR_UNSUPPORTED) {
             erro("duplicacao nao suportada neste adaptador: {}", hr(resultado));
-        } else {
+        } else if (resultado != ultimoErroDuplicacao) {
+            // Uma vez por codigo de erro, e nao a cada tentativa: com a
+            // duplicacao negada de verdade o laco tenta duas vezes por segundo,
+            // para sempre, e a mesma linha afogava o log inteiro.
             erro("DuplicateOutput falhou: {}", hr(resultado));
         }
+        ultimoErroDuplicacao = resultado;
         return false;
     }
     return true;

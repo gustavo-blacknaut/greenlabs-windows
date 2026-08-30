@@ -6,6 +6,8 @@
 #include <d3d11_4.h>  // ID3D11Multithread
 #include <wrl/client.h>
 
+#include <atomic>
+
 #include "util/Log.h"
 
 using Microsoft::WRL::ComPtr;
@@ -59,7 +61,16 @@ bool ColorConverter::iniciar(ID3D11Device* dispositivo, ID3D11DeviceContext* con
 
     HRESULT resultado = d_->dispositivo.As(&d_->videoDevice);
     if (FAILED(resultado)) {
-        erro("ID3D11VideoDevice indisponivel: {}", hr(resultado));
+        // Uma vez por processo, e nao por quadro.
+        //
+        // Sem aceleracao de video - WARP, ou driver que recusou - isto falha em
+        // TODA tentativa, e a exibicao tenta a cada quadro que chega. Eram
+        // dezenas de linhas por segundo afogando o resto do log, justamente
+        // quando ele e mais necessario.
+        static std::atomic<bool> jaDisse{false};
+        if (!jaDisse.exchange(true)) {
+            erro("ID3D11VideoDevice indisponivel: {} - sem conversao de cor na GPU", hr(resultado));
+        }
         return false;
     }
     resultado = d_->contexto.As(&d_->videoContexto);
