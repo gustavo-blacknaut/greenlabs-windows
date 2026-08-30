@@ -285,7 +285,62 @@ struct Aplicacao::Interno {
     std::vector<D2D1_RECT_F> btServidores;
 
     std::vector<MonitorInfo> monitores;
+
+    // O monitor que a captura principal abre. É dele que sai o dispositivo
+    // D3D11 usado por todo o resto - encoder, decodificador e interface.
     int monitorEscolhido = 0;
+
+    // Telas EXTRAS, que entram lado a lado com a principal.
+    //
+    // Cada uma abre a duplicação no MESMO dispositivo da principal: o Video
+    // Processor compõe as duas numa passada, e ele não atravessa dispositivos.
+    // Por isso elas usam iniciarCom, e por isso um monitor ligado em outra
+    // placa não pode entrar - o que acontece em notebook híbrido.
+    std::vector<std::unique_ptr<ScreenCapture>> telasExtras;
+    std::vector<int> monitoresExtras;
+
+    // Transmitir só a câmera, sem tela nenhuma.
+    //
+    // Não é um caso especial no meio do caminho: quando ligado, a câmera vira a
+    // imagem principal em vez de ir para o canto, e o encoder é montado no
+    // tamanho dela. Tudo o mais - encoder, rede, áudio - segue igual.
+    bool soCamera = false;
+
+    /// Verdadeiro quando há imagem de tela para transmitir.
+    bool comTela() const { return !soCamera; }
+
+    /// Abre a duplicação dos monitores extras no dispositivo da principal.
+    void abrirTelasExtras() {
+        fecharTelasExtras();
+        for (int indice : monitoresExtras) {
+            if (indice == monitorEscolhido) continue;
+            auto captura = std::make_unique<ScreenCapture>();
+            if (captura->iniciarCom(tela.dispositivo(), tela.contexto(),
+                                    static_cast<uint32_t>(indice))) {
+                telasExtras.push_back(std::move(captura));
+            }
+        }
+    }
+
+    void fecharTelasExtras() {
+        for (auto& extra : telasExtras) extra->parar();
+        telasExtras.clear();
+        for (auto& copia : copiasExtras) copia.Reset();
+        copiasExtras.clear();
+    }
+
+    // Cópia própria de cada tela extra.
+    //
+    // A textura que a duplicação entrega vale só até a próxima leitura, e a
+    // duplicação só entrega quando aquela tela muda. Sem a cópia, um monitor
+    // parado deixaria de existir no quadro seguinte - piscando entre a imagem e
+    // preto conforme a outra tela se mexesse.
+    std::vector<ComPtr<ID3D11Texture2D>> copiasExtras;
+
+    bool montarEncoder(uint32_t largura, uint32_t altura, const Qualidade& q);
+    void trocarPrincipal(int novo);
+    void alternarTela(int indice);
+    void alternarSoCamera();
     int qualidadeEscolhida = 1;  // 1080p 30fps
 
     // Mandar o som do sistema junto com a tela. Só vale para o que sai daqui:
@@ -488,6 +543,7 @@ struct Aplicacao::Interno {
     D2D1_RECT_F btMinimizar{}, btMaximizar{}, btFechar{};
     D2D1_RECT_F btEntrar{}, btTransmitir{}, btSair{};
     std::vector<D2D1_RECT_F> btMonitores;
+    D2D1_RECT_F btSoCamera{};
     std::vector<D2D1_RECT_F> btQualidades;
     std::vector<D2D1_RECT_F> btTransmissoes;
     std::vector<std::string> idsTransmissoes;
@@ -760,6 +816,9 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
     // A lista de câmeras é montada agora, mas nenhuma é aberta: enumerar não
     // acende a luzinha de ninguém. A escolhida só é aberta quando a
     // transmissão começa.
+    d_->soCamera = d_->config.soCamera;
+    d_->monitoresExtras = d_->config.telasExtras;
+
     d_->cameras = CameraCapture::listar();
     for (const auto& c : d_->cameras) {
         info("camera encontrada: {} ({})", c.nome, c.id);
@@ -1044,6 +1103,50 @@ void Aplicacao::Interno::bombearCaptura() {
         quadroAtual = nullptr;
     }
 
+    // Telas extras primeiro, e cada quadro novo vira uma cópia própria.
+    //
+    // A textura que a duplicação entrega vale só até a próxima leitura, e ela
+    // só entrega quando AQUELA tela muda. Compondo direto da textura
+    // emprestada, um monitor parado sumiria do quadro seguinte - piscando entre
+    // a imagem e preto conforme a outra tela se mexesse.
+    if (copiasExtras.size() != telasExtras.size()) copiasExtras.resize(telasExtras.size());
+    for (size_t i = 0; i < telasExtras.size(); ++i) {
+        QuadroCapturado extra;
+        const auto estado = telasExtras[i]->proximoQuadro(0, extra);
+        if (estado == ResultadoQuadro::PrecisaReiniciar) {
+            telasExtras[i]->reiniciar();
+            continue;
+        }
+        if (estado != ResultadoQuadro::Ok || !extra.textura) continue;
+
+        D3D11_TEXTURE2D_DESC origem{};
+        extra.textura->GetDesc(&origem);
+        if (copiasExtras[i]) {
+            D3D11_TEXTURE2D_DESC atual{};
+            copiasExtras[i]->GetDesc(&atual);
+            if (atual.Width != origem.Width || atual.Height != origem.Height) {
+                copiasExtras[i].Reset();
+            }
+        }
+        if (!copiasExtras[i]) {
+            D3D11_TEXTURE2D_DESC nova = origem;
+            nova.Usage = D3D11_USAGE_DEFAULT;
+            // Sem flag de ligação: esta textura só é destino de cópia e entrada
+            // do Video Processor, e SHADER_RESOURCE aqui faria a placa da AMD
+            // recusar a entrada - a mesma armadilha da textura do decodificador.
+            nova.BindFlags = 0;
+            nova.CPUAccessFlags = 0;
+            nova.MiscFlags = 0;
+            nova.MipLevels = 1;
+            nova.ArraySize = 1;
+            tela.dispositivo()->CreateTexture2D(&nova, nullptr, &copiasExtras[i]);
+        }
+        if (copiasExtras[i]) {
+            tela.contexto()->CopyResource(copiasExtras[i].Get(), extra.textura);
+        }
+        telasExtras[i]->liberarQuadro();
+    }
+
     QuadroCapturado quadro;
     // Prazo curto: a interface não pode ficar esperando a tela mudar, senão
     // clique e digitação engasgam.
@@ -1131,10 +1234,20 @@ void Aplicacao::Interno::bombearCaptura() {
                 // fps escolhido. Limitar de novo aqui, com o mesmo intervalo,
                 // só faria perder um quadro sim outro não por arredondamento.
                 ultimoEncode = agoraCaptura;
-                // A câmera entra aqui, no mesmo Blt que converte a cor. Quando
-                // ela ainda não entregou quadro nenhum, quadro() devolve nulo e
-                // sai só a tela - sem buraco preto no canto esperando por ela.
-                if (auto* nv12 = conversor.converter(quadroAtual, camera.quadro())) {
+
+                // Tudo que entra no quadro, na ordem em que a composição foi
+                // montada: a tela principal, as extras e a câmera por último.
+                //
+                // A câmera e as telas extras podem estar nulas: elas entregam
+                // no ritmo delas, e uma entrada nula é pulada em vez de abrir
+                // buraco preto. O resto do quadro sai igual.
+                std::vector<ID3D11Texture2D*> entradas;
+                entradas.reserve(2 + telasExtras.size());
+                entradas.push_back(quadroAtual);
+                for (auto& copia : copiasExtras) entradas.push_back(copia.Get());
+                if (camera.ativa()) entradas.push_back(camera.quadro());
+
+                if (auto* nv12 = conversor.compor(entradas)) {
                     encoder.codificar(nv12,
                                       std::chrono::duration_cast<std::chrono::microseconds>(
                                           agoraCaptura.time_since_epoch())
@@ -1202,8 +1315,45 @@ bool Aplicacao::Interno::comecarTransmissao() {
     // dentro da própria trava: a troca de monitor solta antes de chegar aqui.
     std::lock_guard travaTela(travaCaptura);
 
-    const auto& m = tela.monitor();
     const Qualidade& q = kQualidades[qualidadeEscolhida];
+
+    // ---- só a câmera
+    //
+    // Caminho separado, e curto: a câmera vira a imagem principal em vez de ir
+    // para o canto, e o encoder é montado no tamanho dela. Tratar isso como
+    // "uma tela de zero pixels com a câmera por cima" daria um monte de casos
+    // especiais espalhados pelo resto da função.
+    if (soCamera) {
+        if (!camera.ativa() && !cameraEscolhida.empty()) {
+            camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto());
+        }
+        if (!camera.ativa()) {
+            aviso = L"Escolha uma câmera para transmitir sem a tela.";
+            return false;
+        }
+
+        const uint32_t entradaL = camera.largura();
+        const uint32_t entradaA = camera.altura();
+        const double escalaCam = (std::min)(
+            1.0, (std::min)(static_cast<double>(q.largura) / entradaL,
+                            static_cast<double>(q.altura) / entradaA));
+        const uint32_t saidaL = static_cast<uint32_t>(entradaL * escalaCam) & ~1u;
+        const uint32_t saidaA = static_cast<uint32_t>(entradaA * escalaCam) & ~1u;
+
+        // A entrada é NV12 aqui, e não BGRA: quem manda a imagem é a câmera.
+        // O conversor faz NV12 -> NV12, que continua valendo a pena - é ele
+        // quem redimensiona, e de graça.
+        if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), entradaL, entradaA, saidaL,
+                               saidaA, ColorConverter::Saida::Nv12, 0)) {
+            aviso = L"Não foi possível preparar a imagem da câmera.";
+            return false;
+        }
+        conversor.desligarComposicao();
+        info("transmitindo so a camera: {}x{}", saidaL, saidaA);
+        return montarEncoder(saidaL, saidaA, q);
+    }
+
+    const auto& m = tela.monitor();
 
     // A ENTRADA é o tamanho físico da textura, não o lógico.
     //
@@ -1225,37 +1375,125 @@ bool Aplicacao::Interno::comecarTransmissao() {
     // 1440x1080: mais pixels para codificar, mais banda gasta, e nenhum detalhe
     // a mais - o que chegava do outro lado era a mesma imagem, borrada. A
     // qualidade escolhida é um limite, não uma meta.
-    const double escala = std::min(1.0, std::min(static_cast<double>(q.largura) / m.largura,
-                                                  static_cast<double>(q.altura) / m.altura));
-    const uint32_t saidaL = static_cast<uint32_t>(m.largura * escala) & ~1u;
-    const uint32_t saidaA = static_cast<uint32_t>(m.altura * escala) & ~1u;
+    // Telas extras abrem ANTES da conta do tamanho: é o tamanho delas que entra
+    // na soma. Cada uma no mesmo dispositivo da principal - o Video Processor
+    // compõe as duas numa passada, e ele não atravessa dispositivos.
+    abrirTelasExtras();
+
+    // Larguras alinhadas por uma altura comum.
+    //
+    // Duas telas lado a lado precisam da mesma altura, senão uma fica flutuando
+    // com faixa preta em cima ou embaixo. A altura comum é a maior das lógicas;
+    // cada tela contribui com a largura que a proporção dela pede nessa altura.
+    struct Parte {
+        double largura;
+        uint32_t graus;
+    };
+    std::vector<Parte> partes;
+    uint32_t alturaComum = m.altura;
+    for (const auto& extra : telasExtras) {
+        if (extra->capturando()) alturaComum = (std::max)(alturaComum, extra->monitor().altura);
+    }
+    partes.push_back({static_cast<double>(m.largura) * alturaComum / m.altura, m.graus});
+    for (const auto& extra : telasExtras) {
+        if (!extra->capturando()) continue;
+        const auto& e = extra->monitor();
+        partes.push_back({static_cast<double>(e.largura) * alturaComum / e.altura, e.graus});
+    }
+
+    double larguraTotal = 0;
+    for (const auto& p : partes) larguraTotal += p.largura;
+
+    // A SAÍDA respeita a proporção do conjunto, dentro do que a qualidade
+    // permite. E nunca AMPLIA.
+    //
+    // Antes eu esticava qualquer tela para o tamanho fixo do preset, então um
+    // monitor em pé era espremido para 16:9 e chegava achatado. Aqui a escala é
+    // a mesma nos dois eixos, e o que sobra é resolução, não deformação.
+    //
+    // Sem o teto em 1, um monitor 1024x768 no preset de 1080p era esticado para
+    // 1440x1080: mais pixels para codificar, mais banda gasta, e nenhum detalhe
+    // a mais - o que chegava do outro lado era a mesma imagem, borrada. A
+    // qualidade escolhida é um limite, não uma meta.
+    const double escala =
+        (std::min)(1.0, (std::min)(static_cast<double>(q.largura) / larguraTotal,
+                                   static_cast<double>(q.altura) / alturaComum));
+    const uint32_t saidaL = static_cast<uint32_t>(larguraTotal * escala) & ~1u;
+    const uint32_t saidaA = static_cast<uint32_t>(alturaComum * escala) & ~1u;
 
     if (!conversor.iniciar(tela.dispositivo(), tela.contexto(), entradaL, entradaA, saidaL, saidaA,
-                           ColorConverter::Saida::Nv12, m.graus)) {
+                           ColorConverter::Saida::Nv12, 0)) {
         aviso = L"Não foi possível preparar a conversão de cor.";
         return false;
     }
 
-    // A sobreposição é preparada depois do conversor de propósito: só aí se
-    // sabe o tamanho do quadro final, que é o que define onde a câmera cabe no
-    // canto.
+    // Onde cada imagem cai. O giro vai por pedaço: um monitor em pé ao lado de
+    // um deitado é o caso comum de quem tem dois.
+    std::vector<ColorConverter::Pedaco> pedacos;
+    double x = 0;
+    for (const auto& p : partes) {
+        ColorConverter::Pedaco pedaco;
+        pedaco.esquerda = static_cast<int32_t>(x * escala);
+        pedaco.topo = 0;
+        pedaco.direita = static_cast<int32_t>((x + p.largura) * escala);
+        pedaco.baixo = static_cast<int32_t>(saidaA);
+        pedaco.graus = p.graus;
+        pedacos.push_back(pedaco);
+        x += p.largura;
+    }
+
+    // A câmera entra por último, no canto de baixo à direita do quadro inteiro.
     //
-    // A câmera em si já costuma estar aberta - ela abre quando é escolhida,
-    // para a prévia. Aqui ela só é aberta quando a transmissão começa antes de
-    // alguém ter mexido na lista, que é o caso de quem já tinha a câmera
-    // guardada no config.
+    // Ela já costuma estar aberta - abre quando é escolhida, para a prévia.
+    // Aqui só é aberta quando a transmissão começa antes de alguém ter mexido
+    // na lista, que é o caso de quem já tinha a câmera guardada no config.
     if (!cameraEscolhida.empty()) {
         if (!camera.ativa()) {
             camera.iniciar(cameraEscolhida, tela.dispositivo(), tela.contexto());
         }
         if (camera.ativa()) {
-            conversor.prepararSobreposicao(camera.largura(), camera.altura());
+            // Um quarto da largura com uma tela, menos com duas: numa
+            // composição de dois monitores, um quarto do total já é do tamanho
+            // de meia tela.
+            const double fatia = (partes.size() > 1) ? 6.0 : 4.0;
+            const int32_t margem = static_cast<int32_t>(saidaL / 48);
+            const int32_t larguraCam = static_cast<int32_t>(saidaL / fatia);
+            const int32_t alturaCam = static_cast<int32_t>(
+                static_cast<double>(larguraCam) * camera.altura() / camera.largura());
+
+            ColorConverter::Pedaco canto;
+            canto.direita = static_cast<int32_t>(saidaL) - margem;
+            canto.baixo = static_cast<int32_t>(saidaA) - margem;
+            canto.esquerda = canto.direita - larguraCam;
+            canto.topo = canto.baixo - alturaCam;
+            pedacos.push_back(canto);
         }
     }
 
+    if (pedacos.size() > 1 && !conversor.prepararComposicao(pedacos)) {
+        // A placa não deu conta de compor. Cai para a tela principal sozinha,
+        // que é melhor do que não transmitir nada.
+        gl::aviso("nao foi possivel compor {} imagens; indo so com a tela principal",
+                  pedacos.size());
+        fecharTelasExtras();
+        conversor.desligarComposicao();
+    }
+
+    info("transmitindo {} tela(s){}: {}x{}", partes.size(),
+         camera.ativa() ? " e a camera" : "", saidaL, saidaA);
+    return montarEncoder(saidaL, saidaA, q);
+}
+
+// Encoder, áudio e rede: a parte da transmissão que não depende de a imagem
+// vir de uma tela, de duas ou da câmera.
+//
+// Ficava tudo dentro do comecarTransmissao. Separar foi o que permitiu o
+// caminho de "só a câmera" existir sem repetir noventa linhas nem encher a
+// função de casos especiais.
+bool Aplicacao::Interno::montarEncoder(uint32_t largura, uint32_t altura, const Qualidade& q) {
     ConfigEncoder cfg;
-    cfg.largura = conversor.largura();
-    cfg.altura = conversor.altura();
+    cfg.largura = largura;
+    cfg.altura = altura;
     cfg.fps = q.fps;
     cfg.bitrate = q.bitrate;
 
@@ -2013,6 +2251,154 @@ void Aplicacao::Interno::tecla(wchar_t c) {
     }
 }
 
+// Troca o monitor PRINCIPAL: o que define de qual placa vem o dispositivo D3D.
+//
+// É a operação cara. Todo o resto - encoder, decodificador, interface, câmera -
+// vive nesse dispositivo, e trocá-lo significa refazer tudo. Por isso ligar uma
+// segunda tela não passa por aqui: a extra entra por iniciarCom, no dispositivo
+// que já existe.
+void Aplicacao::Interno::trocarPrincipal(int novo) {
+    const bool estavaTransmitindo = transmitindo;
+    // So o encode: a conexao com o servidor continua de pe. Antes
+    // isto chamava pararTransmissao, que limpa o mapa de conexoes -
+    // trocar de monitor derrubava a chamada inteira e a
+    // renegociacao seguinte falhava.
+    pararEncodeSomente();
+
+    // A câmera guarda texturas do dispositivo D3D atual, e trocar
+    // de monitor cria outro. Ela volta logo abaixo, no novo.
+    soltarCameraDoDispositivo();
+
+    // O renderizador vive no dispositivo D3D11 da captura. Trocar de
+    // monitor destrói esse dispositivo, então ele precisa soltar
+    // tudo ANTES - senão fica com uma cadeia de troca apontando para
+    // um dispositivo morto, e a nova criação falha em silêncio
+    // porque o DXGI só aceita uma cadeia por janela.
+    render.liberar();
+    cursorPronto = false;
+
+    monitorEscolhido = novo;
+    // Trocar o monitor troca o objeto de duplicação por baixo da
+    // thread de captura. Sem esta trava ela estaria adquirindo
+    // quadro de um objeto que deixou de existir no meio da chamada.
+    {
+        std::lock_guard travaTela(travaCaptura);
+        if (quadroAtual) {
+            tela.liberarQuadro();
+            quadroAtual = nullptr;
+        }
+        {
+            std::lock_guard t(travaPrevia);
+            quadroPrevia = nullptr;
+        }
+        for (auto& t : previaTex) t.Reset();
+        previaLargura = 0;
+        previaAltura = 0;
+        cursorPronto = false;
+
+        // O decodificador também: ele nasceu amarrado ao dispositivo
+        // D3D antigo, e trocar de monitor cria um novo. Sem derrubar
+        // aqui, ele seguia decodificando para uma GPU que não é mais
+        // a nossa - e a tela de quem estava transmitindo
+        // simplesmente não aparecia mais depois da troca.
+        decodificando.store(false);
+        temVideo.notify_all();
+        if (threadVideo.joinable()) threadVideo.join();
+        decodificador.parar();
+        {
+            std::lock_guard t(travaTransmissoes);
+            transmissoes.clear();
+            noPalco.clear();
+        }
+
+        if (!tela.iniciar(static_cast<uint32_t>(novo))) {
+            aviso = L"Não foi possível capturar esse monitor.";
+            tela.iniciar(0);
+            monitorEscolhido = 0;
+        }
+    }
+    if (!render.iniciar(janela, tela.dispositivo())) {
+        aviso = L"A troca de monitor falhou. Reabra o aplicativo.";
+        return;
+    }
+    reabrirCamera();
+    if (estavaTransmitindo) comecarTransmissao();
+}
+
+// Liga ou desliga uma tela na composição.
+//
+// Uma regra só: clicar liga, clicar de novo desliga. A primeira da lista é a
+// principal - é dela que sai o dispositivo D3D - e desligar a principal promove
+// a próxima. Não dá para desligar a última: sem tela e sem câmera não há o que
+// transmitir, e um botão que deixa a pessoa sem imagem nenhuma não é escolha, é
+// armadilha.
+void Aplicacao::Interno::alternarTela(int indice) {
+    if (indice < 0 || indice >= static_cast<int>(monitores.size())) return;
+
+    // Clicar numa tela sai do modo "só a câmera": são a mesma escolha.
+    if (soCamera) {
+        soCamera = false;
+        monitoresExtras.clear();
+        config.salvar();
+        if (indice == monitorEscolhido) {
+            reiniciarEncode();
+            return;
+        }
+        trocarPrincipal(indice);
+        return;
+    }
+
+    const auto naLista = std::find(monitoresExtras.begin(), monitoresExtras.end(), indice);
+    if (naLista != monitoresExtras.end()) {
+        monitoresExtras.erase(naLista);
+        config.telasExtras = monitoresExtras;
+        config.salvar();
+        reiniciarEncode();
+        return;
+    }
+
+    if (indice == monitorEscolhido) {
+        // Desligar a principal: a próxima extra assume. Sem extras, só dá para
+        // desligar indo para "só a câmera", e isso é o outro botão.
+        if (monitoresExtras.empty()) {
+            aviso = cameras.empty()
+                        ? L"É a única tela ligada."
+                        : L"É a única tela ligada. Use \"Só a câmera\" para transmitir sem tela.";
+            return;
+        }
+        const int assume = monitoresExtras.front();
+        monitoresExtras.erase(monitoresExtras.begin());
+        trocarPrincipal(assume);
+        return;
+    }
+
+    // Tela nova entrando na composição, sem mexer no dispositivo.
+    monitoresExtras.push_back(indice);
+    std::sort(monitoresExtras.begin(), monitoresExtras.end());
+    config.telasExtras = monitoresExtras;
+    config.salvar();
+    reiniciarEncode();
+}
+
+// Liga e desliga o modo "só a câmera".
+void Aplicacao::Interno::alternarSoCamera() {
+    soCamera = !soCamera;
+    config.soCamera = soCamera;
+    if (soCamera) {
+        // Este modo precisa de uma câmera. Sem nenhuma escolhida, pega a
+        // primeira - deixar o modo ligado sem transmitir nada seria pior.
+        monitoresExtras.clear();
+        config.telasExtras.clear();
+        if (cameraEscolhida.empty() && !cameras.empty()) {
+            cameraEscolhida = cameras.front().id;
+            config.camera = cameraEscolhida;
+            reabrirCamera();
+        }
+    }
+    config.salvar();
+    reiniciarEncode();
+}
+
 void Aplicacao::Interno::clique(float x, float y) {
     if (dentro(btFechar, x, y)) {
         ::PostMessageW(janela, WM_CLOSE, 0, 0);
@@ -2082,76 +2468,31 @@ void Aplicacao::Interno::clique(float x, float y) {
         return;
     }
 
+    if (!cameras.empty() && dentro(btSoCamera, x, y)) {
+        soCamera = !soCamera;
+        if (soCamera) {
+            // Só a câmera precisa de uma câmera. Se não havia nenhuma
+            // escolhida, pega a primeira em vez de deixar a pessoa com um modo
+            // ligado que não transmite nada.
+            if (cameraEscolhida.empty()) {
+                cameraEscolhida = cameras.front().id;
+                aplicarCamera();
+            }
+            monitoresExtras.clear();
+        }
+        config.salvar();
+        reiniciarEncode();
+        return;
+    }
+
+    if (!cameras.empty() && dentro(btSoCamera, x, y)) {
+        alternarSoCamera();
+        return;
+    }
+
     for (size_t i = 0; i < btMonitores.size(); ++i) {
         if (dentro(btMonitores[i], x, y)) {
-            const int novo = static_cast<int>(i);
-            if (novo != monitorEscolhido) {
-                const bool estavaTransmitindo = transmitindo;
-                // So o encode: a conexao com o servidor continua de pe. Antes
-                // isto chamava pararTransmissao, que limpa o mapa de conexoes -
-                // trocar de monitor derrubava a chamada inteira e a
-                // renegociacao seguinte falhava.
-                pararEncodeSomente();
-
-                // A câmera guarda texturas do dispositivo D3D atual, e trocar
-                // de monitor cria outro. Ela volta logo abaixo, no novo.
-                soltarCameraDoDispositivo();
-
-                // O renderizador vive no dispositivo D3D11 da captura. Trocar de
-                // monitor destrói esse dispositivo, então ele precisa soltar
-                // tudo ANTES - senão fica com uma cadeia de troca apontando para
-                // um dispositivo morto, e a nova criação falha em silêncio
-                // porque o DXGI só aceita uma cadeia por janela.
-                render.liberar();
-                cursorPronto = false;
-
-                monitorEscolhido = novo;
-                // Trocar o monitor troca o objeto de duplicação por baixo da
-                // thread de captura. Sem esta trava ela estaria adquirindo
-                // quadro de um objeto que deixou de existir no meio da chamada.
-                {
-                    std::lock_guard travaTela(travaCaptura);
-                    if (quadroAtual) {
-                        tela.liberarQuadro();
-                        quadroAtual = nullptr;
-                    }
-                    {
-                        std::lock_guard t(travaPrevia);
-                        quadroPrevia = nullptr;
-                    }
-                    for (auto& t : previaTex) t.Reset();
-                    previaLargura = 0;
-                    previaAltura = 0;
-                    cursorPronto = false;
-
-                    // O decodificador também: ele nasceu amarrado ao dispositivo
-                    // D3D antigo, e trocar de monitor cria um novo. Sem derrubar
-                    // aqui, ele seguia decodificando para uma GPU que não é mais
-                    // a nossa - e a tela de quem estava transmitindo
-                    // simplesmente não aparecia mais depois da troca.
-                    decodificando.store(false);
-                    temVideo.notify_all();
-                    if (threadVideo.joinable()) threadVideo.join();
-                    decodificador.parar();
-                    {
-                        std::lock_guard t(travaTransmissoes);
-                        transmissoes.clear();
-                        noPalco.clear();
-                    }
-
-                    if (!tela.iniciar(static_cast<uint32_t>(novo))) {
-                        aviso = L"Não foi possível capturar esse monitor.";
-                        tela.iniciar(0);
-                        monitorEscolhido = 0;
-                    }
-                }
-                if (!render.iniciar(janela, tela.dispositivo())) {
-                    aviso = L"A troca de monitor falhou. Reabra o aplicativo.";
-                    return;
-                }
-                reabrirCamera();
-                if (estavaTransmitindo) comecarTransmissao();
-            }
+            alternarTela(static_cast<int>(i));
             return;
         }
     }
@@ -2584,7 +2925,7 @@ void Aplicacao::Interno::desenharAoVivo() {
         return area;
     };
 
-    secao(L"MONITOR");
+    secao(monitores.size() > 1 ? L"TELAS  ·  CLIQUE PARA JUNTAR" : L"TELA");
     btMonitores.clear();
     for (size_t i = 0; i < monitores.size(); ++i) {
         // "Monitor 1" em vez de "\\.\DISPLAY2": o caminho do dispositivo não
@@ -2592,7 +2933,22 @@ void Aplicacao::Interno::desenharAoVivo() {
         const std::wstring nome = L"Monitor " + std::to_wstring(i + 1);
         const std::wstring tamanho = std::to_wstring(monitores[i].largura) + L"×" +
                                      std::to_wstring(monitores[i].altura);
-        btMonitores.push_back(item(nome, tamanho, static_cast<int>(i) == monitorEscolhido));
+        const int indice = static_cast<int>(i);
+        const bool ligado = !soCamera && (indice == monitorEscolhido ||
+                                          std::find(monitoresExtras.begin(),
+                                                    monitoresExtras.end(),
+                                                    indice) != monitoresExtras.end());
+        btMonitores.push_back(item(nome, tamanho, ligado));
+    }
+
+    // Só a câmera, sem tela nenhuma.
+    //
+    // Fica junto das telas porque é a mesma pergunta - o que vai na imagem - e
+    // é excludente com elas: escolher esta desliga todas, e clicar numa tela
+    // desliga esta.
+    btSoCamera = {};
+    if (!cameras.empty()) {
+        btSoCamera = item(L"Só a câmera", L"sem tela", soCamera);
     }
 
     y += 6;

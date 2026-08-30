@@ -245,6 +245,54 @@ bool ScreenCapture::iniciar(uint32_t indiceMonitor) {
     return true;
 }
 
+// Abre a duplicação reaproveitando um dispositivo que já existe.
+//
+// Transmitir dois monitores ao mesmo tempo exige as duas texturas no MESMO
+// dispositivo D3D: o Video Processor compõe as duas numa passada só, e ele não
+// atravessa dispositivos. Criar um dispositivo por monitor daria duas texturas
+// que nunca poderiam se encontrar sem passar pela memória principal - que é a
+// cópia que o desenho inteiro deste cliente existe para evitar.
+bool ScreenCapture::iniciarCom(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto,
+                               uint32_t indiceMonitor) {
+    parar();
+    if (!dispositivo || !contexto) return false;
+
+    uint32_t visto = 0;
+    paraCadaSaida([&](ComPtr<IDXGIAdapter1>& adaptador, ComPtr<IDXGIOutput>& saida) {
+        DXGI_OUTPUT_DESC descricao{};
+        if (FAILED(saida->GetDesc(&descricao)) || !descricao.AttachedToDesktop) return true;
+        if (visto++ != indiceMonitor) return true;
+
+        d_->adaptador = adaptador;
+        saida.As(&d_->saida);
+        d_->info.indice = indiceMonitor;
+        d_->info.nome = paraUtf8(descricao.DeviceName);
+        return false;
+    });
+
+    if (!d_->saida) {
+        erro("monitor {} nao encontrado", indiceMonitor);
+        return false;
+    }
+
+    d_->dispositivo = dispositivo;
+    d_->contexto = contexto;
+
+    // As medidas e a rotação são lidas dentro do criarDuplicacao, junto com a
+    // duplicação em si - o mesmo caminho que trata a troca de resolução.
+    if (!d_->criarDuplicacao()) {
+        // Monitor em adaptador diferente é o caso que falha aqui, e falha com
+        // DXGI_ERROR_UNSUPPORTED. Não é fatal: o monitor extra simplesmente não
+        // entra na transmissão.
+        aviso("nao foi possivel duplicar o monitor {} neste dispositivo", indiceMonitor);
+        return false;
+    }
+
+    info("tela extra: monitor {} ({}) {}x{}", d_->info.indice, d_->info.nome, d_->info.largura,
+         d_->info.altura);
+    return true;
+}
+
 bool ScreenCapture::Interno::criarDuplicacao() {
     duplicacao.Reset();
 

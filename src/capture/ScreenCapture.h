@@ -103,6 +103,17 @@ public:
     // dá para entrar na sala, assistir e usar a câmera sem ela. Quando faltar,
     // proximoQuadro() devolve PrecisaReiniciar e ela é aberta depois.
     bool iniciar(uint32_t indiceMonitor);
+
+    // Abre a duplicação num dispositivo D3D que já existe, em vez de criar o
+    // seu. É o que permite transmitir dois monitores ao mesmo tempo: o Video
+    // Processor compõe as duas texturas numa passada só, e para isso elas
+    // precisam ser do mesmo dispositivo.
+    //
+    // Falha quando o monitor está em outro adaptador — placa híbrida com uma
+    // tela em cada. Quem chama segue sem esse monitor.
+    bool iniciarCom(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto,
+                    uint32_t indiceMonitor);
+
     void parar();
 
     // Verdadeiro quando a duplicação está aberta e dá para capturar agora.
