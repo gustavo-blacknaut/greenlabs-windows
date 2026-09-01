@@ -89,6 +89,9 @@ struct ScreenCapture::Interno {
     MonitorInfo info;
     bool quadroEmMaos = false;
 
+    // O dispositivo caiu para WARP: nao ha GPU utilizavel nesta sessao.
+    bool warp = false;
+
     // Para não repetir a mesma linha de erro a cada quadro.
     HRESULT ultimoErro = S_OK;
     std::chrono::steady_clock::time_point momentoDoErro{};
@@ -233,6 +236,7 @@ bool ScreenCapture::iniciar(uint32_t indiceMonitor) {
     // Vale registrar qual ganhou: a diferença entre a primeira e a última é a
     // diferença entre transmitir 1080p sem sentir e a máquina inteira sofrer.
     info("D3D11: {}", escolhida);
+    d_->warp = (escolhida == std::string_view("WARP (software)"));
     if (escolhida != tentativas[0].descricao) {
         aviso("sem o caminho preferido de video - o codec pode cair para software");
     }
@@ -351,6 +355,8 @@ bool ScreenCapture::Interno::criarDuplicacao() {
 }
 
 bool ScreenCapture::capturando() const { return d_->duplicacao != nullptr; }
+
+bool ScreenCapture::semGPU() const { return d_->warp; }
 
 bool ScreenCapture::reiniciar() {
     using namespace std::chrono;
