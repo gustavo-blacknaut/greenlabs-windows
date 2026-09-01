@@ -119,6 +119,18 @@ public:
     // Verdadeiro quando a duplicação está aberta e dá para capturar agora.
     bool capturando() const;
 
+    // Verdadeiro quando o dispositivo é WARP — o rasterizador por software.
+    //
+    // Isto separa dois problemas que davam o mesmo sintoma na tela: "a
+    // duplicação está negada agora" (UAC, tela de bloqueio, jogo em tela cheia
+    // exclusiva), que passa sozinho, e "não há GPU utilizável", que não passa.
+    // O segundo acontece depois que o driver de vídeo cai e se recupera: o
+    // Windows registra o tombo, o D3D11 passa a recusar todos os adaptadores
+    // com DXGI_ERROR_UNSUPPORTED, e só volta ao normal reiniciando. Sem
+    // distinguir, o aplicativo ficava tentando abrir a duplicação para sempre,
+    // sem nada na tela e sem dizer por quê.
+    bool semGPU() const;
+
     // Recria a duplicação depois de ResultadoQuadro::PrecisaReiniciar.
     //
     // Tem intervalo mínimo entre tentativas: quando a duplicação está negada de

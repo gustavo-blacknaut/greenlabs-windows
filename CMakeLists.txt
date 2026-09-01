@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(GreenLabs
-    VERSION 1.1.5
+    VERSION 1.1.6
     DESCRIPTION "Cliente nativo do GreenLabs Live Streaming"
     LANGUAGES C CXX)
 

@@ -3249,7 +3249,17 @@ void Aplicacao::Interno::desenharAoVivo() {
 
         const wchar_t* titulo;
         const wchar_t* dica;
-        if (!conectado.load()) {
+        // A placa de vídeo vem antes de tudo. Sem ela não há transmissão de
+        // tela possível, e mandar "clique em transmitir" nessa situação é
+        // mandar a pessoa clicar num botão que não vai fazer nada - foi
+        // exatamente assim que isto apareceu, com alguém clicando e o
+        // aplicativo "procurando imagem" para sempre, sem dizer o motivo.
+        if (tela.semGPU()) {
+            titulo = L"O driver de vídeo caiu";
+            dica = L"Sem placa de vídeo não dá para transmitir a tela. "
+                   L"Reinicie o computador para voltar ao normal — assistir e "
+                   L"a câmera continuam funcionando.";
+        } else if (!conectado.load()) {
             titulo = L"Você não está numa sala";
             dica = L"Entre numa sala para ver e ser visto.";
         } else {
