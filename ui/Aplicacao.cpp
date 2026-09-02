@@ -1,5 +1,7 @@
 ﻿#include "ui/Aplicacao.h"
 
+#include "ui/Bandeja.h"
+
 #include <windows.h>
 
 #include <windowsx.h>  // GET_X_LPARAM e GET_Y_LPARAM
@@ -133,6 +135,11 @@ struct Aplicacao::Interno {
     std::wstring motivoFalha;
 
     HWND janela = nullptr;
+
+    // O icone ao lado do relogio. Fechar a janela esconde para ca.
+    Bandeja bandeja;
+    bool avisouDaBandeja = false;   // o balao aparece uma vez so
+    bool saindoDeVerdade = false;   // "Sair" do menu: agora WM_CLOSE fecha mesmo
     Renderizador render;
 
     ScreenCapture tela;
@@ -703,13 +710,44 @@ Aplicacao::~Aplicacao() = default;
 
 namespace {
 
+// WM_APP e a primeira faixa livre para mensagens da propria aplicacao.
+constexpr UINT kMensagemDaBandeja = WM_APP + 1;
+
 LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
     auto* d = reinterpret_cast<Aplicacao::Interno*>(::GetWindowLongPtrW(janela, GWLP_USERDATA));
 
     switch (msg) {
         case WM_DESTROY:
+            if (d) d->bandeja.remover();
             ::PostQuitMessage(0);
             return 0;
+
+        // Fechar a janela esconde; não encerra.
+        //
+        // Programa de chamada que morre ao fechar a janela é o comportamento
+        // errado: fechar a janela do Discord no meio de uma conversa não
+        // desliga o microfone. Aqui a transmissão morria junto, no meio da
+        // chamada, e a única forma de continuar era deixar a janela aberta.
+        //
+        // Só esconde se a bandeja existir: sem ícone não haveria como trazer a
+        // janela de volta, e o programa viraria um processo invisível que só o
+        // gerenciador de tarefas mata.
+        case WM_CLOSE:
+            if (d && d->bandeja.existe() && !d->saindoDeVerdade) {
+                ::ShowWindow(janela, SW_HIDE);
+                if (!d->avisouDaBandeja) {
+                    d->avisouDaBandeja = true;
+                    d->bandeja.avisar(L"GreenLabs continua rodando",
+                                      L"A transmissão segue no ar. Clique no ícone para abrir, "
+                                      L"ou use o botão direito para sair.");
+                }
+                return 0;
+            }
+            break;
+
+        case kMensagemDaBandeja:
+            if (d && d->bandeja.tratar(janela, w, l)) return 0;
+            break;
 
         // A moldura que o Windows desenha por cima da janela.
         //
@@ -936,6 +974,19 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
         return false;
     }
     ::SetWindowLongPtrW(d_->janela, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(d_.get()));
+
+    // A bandeja antes de qualquer coisa que possa esconder a janela: sem o
+    // ícone, esconder seria perder o aplicativo.
+    d_->bandeja.criar(d_->janela, kMensagemDaBandeja, L"GreenLabs");
+    d_->bandeja.aoAbrir = [d = d_.get()] {
+        ::ShowWindow(d->janela, SW_SHOW);
+        ::ShowWindow(d->janela, SW_RESTORE);
+        ::SetForegroundWindow(d->janela);
+    };
+    d_->bandeja.aoSair = [d = d_.get()] {
+        d->saindoDeVerdade = true;
+        ::PostMessageW(d->janela, WM_CLOSE, 0, 0);
+    };
 
     // Preferências guardadas: ninguém quer digitar o endereço do servidor
     // toda vez que abre o aplicativo.
