@@ -128,6 +128,7 @@ add_library(greenlabs_core STATIC
     src/network/Pacer.cpp
     src/config/Config.cpp
     ui/Renderizador.cpp
+    ui/Bandeja.cpp
     ui/Aplicacao.cpp
 )
 
