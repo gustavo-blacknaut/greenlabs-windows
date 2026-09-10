@@ -4,7 +4,7 @@
 //
 // A duplicação de área de trabalho entrega a tela SEM o ponteiro do mouse, e a
 // forma dele por um caminho separado. Quem transmite tela precisa que o cursor
-// apareça — sem ele quem assiste não sabe para onde a pessoa está apontando.
+// apareça - sem ele quem assiste não sabe para onde a pessoa está apontando.
 //
 // O desenho acontece na GPU, sobre uma cópia do quadro. É uma cópia a mais por
 // quadro, dentro da própria placa, e é o preço de ter o ponteiro.

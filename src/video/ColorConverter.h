@@ -4,7 +4,7 @@
 //
 // A duplicação de área de trabalho entrega BGRA; o encoder H.264 quer NV12.
 // Fazer essa conversão na CPU custaria uma leitura da GPU para a memória
-// principal por quadro — a cópia mais cara do pipeline inteiro, e justamente a
+// principal por quadro - a cópia mais cara do pipeline inteiro, e justamente a
 // que o desenho do cliente existe para evitar.
 //
 // O Video Processor é a unidade de função fixa da placa: a conversão acontece
@@ -61,7 +61,7 @@ public:
     // já está lendo tudo de qualquer jeito.
     //
     // É assim que duas telas cabem lado a lado e a câmera cabe no canto, sem
-    // nada disso virar uma segunda faixa de vídeo — que o servidor não aceita.
+    // nada disso virar uma segunda faixa de vídeo - que o servidor não aceita.
     //
     // Devolve falso quando a placa não aceita tantas entradas ou não aceita os
     // formatos; aí quem chama compõe menos coisa.
@@ -69,7 +69,7 @@ public:
     void desligarComposicao();
 
     // A textura devolvida pertence ao conversor e é reaproveitada a cada
-    // quadro — quem consome precisa fazê-lo antes da próxima chamada.
+    // quadro - quem consome precisa fazê-lo antes da próxima chamada.
     //
     // Sem composição montada, usa só a primeira entrada, no quadro inteiro.
     // Entrada nula é pulada: é o caso de todo quadro em que uma das telas (ou

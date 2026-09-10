@@ -349,7 +349,7 @@ bool VideoEncoder::codificar(ID3D11Texture2D* nv12, int64_t tempoUs) {
         d_->drenarEventos();
         if (d_->entradasPedidas <= 0) {
             // O encoder ainda está mastigando o quadro anterior. Em tempo real
-            // a resposta certa é largar este e seguir para o próximo — esperar
+            // a resposta certa é largar este e seguir para o próximo - esperar
             // só empilharia atraso, que é exatamente o que não se quer.
             d_->quadrosDescartados.fetch_add(1);
             return true;

@@ -2,7 +2,7 @@
 
 // O que fica guardado entre uma execução e outra.
 //
-// Vai para %APPDATA%\GreenLabs\config.json — ninguém quer digitar o endereço do
+// Vai para %APPDATA%\GreenLabs\config.json - ninguém quer digitar o endereço do
 // servidor toda vez que abre o aplicativo. Só preferências: nada de senha,
 // nada de identificador, porque o GreenLabs não tem conta.
 
@@ -21,7 +21,7 @@ struct Config {
 
     // Transmitir o som do sistema junto com a tela. Ligado é o padrão, porque
     // é o motivo de o GreenLabs existir; desligado serve a quem só quer
-    // mostrar a tela — e gasta menos banda e menos máquina.
+    // mostrar a tela - e gasta menos banda e menos máquina.
     bool audio = true;
 
     // Volume do que CHEGA da chamada, de 0 a 100. Nao mexe no volume do

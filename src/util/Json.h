@@ -2,7 +2,7 @@
 
 // JSON mínimo, só o que o protocolo de sinalização usa.
 //
-// Escrever isto à mão mantém o projeto sem dependência externa — a mesma
+// Escrever isto à mão mantém o projeto sem dependência externa - a mesma
 // escolha do servidor em Go. São umas trezentas linhas contra um gerenciador de
 // pacotes inteiro, e o formato aqui é conhecido e fechado.
 //

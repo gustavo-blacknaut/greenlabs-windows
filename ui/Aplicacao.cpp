@@ -97,7 +97,7 @@ bool dentro(const D2D1_RECT_F& area, float x, float y) {
 enum class Tela { Entrada, AoVivo };
 
 // Taxa e resolução são fixas de propósito. Deixar o encoder seguir a taxa de
-// entrega da duplicação — que varia com o quanto a tela muda — faz o bitrate
+// entrega da duplicação - que varia com o quanto a tela muda - faz o bitrate
 // oscilar e o outro lado ver a imagem acelerar e travar. Fixando, cada quadro
 // tem o mesmo peso e o controle de bitrate tem um alvo estável.
 struct Qualidade {
@@ -1092,7 +1092,7 @@ bool Aplicacao::iniciar(const std::wstring& titulo, int largura, int altura,
             std::lock_guard trava(d_->travaPares);
             d_->pares.push_back(p);
         }
-        // Quem CHEGA é quem oferece — é o que o cliente web e o de Electron
+        // Quem CHEGA é quem oferece - é o que o cliente web e o de Electron
         // fazem, e seguir a mesma regra evita os dois lados oferecerem ao mesmo
         // tempo. Aqui só preparamos a conexão com a faixa pronta, para poder
         // responder à oferta que vem em seguida.
@@ -1243,7 +1243,7 @@ int Aplicacao::rodar() {
         // espera o vsync, num monitor de 144 Hz isso eram 144 repinturas
         // completas da interface por segundo. Fora de gastar GPU à toa, cada
         // volta é uma volta que o decodificador de vídeo e a thread de áudio
-        // não têm — é boa parte do que se via como tela e som travando.
+        // não têm - é boa parte do que se via como tela e som travando.
         //
         // 60 Hz é o teto do que o olho aproveita numa interface, e o vídeo
         // recebido vem a 30. O resto era desperdício.
@@ -2137,11 +2137,11 @@ std::shared_ptr<ConexaoPar> Aplicacao::Interno::abrirMidiaPara(const std::string
             std::lock_guard tf(t->travaFila);
             // H.264 não admite descarte no meio. Cada quadro P só faz sentido
             // a partir do anterior, então jogar fora o mais antigo corrompe
-            // tudo até o próximo keyframe — e é exatamente isso que se via
+            // tudo até o próximo keyframe - e é exatamente isso que se via
             // como a tela congelando.
             //
             // Se a fila enche, o decodificador parou de valer: limpa tudo de
-            // uma vez e espera o próximo keyframe — um corte só, em vez de
+            // uma vez e espera o próximo keyframe - um corte só, em vez de
             // corrupção contínua.
             if (t->fila.size() >= 30) {
                 t->fila.clear();
@@ -2196,7 +2196,7 @@ void Aplicacao::Interno::tratarRepasse(const std::string& de, const Json& msg) {
     //
     // A regra é a mesma dos outros clientes: quem tem o id maior cede. Como o
     // libdatachannel não desfaz uma descrição local, ceder significa recriar a
-    // conexão do zero — e é o que acontece aqui.
+    // conexão do zero - e é o que acontece aqui.
     if (conexao && tipo == "offer" && conexao->ofertaPendente()) {
         // Contra o servidor não há desempate: ele é quem renegocia para a sala
         // inteira, e uma oferta nossa que vença a dele deixa a mídia sem sair
@@ -3308,7 +3308,7 @@ void Aplicacao::Interno::desenharAoVivo() {
         if (tela.semGPU()) {
             titulo = L"O driver de vídeo caiu";
             dica = L"Sem placa de vídeo não dá para transmitir a tela. "
-                   L"Reinicie o computador para voltar ao normal — assistir e "
+                   L"Reinicie o computador para voltar ao normal - assistir e "
                    L"a câmera continuam funcionando.";
         } else if (!conectado.load()) {
             titulo = L"Você não está numa sala";
@@ -4121,7 +4121,7 @@ void Aplicacao::Interno::desenharModal() {
 //
 // Fundo escuro por cima da janela, cartão no meio, cabeçalho com o quadrado do
 // ícone, título, subtítulo e o X, e a fileira de abas. O que muda de um modal
-// para o outro é só o que vai dentro — e por isso os dois são idênticos por
+// para o outro é só o que vai dentro - e por isso os dois são idênticos por
 // construção, e não por eu ter copiado as medidas de um para o outro e
 // lembrado de manter as duas cópias iguais.
 Aplicacao::Interno::MolduraModal Aplicacao::Interno::desenharMoldura(

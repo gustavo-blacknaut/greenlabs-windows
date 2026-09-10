@@ -4,7 +4,7 @@
 //
 // Mesmo protocolo do servidor em Go e dos clientes em Electron, Android e
 // navegador: JSON sobre WebSocket, sem autenticação. Este arquivo é a tradução
-// direta do que o cliente web faz, e não inventa nada — trocar qualquer campo
+// direta do que o cliente web faz, e não inventa nada - trocar qualquer campo
 // aqui quebra a conversa com os outros três.
 //
 // Entrada:

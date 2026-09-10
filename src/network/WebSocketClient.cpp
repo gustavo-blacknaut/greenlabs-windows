@@ -211,7 +211,7 @@ bool WebSocketClient::conectar(const std::string& endereco, uint32_t prazoMs) {
     }
 
     // Lê a resposta até a linha em branco. O que vier depois já é quadro, e
-    // precisa ficar no buffer — descartar aqui perderia a primeira mensagem.
+    // precisa ficar no buffer - descartar aqui perderia a primeira mensagem.
     std::string cabecalhos;
     uint8_t pedaco[2048];
     for (;;) {

@@ -71,7 +71,7 @@ struct QuadroCapturado {
     int32_t cursorX = 0;
     int32_t cursorY = 0;
 
-    // Verdadeiro quando a forma do cursor mudou neste quadro — só aí vale a
+    // Verdadeiro quando a forma do cursor mudou neste quadro - só aí vale a
     // pena reenviá-la para a GPU.
     bool formaMudou = false;
 };
@@ -98,8 +98,8 @@ public:
     // duplicação.
     //
     // Só falha quando o dispositivo não pôde ser criado. A duplicação em si
-    // pode não abrir agora — durante o UAC, na tela de bloqueio, com jogo em
-    // tela cheia exclusiva — e isso não é motivo para o aplicativo desistir:
+    // pode não abrir agora - durante o UAC, na tela de bloqueio, com jogo em
+    // tela cheia exclusiva - e isso não é motivo para o aplicativo desistir:
     // dá para entrar na sala, assistir e usar a câmera sem ela. Quando faltar,
     // proximoQuadro() devolve PrecisaReiniciar e ela é aberta depois.
     bool iniciar(uint32_t indiceMonitor);
@@ -109,7 +109,7 @@ public:
     // Processor compõe as duas texturas numa passada só, e para isso elas
     // precisam ser do mesmo dispositivo.
     //
-    // Falha quando o monitor está em outro adaptador — placa híbrida com uma
+    // Falha quando o monitor está em outro adaptador - placa híbrida com uma
     // tela em cada. Quem chama segue sem esse monitor.
     bool iniciarCom(ID3D11Device* dispositivo, ID3D11DeviceContext* contexto,
                     uint32_t indiceMonitor);
@@ -119,7 +119,7 @@ public:
     // Verdadeiro quando a duplicação está aberta e dá para capturar agora.
     bool capturando() const;
 
-    // Verdadeiro quando o dispositivo é WARP — o rasterizador por software.
+    // Verdadeiro quando o dispositivo é WARP - o rasterizador por software.
     //
     // Isto separa dois problemas que davam o mesmo sintoma na tela: "a
     // duplicação está negada agora" (UAC, tela de bloqueio, jogo em tela cheia

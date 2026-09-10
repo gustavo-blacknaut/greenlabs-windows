@@ -3,7 +3,7 @@
 // Descoberta do processo a excluir do áudio.
 //
 // O Discord roda em vários processos (o principal, os renderizadores, o GPU).
-// Só um deles é dono da sessão de áudio, e o WASAPI exclui uma *árvore* — então
+// Só um deles é dono da sessão de áudio, e o WASAPI exclui uma *árvore* - então
 // é preciso achar quem toca som e subir até a raiz da árvore do Discord.
 
 #include <cstdint>
@@ -34,7 +34,7 @@ std::vector<uint32_t> pidsComSessaoDeAudio();
 //
 // A subida para na primeira vez que o pai NÃO casa com os nomes. Sem essa
 // guarda a subida chega no explorer.exe e a árvore excluída passa a ser a
-// máquina inteira — foi exatamente o que aconteceu na versão 0.2.7 do app em
+// máquina inteira - foi exatamente o que aconteceu na versão 0.2.7 do app em
 // Electron: o Discord acabava dentro da árvore "própria" e nunca era excluído.
 uint32_t acharRaizParaExcluir(const std::vector<std::string>& nomes);
 

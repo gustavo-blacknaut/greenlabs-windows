@@ -2,7 +2,7 @@
 
 // Ícones desenhados, não escritos.
 //
-// A primeira versão usava caracteres — ⚙, ✕, ▣, ✓. Depender de glifo é depender
+// A primeira versão usava caracteres - ⚙, ✕, ▣, ✓. Depender de glifo é depender
 // de a fonte instalada ter aquele ponto de código: quando não tem, o Windows
 // desenha o retângulo vazio, e foi o que apareceu no lugar da engrenagem. Os
 // que existem também não ajudam muito, porque cada fonte desenha o seu com um
