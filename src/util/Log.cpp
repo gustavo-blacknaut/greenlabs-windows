@@ -91,7 +91,7 @@ void escreverLog(Nivel nivel, std::string_view texto) {
 
     if (g_arquivo) {
         std::fwrite(linha.data(), 1, linha.size(), g_arquivo);
-        // Sem flush, uma queda leva junto exatamente as últimas linhas — as que
+        // Sem flush, uma queda leva junto exatamente as últimas linhas - as que
         // dizem o que aconteceu.
         std::fflush(g_arquivo);
     }

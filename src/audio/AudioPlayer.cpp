@@ -34,7 +34,7 @@ constexpr size_t kMaximo = kQuadrosPorMs * 160;
 // Onde a correção chega ao desvio máximo.
 constexpr size_t kLimite = kQuadrosPorMs * 300;
 
-// Quanto a velocidade pode desviar. 2% é imperceptível — meio tom são 6%.
+// Quanto a velocidade pode desviar. 2% é imperceptível - meio tom são 6%.
 constexpr double kDesvioMaximo = 0.02;
 
 // Potência de dois para o índice virar máscara em vez de divisão. 682 ms, muito
@@ -54,7 +54,7 @@ struct AudioPlayer::Interno {
     //
     // Antes isto era um vector com mutex, e o mutex era o problema: o erase da
     // frente é um memmove da fila inteira a cada 20 ms, com a trava na mão. E
-    // quem enfileira é a thread de rede do libdatachannel — a MESMA que entrega
+    // quem enfileira é a thread de rede do libdatachannel - a MESMA que entrega
     // o vídeo. Ou seja: o áudio segurava o vídeo e o vídeo segurava o áudio,
     // que é exatamente o que se ouvia e via quando os dois rodavam juntos.
     //
@@ -151,7 +151,7 @@ bool AudioPlayer::iniciar() {
 // ajustarVelocidade decide o passo de leitura a partir de quanto som há guardado.
 //
 // A fila oscila por dois motivos: a rede entrega irregular, e o relógio de quem
-// manda nunca é exatamente igual ao de quem toca — alguns quadros por hora de
+// manda nunca é exatamente igual ao de quem toca - alguns quadros por hora de
 // diferença já enchem ou esvaziam a fila.
 //
 // A resposta antiga era descartar (emenda audível) ou inserir silêncio (buraco

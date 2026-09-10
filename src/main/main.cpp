@@ -1,4 +1,4 @@
-// GreenLabs — cliente nativo para Windows.
+// GreenLabs - cliente nativo para Windows.
 //
 // Sem Electron, sem Chromium, sem Node.
 

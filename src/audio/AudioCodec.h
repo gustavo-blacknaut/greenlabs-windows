@@ -3,7 +3,7 @@
 // Opus, nos dois sentidos.
 //
 // A captura entrega float32 intercalado a 48 kHz, que é exatamente o que o
-// Opus quer nativamente — não há reamostragem no caminho.
+// Opus quer nativamente - não há reamostragem no caminho.
 
 #include <cstdint>
 #include <memory>

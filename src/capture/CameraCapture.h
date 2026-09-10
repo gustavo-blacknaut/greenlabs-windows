@@ -3,7 +3,7 @@
 // Captura de câmera com Media Foundation.
 //
 // Só imagem. A enumeração pede exclusivamente fontes de vídeo, então o
-// microfone da webcam nunca é aberto — nem por engano, nem como efeito
+// microfone da webcam nunca é aberto - nem por engano, nem como efeito
 // colateral de abrir a câmera. O som que sai daqui continua sendo só o do
 // sistema, e é o AudioCapture quem cuida dele.
 //
@@ -44,7 +44,7 @@ public:
 
     // Abre a câmera e começa a ler. id vazio pega a primeira que houver.
     //
-    // Falha sem drama quando a câmera está em uso por outro programa — que é o
+    // Falha sem drama quando a câmera está em uso por outro programa - que é o
     // caso comum de quem tem o Discord aberto. Quem chama segue sem câmera.
     bool iniciar(const std::string& id, ID3D11Device* dispositivo,
                  ID3D11DeviceContext* contexto);
@@ -55,7 +55,7 @@ public:
     //
     // A textura pertence à captura e vale até a próxima troca de quadro. Ela é
     // alternada entre duas, então quem desenha a partir dela tem um quadro
-    // inteiro de folga — o suficiente para uma passada do Video Processor.
+    // inteiro de folga - o suficiente para uma passada do Video Processor.
     ID3D11Texture2D* quadro();
 
     uint32_t largura() const;

@@ -1,4 +1,4 @@
-# GreenLabs — análise para migração do cliente para C++ nativo
+# GreenLabs - análise para migração do cliente para C++ nativo
 
 Análise do cliente atual (`C:\Users\geren\Downloads\meet`) feita antes de
 escrever qualquer código, conforme pedido. Nenhum arquivo do projeto Electron
@@ -10,14 +10,14 @@ foi alterado.
 
 **O cliente não é TypeScript.** É JavaScript com JSX, sem um único arquivo
 `.ts` ou `.tsx`. Isso importa para a migração: não existe nenhum contrato de
-tipos para servir de especificação — o comportamento só está descrito pelo
+tipos para servir de especificação - o comportamento só está descrito pelo
 código em si e pelos comentários. A tradução vai ter que ser lida linha a
 linha, não derivada de interfaces.
 
 **O "protocolo de transmissão" atual é WebRTC inteiro.** Isso é o ponto central
 desta análise e está detalhado na seção 9. Resumindo aqui porque muda tudo: o
 que trafega mídia hoje não é um formato do GreenLabs, é o stack WebRTC do
-Chromium — ICE, DTLS, SRTP, negociação SDP e os codecs. O que o servidor de
+Chromium - ICE, DTLS, SRTP, negociação SDP e os codecs. O que o servidor de
 sinalização carrega é só texto de controle. Tirar o Chromium significa
 substituir esse stack por outro compatível com ele, porque do outro lado da
 chamada continuam existindo um app Android e um navegador que só falam WebRTC.
@@ -33,7 +33,7 @@ chamada continuam existindo um app Android e um navegador que só falam WebRTC.
 | `GreenLabs.exe` (main) | Electron 43 / Node.js | Janela, bandeja, IPC, seletor de fontes, hospedagem, túnel, mute |
 | renderer | Chromium | **Toda a mídia**: WebRTC, captura, decodificação, e a UI React |
 | `AudioCapture.exe` | C# / .NET Framework 4.0 | WASAPI process loopback, exclusão do Discord |
-| `greenlabs-signaling.exe` | Go | Sinalização — só quando o usuário hospeda |
+| `greenlabs-signaling.exe` | Go | Sinalização - só quando o usuário hospeda |
 | `cloudflared` / `ngrok` | externo | Túnel público, opcional |
 | `powershell.exe` | script | `mute-audio.ps1`, mute por sessão de áudio |
 
@@ -77,20 +77,20 @@ Quatro canais distintos, e todos precisam de substituto:
 
 **1. IPC do Electron** (`preload.cjs`, 21 métodos expostos)
 Janela, bandeja, autostart, processos em execução, seletor de fontes,
-hospedagem, túnel, versão. Vira chamada de função direta em C++ — desaparece.
+hospedagem, túnel, versão. Vira chamada de função direta em C++ - desaparece.
 
-**2. HTTP local `127.0.0.1:25641`** — áudio
+**2. HTTP local `127.0.0.1:25641`** - áudio
 `AudioCapture.exe` serve PCM float32 cru por HTTP com streaming infinito.
 Cabeçalhos `X-Sample-Rate` e `X-Channels`. O renderer lê com `fetch` +
 `ReadableStream`, desentrelaça os canais e empurra para um `AudioWorklet` com
-ring buffer. Em C++ isso vira uma fila em memória no mesmo processo — o cano
+ring buffer. Em C++ isso vira uma fila em memória no mesmo processo - o cano
 HTTP inteiro deixa de existir.
 
-**3. HTTP local `127.0.0.1:8080`** — tela do Android
+**3. HTTP local `127.0.0.1:8080`** - tela do Android
 Mesmo desenho, do lado do app Android. Só existe no mobile; não afeta o
 cliente Windows.
 
-**4. WebSocket com o servidor de sinalização** — detalhado na seção 4.
+**4. WebSocket com o servidor de sinalização** - detalhado na seção 4.
 
 ### Captura de tela (hoje)
 
@@ -106,12 +106,12 @@ navigator.mediaDevices.getDisplayMedia({ video: {...}, audio: false })
 
 Por baixo, quem captura é o Chromium: DXGI Desktop Duplication para telas
 inteiras e Windows Graphics Capture / BitBlt para janelas. **A duplicação DXGI
-já é o método em uso** — não é algo a introduzir, é algo a preservar.
+já é o método em uso** - não é algo a introduzir, é algo a preservar.
 
 Perfis em `src/lib/media.js`: 480p15, 480p30, 720p30, 720p60, 1080p30, 1080p60,
 com bitrate de 700 kbps a 7,5 Mbps.
 
-### Captura de áudio (hoje) — **já é nativo**
+### Captura de áudio (hoje) - **já é nativo**
 
 Esta é a melhor notícia da análise. `AudioCapture.cs` já faz exatamente o que
 o pedido descreve no item 3:
@@ -125,14 +125,14 @@ o pedido descreve no item 3:
   via WMI
 
 São 466 linhas de C# que é quase inteiramente interop COM. **Traduzir para C++
-deixa esse código mais simples, não mais complicado** — as interfaces
+deixa esse código mais simples, não mais complicado** - as interfaces
 (`IAudioClient`, `IAudioCaptureClient`, `IMMDeviceEnumerator`) são nativas em
 C++, então somem as declarações de vtable, os `[Guid]`, o `NativeHandler`
 manual e o `Marshal.Copy`.
 
 ⚠️ **Cuidado ao portar:** existe uma função `SelfTree()` neste arquivo que na
 versão 0.2.7 subia até `explorer.exe` e descia de volta, engolindo o Discord
-dentro do "próprio processo" — resultado: o Discord nunca era excluído e o PC
+dentro do "próprio processo" - resultado: o Discord nunca era excluído e o PC
 travava. O código atual está correto; ao traduzir, esse comportamento precisa
 de teste explícito com o app **iniciado pelo Explorer**, não por terminal (foi
 exatamente assim que o defeito passou despercebido).
@@ -155,7 +155,7 @@ MediaStream (áudio) ──┼──> RTCPeerConnection.addTrack()
 Topologia **mesh**: cada participante abre uma `RTCPeerConnection` com todos os
 outros. 30 pessoas = 435 conexões no total, 29 por máquina.
 
-O codec real não está fixado no código — é negociado. **Não confirmei qual
+O codec real não está fixado no código - é negociado. **Não confirmei qual
 codec está sendo escolhido numa chamada real**, e isso precisa ser medido antes
 de qualquer decisão de encoder (ver seção 8, etapa 0).
 
@@ -163,14 +163,14 @@ de qualquer decisão de encoder (ver seção 8, etapa 0).
 
 Sala é só uma string. `createPeer` / `removePeer` mantêm `Map<peerId,
 RTCPeerConnection>`, `Map<peerId, nome>` e `Map<"peerId:streamId", metadados>`.
-Colisão de oferta é resolvida por *perfect negotiation* — o peer com id
+Colisão de oferta é resolvida por *perfect negotiation* - o peer com id
 lexicograficamente menor é o "polido" e faz rollback.
 
 ### Autenticação
 
 **Não existe.** Nenhum token, senha, login ou sessão em nenhum lugar do cliente,
 do servidor ou do site. Quem souber o endereço e o nome da sala entra. A pasta
-`auth/` da arquitetura proposta no pedido não tem nada para migrar — seria
+`auth/` da arquitetura proposta no pedido não tem nada para migrar - seria
 funcionalidade nova.
 
 ### Configurações
@@ -188,7 +188,7 @@ greenlabs:onboarded
 Em C++ vira um JSON em `%APPDATA%\GreenLabs\config.json`. **A migração precisa
 ler o localStorage existente uma vez** (fica em um LevelDB dentro de
 `%APPDATA%\GreenLabs\Local Storage\leveldb`) ou aceitar que o usuário reconfigure.
-Ler LevelDB só para isso não vale — melhor pedir para reconfigurar uma vez.
+Ler LevelDB só para isso não vale - melhor pedir para reconfigurar uma vez.
 
 ### UI
 
@@ -216,7 +216,7 @@ electron-builder --win  → NSIS one-click, 106 MB
 csc.exe AudioCapture.cs → AudioCapture.exe (18 KB)
 ```
 
-Sem assinatura de código válida — o electron-builder usa `signtool` com
+Sem assinatura de código válida - o electron-builder usa `signtool` com
 certificado de teste.
 
 ---
@@ -262,7 +262,7 @@ Regras de acoplamento:
 - `capture`, `encoder` e `network` **não incluem nada de `ui/`**
 - `ui/` fala com `streaming/` por uma fila de eventos, nunca direto com sockets
 - o núcleo de mídia compila e roda sem UI (dá para ter um `greenlabs-cli.exe`
-  que só transmite — útil para teste e para medir latência sem a janela no meio)
+  que só transmite - útil para teste e para medir latência sem a janela no meio)
 
 ### Threads
 
@@ -283,7 +283,7 @@ mutex no caminho de frame.
 ## 3. Arquivos que serão removidos
 
 **Nenhum, por enquanto.** O pedido é explícito: o Electron não sai até o C++
-funcionar. E há uma razão a mais para não apagar — o cliente web e o app Android
+funcionar. E há uma razão a mais para não apagar - o cliente web e o app Android
 continuam existindo e continuam usando o mesmo servidor.
 
 Quando o C++ estiver equivalente, saem do escopo do cliente Windows:
@@ -300,7 +300,7 @@ Quando o C++ estiver equivalente, saem do escopo do cliente Windows:
 | `index.html`, `vite.config.js` | sem bundler |
 | `package.json`, `node_modules` | sem npm |
 
-`electron/AudioCapture.cs`, `.exe` e `mute-audio.ps1` **não são removidos** —
+`electron/AudioCapture.cs`, `.exe` e `mute-audio.ps1` **não são removidos** -
 viram referência de tradução e ficam no repositório antigo.
 
 `server/` também fica: é usado pelo cliente web.
@@ -309,7 +309,7 @@ viram referência de tradução e ficam no repositório antigo.
 
 ## 4. Arquivos que serão migrados
 
-### 4.1 Protocolo de sinalização — migra 1:1
+### 4.1 Protocolo de sinalização - migra 1:1
 
 Este eu conheço com precisão porque reescrevi o servidor em Go. JSON sobre
 WebSocket, sem framing binário, sem compressão, sem autenticação.
@@ -362,18 +362,18 @@ Tradução direta, e mais curta que o original. O que precisa vir junto:
 
 | Do C# | Para o C++ |
 | --- | --- |
-| `NativeHandler` (vtable COM manual) | classe que implementa `IActivateAudioInterfaceCompletionHandler` e `IAgileObject` — some a gambiarra |
+| `NativeHandler` (vtable COM manual) | classe que implementa `IActivateAudioInterfaceCompletionHandler` e `IAgileObject` - some a gambiarra |
 | `PidsWithAudioSessions()` | `IAudioSessionManager2` + `IAudioSessionEnumerator`, igual |
-| `ParentMap()` via WMI | `CreateToolhelp32Snapshot` — mais rápido e sem WMI (era 2 consultas WMI por conexão, causa de travamento na 0.2.7) |
+| `ParentMap()` via WMI | `CreateToolhelp32Snapshot` - mais rápido e sem WMI (era 2 consultas WMI por conexão, causa de travamento na 0.2.7) |
 | `ReadAvailable()` + `List<float>` | ponteiro direto do `GetBuffer` para a fila, **sem cópia** |
-| servidor `HttpListener` | apagado — fila em memória |
+| servidor `HttpListener` | apagado - fila em memória |
 
 O retry de 5 tentativas na porta 25641 também some, já que a porta some.
 
 ### 4.3 `wasapi-audio-worklet.js` → ring buffer C++
 
 A lógica de `maxFill` adaptativo (piso de 40 ms, crescendo até 2× a maior
-rajada) foi resultado de medição — um teto fixo de 40 ms tocava só 66% do
+rajada) foi resultado de medição - um teto fixo de 40 ms tocava só 66% do
 áudio. **Esse número não é chute e deve ser preservado.**
 
 ### 4.4 `src/lib/media.js` → `src/config/Quality.h`
@@ -385,7 +385,7 @@ Os 6 perfis e o `configureSender` viram configuração do encoder. Direto.
 O trecho entre as linhas ~508 e ~740 de `src/main.jsx` é o coração: `makeOffer`,
 `createPeer`, `removePeer`, `connect`, `addLocalStream`, `removeLocalStream`.
 São cerca de 230 linhas que definem todo o comportamento de sala. Devem ser
-traduzidas mantendo a ordem das operações — a ordem importa. Dois exemplos
+traduzidas mantendo a ordem das operações - a ordem importa. Dois exemplos
 reais de defeitos já corrigidos que a tradução pode reintroduzir:
 
 - `pc.addTrack()` sem renegociar: o áudio é realmente enviado, mas o `ontrack`
@@ -447,14 +447,14 @@ greenlabs-windows/
 
 **Descartadas, com motivo:**
 
-- **libwebrtc** — resolveria compatibilidade de uma vez, mas o build precisa de
+- **libwebrtc** - resolveria compatibilidade de uma vez, mas o build precisa de
   `depot_tools`, baixa 2–4 GB de fontes e leva horas. Fica como plano B se a
   interoperabilidade com libdatachannel se mostrar inviável (seção 9).
-- **Qt** — resolveria a UI, mas licença comercial ou LGPL com DLLs, e adiciona
+- **Qt** - resolveria a UI, mas licença comercial ou LGPL com DLLs, e adiciona
   ~40 MB.
-- **WebView2** — seria o caminho mais rápido para reaproveitar a UI React
+- **WebView2** - seria o caminho mais rápido para reaproveitar a UI React
   inteira, mas é o Edge, ou seja **Chromium**. Contraria o requisito.
-- **FFmpeg** — pesado para o que é preciso; a Media Foundation cobre o caso.
+- **FFmpeg** - pesado para o que é preciso; a Media Foundation cobre o caso.
 
 ---
 
@@ -497,7 +497,7 @@ O instalador NSIS pode ser reaproveitado quase inteiro.
 
 Por etapas, com o Electron intacto o tempo todo e comparação lado a lado.
 
-### Etapa 0 — medir antes de decidir *(bloqueia tudo)*
+### Etapa 0 - medir antes de decidir *(bloqueia tudo)*
 
 Antes de escolher encoder, é preciso saber o que o cliente atual realmente
 negocia. Não dá para deduzir do código, porque é negociado em tempo de execução.
@@ -513,40 +513,40 @@ negocia. Não dá para deduzir do código, porque é negociado em tempo de execu
 encoda VP8, e aí entra libvpx ou força-se H.264 no SDP (o que exige confirmar
 que o Android e o navegador aceitam).
 
-### Etapa 1 — núcleo de captura, sem rede
+### Etapa 1 - núcleo de captura, sem rede
 
 `ScreenCapture` (DXGI) + `AudioCapture` (WASAPI exclude) + um `greenlabs-probe.exe`
 que só mede: frames por segundo, latência de `AcquireNextFrame`, se o Discord
 está mesmo fora do áudio. Comparável diretamente com o Electron.
 
-### Etapa 2 — encoder
+### Etapa 2 - encoder
 
 Media Foundation H.264 com as GPUs disponíveis, medindo latência de encode e
 tamanho de GOP. Saída para arquivo, para inspeção.
 
-### Etapa 3 — rede: sinalização
+### Etapa 3 - rede: sinalização
 
 `WebSocketClient` + `Protocol`, entrando numa sala de verdade e aparecendo no
 `/rooms` do servidor. Sem mídia ainda. Valida o protocolo inteiro isoladamente.
 
-### Etapa 4 — rede: mídia *(a etapa de risco)*
+### Etapa 4 - rede: mídia *(a etapa de risco)*
 
 libdatachannel: ICE, DTLS, SRTP, e envio de RTP H.264. **Critério de sucesso: o
 navegador do outro lado exibe o vídeo.** Se isso não funcionar em duas semanas
 de trabalho, é o sinal para migrar para libwebrtc.
 
-### Etapa 5 — recepção e renderização
+### Etapa 5 - recepção e renderização
 
 Decodificar os peers com D3D11VA e mostrar. A partir daqui o cliente C++ é
 utilizável sem interface.
 
-### Etapa 6 — UI
+### Etapa 6 - UI
 
 Só agora, com o núcleo pronto, como o próprio pedido prioriza. Começa pelo
 mínimo: conectar, escolher fonte, transmitir, ver. Depois configurações,
 onboarding, grade, zoom.
 
-### Etapa 7 — paridade e troca
+### Etapa 7 - paridade e troca
 
 Rodar os dois em paralelo, comparar latência e uso de recursos, e só então
 promover o C++ a cliente padrão.
@@ -555,7 +555,7 @@ promover o C++ a cliente padrão.
 
 ## 9. Problemas e riscos
 
-### 🔴 Risco 1 — Interoperabilidade WebRTC (o que decide o projeto)
+### 🔴 Risco 1 - Interoperabilidade WebRTC (o que decide o projeto)
 
 Do outro lado da chamada há um **app Android** e um **navegador**, e nenhum dos
 dois vai mudar. O cliente C++ precisa conversar com o WebRTC deles.
@@ -568,12 +568,12 @@ entrega pacotes RTP prontos. Isso significa implementar do lado do GreenLabs:
 - packetização Opus (RFC 7587)
 - responder a **NACK** (retransmissão) e **PLI/FIR** (pedido de keyframe)
 - gerar e ler **RTCP** Sender/Receiver Reports
-- **controle de congestionamento** — e aqui está o problema real
+- **controle de congestionamento** - e aqui está o problema real
 
 O WebRTC do Chromium usa GCC/TWCC para descobrir a banda disponível e ajustar o
 bitrate em tempo real. **O libdatachannel não faz isso.** Sem controle de
 congestionamento, uma rede que piora não reduz o bitrate: ela perde pacotes, e o
-vídeo trava — que é exatamente o sintoma que você já relatou nas versões
+vídeo trava - que é exatamente o sintoma que você já relatou nas versões
 anteriores.
 
 Mitigações, em ordem de preferência:
@@ -585,11 +585,11 @@ Mitigações, em ordem de preferência:
 
 **Recomendação honesta:** tratar a etapa 4 como um experimento com prazo. Se em
 duas semanas o navegador não exibir vídeo do cliente C++ de forma estável, ir
-para libwebrtc sem hesitar. O objetivo "sem Chromium" continua atendido — o
+para libwebrtc sem hesitar. O objetivo "sem Chromium" continua atendido - o
 libwebrtc é a biblioteca de mídia, não o navegador: nada de Blink, V8, nem
 processo de renderização.
 
-### 🟠 Risco 2 — Borda amarela na captura de janela
+### 🟠 Risco 2 - Borda amarela na captura de janela
 
 O pedido menciona explicitamente evitar bordas amarelas. Vale ser preciso sobre
 de onde ela vem:
@@ -597,15 +597,15 @@ de onde ela vem:
 - **DXGI Desktop Duplication** (tela inteira): sem borda. É o caminho principal.
 - **Windows.Graphics.Capture** (janela específica): desenha a borda amarela no
   Windows 10. No Windows 11 build 22000+ existe `IsBorderRequired = false`, mas
-  **é uma API restrita** — precisa de capacidade declarada em app empacotado.
+  **é uma API restrita** - precisa de capacidade declarada em app empacotado.
 
 Se a captura de janela individual for necessária no Windows 10 sem borda, as
 opções são `PrintWindow` com `PW_RENDERFULLCONTENT` (mais lento, por CPU) ou
 capturar a tela inteira e recortar. Nenhuma é ideal. **Vale confirmar se
-capturar janela isolada é mesmo necessário** — hoje o seletor oferece janelas,
+capturar janela isolada é mesmo necessário** - hoje o seletor oferece janelas,
 mas talvez a maioria dos usuários compartilhe tela inteira.
 
-### 🟠 Risco 3 — A malha de 30 pessoas fica muito mais cara em C++
+### 🟠 Risco 3 - A malha de 30 pessoas fica muito mais cara em C++
 
 Hoje o Chromium gerencia 29 `RTCPeerConnection` com codificação compartilhada:
 ele codifica **uma vez** e envia para todos. Uma implementação ingênua em C++
@@ -617,32 +617,32 @@ empacotado uma vez e os mesmos pacotes RTP vão para todos os peers, com
 sequência e SSRC por destino. Isso precisa estar na arquitetura desde o começo,
 não ser corrigido depois.
 
-### 🟡 Risco 4 — Perda das proteções já conquistadas
+### 🟡 Risco 4 - Perda das proteções já conquistadas
 
 Vários números neste código vieram de medição, não de bom senso, e uma tradução
 "limpa" tende a normalizá-los de volta ao valor errado:
 
 - `maxFill` adaptativo do ring buffer (fixo em 40 ms tocava 66% do áudio)
 - ping acumulado 1×/s por sala (por ping era O(n²): 8 Mbps com 30 pessoas)
-- `SelfTree()` — a versão errada engolia o Discord e travava o PC
+- `SelfTree()` - a versão errada engolia o Discord e travava o PC
 - renegociação obrigatória depois de `addTrack`
 
 Cada um desses deve virar um **teste**, não um comentário.
 
-### 🟡 Risco 5 — A UI não vai ser igual
+### 🟡 Risco 5 - A UI não vai ser igual
 
 São 2433 linhas de CSS com layout responsivo, animação e tema. O ImGui é modo
 imediato: dá para chegar perto e funcional, mas **não vai ser visualmente
 idêntico**, e tentar reproduzir pixel a pixel consome mais tempo que o resto do
 projeto junto. Vale acertar a expectativa agora.
 
-### 🟡 Risco 6 — SmartScreen
+### 🟡 Risco 6 - SmartScreen
 
 Um `.exe` novo e sem assinatura vai levar aviso do Windows nos primeiros
 downloads, e o instalador atual já não tem certificado válido. Não é bloqueante,
 mas é atrito para quem for instalar.
 
-### 🟢 Risco 7 — Manter dois clientes
+### 🟢 Risco 7 - Manter dois clientes
 
 Durante a migração, correções de comportamento precisam entrar nos dois. A
 mitigação é escopo: congelar funcionalidade nova no Electron durante a migração
@@ -652,8 +652,8 @@ e só corrigir defeito.
 
 ## Resumo executivo
 
-**O que já está pronto:** a captura de áudio com exclusão do Discord — o pedaço
-mais difícil e mais específico do projeto — já é código nativo e traduz para C++
+**O que já está pronto:** a captura de áudio com exclusão do Discord - o pedaço
+mais difícil e mais específico do projeto - já é código nativo e traduz para C++
 ficando mais simples. A captura de tela já usa DXGI. O protocolo de sinalização
 está documentado e tem um servidor em Go que eu escrevi e testei.
 
@@ -669,5 +669,5 @@ deduzir lendo o fonte.
 **Ganho esperado:** de 233 MB para 8–15 MB, com latência sob controle direto em
 vez de mediada pelo jitter buffer do Chromium.
 
-**Custo realista:** é um projeto de meses, não de semanas — a maior parte
+**Custo realista:** é um projeto de meses, não de semanas - a maior parte
 concentrada na etapa 4 e na UI.

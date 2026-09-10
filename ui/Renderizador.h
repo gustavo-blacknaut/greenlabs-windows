@@ -3,7 +3,7 @@
 // Desenho da interface: Direct3D 11 para o vídeo, Direct2D e DirectWrite para
 // o resto.
 //
-// Todos vêm no Windows SDK, então a interface não custa uma dependência nova —
+// Todos vêm no Windows SDK, então a interface não custa uma dependência nova -
 // a mesma regra que vale para a captura e o encoder. E o vídeo capturado já é
 // uma textura D3D11: pintá-la aqui é uma cópia dentro da própria GPU, sem
 // passar pela memória principal.
@@ -77,7 +77,7 @@ public:
     //
     // Passar nullptr redesenha o último quadro recebido. A duplicação de área de
     // trabalho só entrega quadro quando a tela muda, então na maior parte dos
-    // instantes não há nada novo — e apagar a imagem nesses instantes fazia a
+    // instantes não há nada novo - e apagar a imagem nesses instantes fazia a
     // prévia piscar sem parar.
     // A chave separa as imagens: "previa" para a propria tela, e o id da faixa
     // para cada pessoa transmitindo. Sem ela havia um cache so, e mostrar duas

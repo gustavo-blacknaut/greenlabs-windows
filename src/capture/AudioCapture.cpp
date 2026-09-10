@@ -20,7 +20,7 @@ namespace gl {
 namespace {
 
 // ActivateAudioInterfaceAsync exige um handler agile. FtmBase entrega o
-// marshaler free-threaded, que é o que torna o objeto agile — no C# isso exigia
+// marshaler free-threaded, que é o que torna o objeto agile - no C# isso exigia
 // montar a vtable COM na mão porque o CCW do .NET não serve.
 class HandlerAtivacao
     : public Microsoft::WRL::RuntimeClass<
@@ -133,7 +133,7 @@ bool AudioCapture::iniciar(uint32_t pidExcluir, Consumidor consumidor) {
     formato.cbSize = 0;
 
     // 200 ms, o mesmo do exemplo oficial ApplicationLoopback da Microsoft. Já
-    // esteve em 5 segundos no capturador antigo — tamanho errado para captura
+    // esteve em 5 segundos no capturador antigo - tamanho errado para captura
     // em tempo real, e latência de graça.
     constexpr REFERENCE_TIME kDuracaoBuffer = 200 * 10000;
 

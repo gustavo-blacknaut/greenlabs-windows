@@ -5,13 +5,13 @@
 // Porte de public/wasapi-audio-worklet.js. Os números aqui vieram de medição,
 // não de bom senso, e mudá-los quebra o áudio de um jeito difícil de notar:
 //
-//   O áudio não chega gota a gota, chega em rajadas — a thread do WASAPI acorda
+//   O áudio não chega gota a gota, chega em rajadas - a thread do WASAPI acorda
 //   com um pacote inteiro. Um teto fixo de 40 ms contra rajadas de 60 ms joga
 //   fora a maior parte de cada rajada assim que ela entra. Medido no cliente em
 //   Electron: só 66% do áudio era tocado, o resto saía como silêncio.
 //
-//   Por isso o teto tem piso de 40 ms — mantido baixo para entrega regular
-//   continuar com latência baixa — mas cresce até o dobro da maior rajada já
+//   Por isso o teto tem piso de 40 ms - mantido baixo para entrega regular
+//   continuar com latência baixa - mas cresce até o dobro da maior rajada já
 //   vista. Quando a entrega é regular isso não custa nada, e quando não é,
 //   evita o descarte.
 //

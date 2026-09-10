@@ -3,7 +3,7 @@
 // Captura do áudio do sistema com um aplicativo de fora.
 //
 // Usa WASAPI process loopback em modo EXCLUDE: pega tudo que está tocando na
-// máquina — jogo, Spotify, navegador, sons do sistema — MENOS a árvore de
+// máquina - jogo, Spotify, navegador, sons do sistema - MENOS a árvore de
 // processos indicada. O aplicativo excluído continua tocando normalmente nos
 // alto-falantes de quem transmite; ele só não entra na captura.
 //

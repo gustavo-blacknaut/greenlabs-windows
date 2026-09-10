@@ -1,7 +1,7 @@
 #pragma once
 
 // Log simples e sem dependência. O formato copia o do servidor em Go e o do
-// AudioCapture.cs — carimbo ISO na frente — para as três coisas poderem ser
+// AudioCapture.cs - carimbo ISO na frente - para as três coisas poderem ser
 // lidas juntas quando algo dá errado numa chamada.
 
 #include <cstdio>
@@ -18,7 +18,7 @@ void escreverLog(Nivel nivel, std::string_view texto);
 //
 // Precisa existir porque o aplicativo é WinMain: não tem console, então tudo
 // que ia para o stdout se perdia. Quando alguma coisa falhava no início, a
-// única informação que sobrava era a caixa de erro — que não sabe dizer o que
+// única informação que sobrava era a caixa de erro - que não sabe dizer o que
 // aconteceu de verdade.
 //
 // Devolve o caminho do arquivo, ou vazio se não deu para abrir. As ferramentas

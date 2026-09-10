@@ -473,7 +473,7 @@ const FormaCursor& ScreenCapture::formaDoCursor() const { return d_->forma; }
 //
 // O Windows entrega em três formatos. O colorido já é BGRA. O monocromático são
 // duas máscaras de 1 bit empilhadas (AND e XOR) que juntas dizem transparente,
-// preto, branco ou inverter — a inversão vira branco aqui, porque inverter o
+// preto, branco ou inverter - a inversão vira branco aqui, porque inverter o
 // que está embaixo exigiria ler o quadro. O mascarado é BGRA onde alfa 0 quer
 // dizer "usa o que está embaixo".
 void ScreenCapture::Interno::lerFormaDoCursor(const DXGI_OUTDUPL_FRAME_INFO& informacao) {

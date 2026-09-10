@@ -2,7 +2,7 @@
 
 // A aplicação: janela, laço de eventos e as telas.
 //
-// A interface não conhece rede nem captura por dentro — ela lê um estado e
+// A interface não conhece rede nem captura por dentro - ela lê um estado e
 // dispara ações. É o que permite o núcleo rodar sem janela nenhuma (o
 // greenlabs-probe e o greenlabs-sinal fazem exatamente isso).
 
@@ -35,7 +35,7 @@ public:
     //
     // Existe porque um bool só faz toda falha virar a mesma mensagem, e a
     // mensagem acaba chutando a causa. Quem lê precisa saber se foi a janela,
-    // o monitor ou a placa — chutar manda a pessoa investigar o lugar errado.
+    // o monitor ou a placa - chutar manda a pessoa investigar o lugar errado.
     const std::wstring& motivoDaFalha() const;
 
     // Publico so para o procedimento de janela do Win32 alcancar: ele e uma

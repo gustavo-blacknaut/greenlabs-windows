@@ -19,7 +19,7 @@ namespace gl {
 namespace {
 
 // Payload type que usamos quando somos nós que oferecemos. Quando respondemos,
-// o número vem da oferta do outro lado — ver escolherH264().
+// o número vem da oferta do outro lado - ver escolherH264().
 constexpr int kPayloadOpus = 111;
 constexpr uint32_t kRelogioAudio = 48000;
 constexpr int kPayloadH264 = 96;
@@ -30,7 +30,7 @@ constexpr uint32_t kRelogioVideo = 90000;  // o relógio de vídeo do RTP é sem
 // O payload type é combinado por chamada, não fixo pelo padrão. O Chromium
 // oferece 96 para VP8 e põe H.264 em outro número. Enviar H.264 marcado como 96
 // faz o navegador decodificar como VP8: ele conecta, recebe os pacotes e não
-// mostra nada — vídeo 0x0 e nenhum quadro pintado, sem erro em lugar nenhum.
+// mostra nada - vídeo 0x0 e nenhum quadro pintado, sem erro em lugar nenhum.
 int escolherH264(const rtc::Description::Media& media) {
     int primeiro = -1;
     for (int pt : media.payloadTypes()) {
@@ -133,7 +133,7 @@ ConexaoPar::ConexaoPar(std::string idDoPar, const ConfigMidia& config)
     }
 
     // Negociação na mão. Com a automática, adicionar a faixa já disparava uma
-    // oferta por conta própria — e como o outro lado também oferece ao entrar,
+    // oferta por conta própria - e como o outro lado também oferece ao entrar,
     // saíam duas negociações para a mesma conexão. O resultado era dois cards
     // do mesmo participante e nenhum quadro chegando.
     cfg.disableAutoNegotiation = true;
