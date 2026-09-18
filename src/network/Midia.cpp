@@ -7,6 +7,7 @@
 #include <rtc/rtc.hpp>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -46,6 +47,24 @@ int escolherH264(const rtc::Description::Media& media) {
         if (primeiro < 0) primeiro = pt;
     }
     return primeiro;
+}
+
+// Opus tambem usa payload dinamico. Embora 111 seja o valor mais comum nos
+// navegadores, ele nao faz parte do codec: cada oferta pode escolher outro.
+// Responder com 111 quando a oferta anunciou, por exemplo, 109 faz o receptor
+// descartar todos os pacotes de audio sem encerrar a conexao.
+int escolherOpus(const rtc::Description::Media& media) {
+    for (int pt : media.payloadTypes()) {
+        const auto* mapa = media.rtpMap(pt);
+        if (!mapa) continue;
+
+        std::string formato = mapa->format;
+        for (char& c : formato) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (formato == "opus") return pt;
+    }
+    return -1;
 }
 
 std::string mensagemDoEstado(rtc::PeerConnection::State estado) {
@@ -95,7 +114,15 @@ struct ConexaoPar::Interno {
 
     // O primeiro quadro precisa ser chave, e o carimbo de tempo do RTP conta a
     // partir do primeiro envio, não do relógio da máquina.
-    int64_t primeiroTempoUs = -1;
+    std::atomic<int64_t> primeiroTempoUs{-1};
+
+    int64_t baseDeTempo(int64_t tempoUs) {
+        int64_t esperado = -1;
+        primeiroTempoUs.compare_exchange_strong(esperado, tempoUs,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire);
+        return primeiroTempoUs.load(std::memory_order_acquire);
+    }
 
     void montarEmpacotador(std::shared_ptr<rtc::Track> faixa);
 
@@ -257,13 +284,13 @@ void ConexaoPar::enviarAudio(const uint8_t* dados, size_t tamanho, int64_t tempo
     auto faixa = d_->faixaAudio;
     if (!faixa || !faixa->isOpen() || !dados || tamanho == 0) return;
 
-    if (d_->primeiroTempoUs < 0) d_->primeiroTempoUs = tempoUs;
+    const int64_t primeiroTempoUs = d_->baseDeTempo(tempoUs);
 
     // Do mesmo relogio do video. Contar pacotes (960 em 960) parece certo e
     // soa certo isolado, mas nao casa com a base do video: o receptor alinha os
     // dois pelos relatorios RTCP e segura a imagem esperando o som. Foi o que
     // produziu dois a tres segundos de atraso.
-    const double segundos = static_cast<double>(tempoUs - d_->primeiroTempoUs) / 1'000'000.0;
+    const double segundos = static_cast<double>(tempoUs - primeiroTempoUs) / 1'000'000.0;
     if (d_->empacotamentoAudio) {
         d_->empacotamentoAudio->timestamp =
             d_->empacotamentoAudio->startTimestamp +
@@ -369,9 +396,9 @@ void ConexaoPar::Interno::montarEmpacotador(std::shared_ptr<rtc::Track> faixa) {
 
     // Quando a faixa veio de uma oferta do outro lado, o número do H.264 é o
     // dele. Quando fomos nós que oferecemos, é o nosso.
-    int payload = kPayloadH264;
+    uint8_t payload = static_cast<uint8_t>(kPayloadH264);
     if (const int doOutroLado = escolherH264(faixa->description()); doOutroLado >= 0) {
-        payload = doOutroLado;
+        payload = static_cast<uint8_t>(doOutroLado);
     } else {
         erro("o outro lado nao ofereceu H.264; o video nao vai aparecer para ele");
     }
@@ -440,6 +467,13 @@ void ConexaoPar::Interno::montarEmpacotador(std::shared_ptr<rtc::Track> faixa) {
 void ConexaoPar::Interno::montarAudio(std::shared_ptr<rtc::Track> faixa) {
     if (faixaAudio) return;
 
+    uint8_t payload = static_cast<uint8_t>(kPayloadOpus);
+    if (const int doOutroLado = escolherOpus(faixa->description()); doOutroLado >= 0) {
+        payload = static_cast<uint8_t>(doOutroLado);
+    } else {
+        erro("o outro lado nao ofereceu Opus; o audio nao vai tocar para ele");
+    }
+
     // Declara o SSRC na nossa resposta. Sem isto o servidor recebe o RTP e nao
     // sabe a quem entregar - ele registra "Incoming unhandled RTP ssrc(43),
     // OnTrack will not be fired" e o audio some sem erro nenhum do nosso lado.
@@ -453,11 +487,13 @@ void ConexaoPar::Interno::montarAudio(std::shared_ptr<rtc::Track> faixa) {
     }
 
     empacotamentoAudio = std::make_shared<rtc::RtpPacketizationConfig>(
-        43, "greenlabs-som", kPayloadOpus, kRelogioAudio);
+        43, "greenlabs-som", payload, kRelogioAudio);
 
     auto empacotador = std::make_shared<rtc::RtpPacketizer>(empacotamentoAudio);
     empacotador->addToChain(std::make_shared<rtc::RtcpSrReporter>(empacotamentoAudio));
     empacotador->addToChain(std::make_shared<rtc::RtcpNackResponder>());
+    empacotador->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
+    empacotador->addToChain(std::make_shared<rtc::OpusRtpDepacketizer>());
     faixa->setMediaHandler(empacotador);
 
     faixa->onMessage(
@@ -468,7 +504,7 @@ void ConexaoPar::Interno::montarAudio(std::shared_ptr<rtc::Track> faixa) {
         nullptr);
 
     faixaAudio = std::move(faixa);
-    info("faixa de audio pronta com {}", par.substr(0, 8));
+    info("faixa de audio pronta com {} usando payload type {}", par.substr(0, 8), payload);
 }
 
 bool ConexaoPar::prepararFaixa() {
@@ -581,8 +617,8 @@ void ConexaoPar::enviarVideo(const uint8_t* anexoB, size_t tamanho, int64_t temp
         info("primeiro quadro-chave enviado para {}", d_->par.substr(0, 8));
     }
 
-    if (d_->primeiroTempoUs < 0) {
-        d_->primeiroTempoUs = tempoUs;
+    const int64_t primeiroTempoUs = d_->baseDeTempo(tempoUs);
+    if (primeiroTempoUs == tempoUs) {
         // Uma vez so: confirma o formato do que sai do encoder em vez de supor.
         std::string inicio;
         for (size_t i = 0; i < 12 && i < tamanho; ++i) {
@@ -593,7 +629,7 @@ void ConexaoPar::enviarVideo(const uint8_t* anexoB, size_t tamanho, int64_t temp
         info("primeiro quadro para {}: {} bytes, comeca com {}", d_->par.substr(0, 8), tamanho,
              inicio);
     }
-    const double segundos = static_cast<double>(tempoUs - d_->primeiroTempoUs) / 1'000'000.0;
+    const double segundos = static_cast<double>(tempoUs - primeiroTempoUs) / 1'000'000.0;
 
     try {
         d_->empacotamento->timestamp =
