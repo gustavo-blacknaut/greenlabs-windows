@@ -24,6 +24,7 @@ void escreverLog(Nivel nivel, std::string_view texto);
 // Devolve o caminho do arquivo, ou vazio se não deu para abrir. As ferramentas
 // de console não chamam: para elas o stdout já resolve.
 std::string abrirArquivoDeLog();
+bool limparLog();
 
 // Caminho do arquivo em uso, vazio enquanto ninguém chamou abrirArquivoDeLog.
 const std::string& caminhoDoLog();

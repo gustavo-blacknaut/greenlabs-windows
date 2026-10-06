@@ -23,6 +23,7 @@
 
 #include "audio/AudioCodec.h"
 #include "audio/AudioPlayer.h"
+#include "audio/FilaAudio.h"
 #include "capture/AudioCapture.h"
 #include "capture/CameraCapture.h"
 #include "capture/Cursor.h"
@@ -60,14 +61,6 @@ constexpr const char* kIdDoSFU = "sfu";
 //
 // Daí o anel abaixo, de tamanho fixo e sem trava: a captura escreve num espaço
 // que já existe e segue adiante. Quem envia é outra thread.
-constexpr size_t kEspacosAudio = 32;
-constexpr size_t kMaxPacoteAudio = 1500;
-
-struct PacoteAudio {
-    uint8_t dados[kMaxPacoteAudio];
-    size_t tamanho = 0;
-    int64_t tempoUs = 0;
-};
 
 
 const wchar_t* kClasse = L"GreenLabsJanela";
@@ -226,12 +219,8 @@ struct Aplicacao::Interno {
     // o send faz criptografia e escrita no socket, e fazer isso ali trava a
     // captura (que sai como estalo) e ocupa o transporte (que atrasa o video).
     // A thread de captura so enfileira; quem envia e esta aqui.
-    // Anel de tamanho fixo. Escrita e leitura andam sozinhas; quando a escrita
-    // alcança a leitura, o pacote mais velho é sobrescrito - áudio atrasado não
-    // serve, e esperar por espaço travaria a captura.
-    PacoteAudio anelAudio[kEspacosAudio];
-    std::atomic<uint64_t> escritaAudio{0};
-    std::atomic<uint64_t> leituraAudio{0};
+    // Fila limitada; nunca sobrescreve um pacote que a rede esteja lendo.
+    FilaAudio filaAudio;
 
     std::atomic<int64_t> picoAudioUs{0};
     std::atomic<int64_t> somaAudioUs{0};
@@ -556,6 +545,9 @@ struct Aplicacao::Interno {
     std::vector<D2D1_RECT_F> btServidoresConfig;
     std::vector<D2D1_RECT_F> btRemoverServidor;
     D2D1_RECT_F btConfigConcluir{}, btSalvarPadrao{}, btRestaurar{}, btEngrenagem{};
+    D2D1_RECT_F btLimparLog{};
+    D2D1_RECT_F btRecolherPainel{};
+    bool painelRecolhido = false;
 
     // Barra de acoes: em quantos quadros o palco se divide, e os botoes dela.
     //
@@ -832,7 +824,7 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
                 const float x = static_cast<float>(GET_X_LPARAM(l));
                 const float y = static_cast<float>(GET_Y_LPARAM(l));
                 if (d->telaAtual == Tela::AoVivo && y > tema::kAlturaTitulo &&
-                    (d->telaCheia || x < d->render.largura() - tema::kLarguraPainelLateral -
+                    (d->telaCheia || x < d->render.largura() - (d->painelRecolhido ? 64.0f : tema::kLarguraPainelLateral) -
                                              2 * tema::kEspaco)) {
                     d->alternarTelaCheia();
                 }
@@ -935,6 +927,7 @@ LRESULT CALLBACK procedimento(HWND janela, UINT msg, WPARAM w, LPARAM l) {
         default:
             return ::DefWindowProcW(janela, msg, w, l);
     }
+    return ::DefWindowProcW(janela, msg, w, l);
 }
 
 }  // namespace
@@ -1248,7 +1241,8 @@ int Aplicacao::rodar() {
         // 60 Hz é o teto do que o olho aproveita numa interface, e o vídeo
         // recebido vem a 30. O resto era desperdício.
         const auto agora = std::chrono::steady_clock::now();
-        if (agora - d_->ultimoDesenho >= std::chrono::microseconds(1'000'000 / 60)) {
+        if (!::IsIconic(d_->janela) && ::IsWindowVisible(d_->janela) &&
+            agora - d_->ultimoDesenho >= std::chrono::microseconds(1'000'000 / 60)) {
             d_->ultimoDesenho = agora;
             d_->desenhar();
         } else {
@@ -1696,6 +1690,7 @@ bool Aplicacao::Interno::montarEncoder(uint32_t largura, uint32_t altura, const 
     // reaproveita os proprios buffers justamente por isso.
     if (audioLigado) audioEnc.iniciar();
     if (audioLigado) {
+        filaAudio.limpar();
         audio.iniciar(excluir, [this](const float* pcm, uint32_t quadros) {
             const auto t0 = std::chrono::steady_clock::now();
 
@@ -1721,14 +1716,7 @@ bool Aplicacao::Interno::montarEncoder(uint32_t largura, uint32_t altura, const 
                 // SRTP mais socket - é trabalho pesado numa thread de tempo
                 // real, e era o que fazia a captura engasgar. Quem envia é a
                 // threadAudio, que existe para isso.
-                const uint64_t w = escritaAudio.load(std::memory_order_relaxed);
-                PacoteAudio& espaco = anelAudio[w % kEspacosAudio];
-                const size_t cabem =
-                    pacote.size() < kMaxPacoteAudio ? pacote.size() : kMaxPacoteAudio;
-                memcpy(espaco.dados, pacote.data(), cabem);
-                espaco.tamanho = cabem;
-                espaco.tempoUs = agora;
-                escritaAudio.store(w + 1, std::memory_order_release);
+                filaAudio.enfileirar(pacote.data(), pacote.size(), agora);
             }
 
             const auto gasto = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1743,8 +1731,6 @@ bool Aplicacao::Interno::montarEncoder(uint32_t largura, uint32_t altura, const 
 
         // A thread que realmente envia. Ela existia e nunca era iniciada: o
         // anel inteiro era código morto e o áudio saía da thread de tempo real.
-        escritaAudio.store(0);
-        leituraAudio.store(0);
         enviandoAudio.store(true);
         threadAudio = std::thread([this] { lacoEnvioAudio(); });
     }
@@ -1782,8 +1768,7 @@ void Aplicacao::Interno::pararTransmissao() {
     audio.parar();
     enviandoAudio.store(false);
     if (threadAudio.joinable()) threadAudio.join();
-    escritaAudio.store(0);
-    leituraAudio.store(0);
+    filaAudio.limpar();
 
     encoder.parar();
     audioEnc.parar();
@@ -1867,8 +1852,7 @@ void Aplicacao::Interno::pararEncodeSomente() {
     std::lock_guard travaTela(travaCaptura);
     encoder.parar();
     audioEnc.parar();
-    escritaAudio.store(0);
-    leituraAudio.store(0);
+    filaAudio.limpar();
     transmitindo = false;
 }
 
@@ -2375,43 +2359,24 @@ void Aplicacao::Interno::lacoDecodificacao() {
 }
 
 void Aplicacao::Interno::lacoEnvioAudio() {
-    uint8_t pacote[kMaxPacoteAudio];
-    size_t tamanho = 0;
-    int64_t tempo = 0;
+    FilaAudio::Pacote pacote;
 
     while (enviandoAudio.load()) {
-        const uint64_t fim = escritaAudio.load(std::memory_order_acquire);
-        uint64_t inicio = leituraAudio.load(std::memory_order_relaxed);
-
-        if (inicio == fim) {
+        if (!filaAudio.retirar(pacote)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
 
-        // Ficou para trás mais que o anel: pula para o mais recente. Mandar
-        // áudio velho só aumenta o atraso de quem ouve.
-        if (fim - inicio > kEspacosAudio) inicio = fim - 1;
-
-        {
-            const PacoteAudio& espaco = anelAudio[inicio % kEspacosAudio];
-            tamanho = espaco.tamanho;
-            tempo = espaco.tempoUs;
-            memcpy(pacote, espaco.dados, tamanho);
-        }
-        leituraAudio.store(inicio + 1, std::memory_order_relaxed);
-
         {
             std::lock_guard trava(travaConexoes);
-            if (destinosAudio.size() != conexoes.size()) {
-                destinosAudio.clear();
-                destinosAudio.reserve(conexoes.size());
-                for (auto& [id, conexao] : conexoes) {
-                    if (conexao) destinosAudio.push_back(conexao);
-                }
+            destinosAudio.clear();
+            destinosAudio.reserve(conexoes.size());
+            for (auto& [id, conexao] : conexoes) {
+                if (conexao) destinosAudio.push_back(conexao);
             }
         }
         for (auto& conexao : destinosAudio) {
-            conexao->enviarAudio(pacote, tamanho, tempo);
+            conexao->enviarAudio(pacote.dados.data(), pacote.tamanho, pacote.tempoUs);
         }
     }
 }
@@ -2423,12 +2388,10 @@ void Aplicacao::Interno::enviarQuadroParaTodos(const PacoteCodificado& pacote) {
     // durante o envio poe as duas midias uma na frente da outra.
     {
         std::lock_guard trava(travaConexoes);
-        if (destinosVideo.size() != conexoes.size()) {
-            destinosVideo.clear();
-            destinosVideo.reserve(conexoes.size());
-            for (auto& [id, conexao] : conexoes) {
-                if (conexao) destinosVideo.push_back(conexao);
-            }
+        destinosVideo.clear();
+        destinosVideo.reserve(conexoes.size());
+        for (auto& [id, conexao] : conexoes) {
+            if (conexao) destinosVideo.push_back(conexao);
         }
     }
     for (auto& conexao : destinosVideo) {
@@ -2632,6 +2595,12 @@ void Aplicacao::Interno::clique(float x, float y) {
             }
             return;
         }
+        if (abaConfig == 2) {
+            if (dentro(btLimparLog, x, y)) {
+                avisoConfig = limparLog() ? L"Logs apagados." : L"Não foi possível limpar o log.";
+            }
+            return;
+        }
         for (size_t i = 0; i < btRemoverServidor.size() && i < config.servidores.size(); ++i) {
             if (dentro(btRemoverServidor[i], x, y)) {
                 config.servidores.erase(config.servidores.begin() + static_cast<long>(i));
@@ -2793,12 +2762,17 @@ void Aplicacao::Interno::clique(float x, float y) {
     // da barra (que também não existe) é clique no palco, e o palco não faz
     // nada com um clique simples. Sair é duplo clique, Esc ou F11.
     if (telaCheia) return;
+    if (dentro(btRecolherPainel, x, y)) {
+        painelRecolhido = !painelRecolhido;
+        return;
+    }
+    if (painelRecolhido) return;
 
     // O que rola só aceita clique dentro da própria janela de rolagem. Sem
     // isto, um item que rolou para debaixo dos botões continuava sendo clicado
     // - invisível, mas ativo.
     const bool naAreaRolavel =
-        y >= areaRolavel.top && y <= areaRolavel.bottom;
+        dentro(areaRolavel, x, y);
     if (!naAreaRolavel) return;
 
     if (dentro(btEscolher, x, y)) {
@@ -2934,8 +2908,8 @@ void Aplicacao::Interno::desenharBarraDeAcoes() {
     // ---- esquerda: a marca e o estado
     const auto selo = D2D1::RectF(barra.left + 10, barra.top + 9, barra.left + 44,
                                   barra.bottom - 9);
-    render.retangulo(selo, tema::kVerdeSuave, 10);
-    render.contorno(selo, tema::kVerdeLinha, 10);
+    render.retangulo(selo, tema::kPainel2, 10);
+    render.contorno(selo, tema::kLinha, 10);
     render.logo(D2D1::RectF(selo.left + 5, selo.top + 5, selo.right - 5, selo.bottom - 5));
 
     const bool ligado = conectado.load();
@@ -3029,7 +3003,7 @@ void Aplicacao::Interno::desenharBarraDeAcoes() {
                                         : (sob ? tema::kVerde : tema::kVerdeForte);
         render.retangulo(btBarraTransmitir, fundo, 10);
         const auto corTexto = transmitindo ? tema::kTexto : tema::kFundo;
-        const std::wstring rotulo = transmitindo ? L"PARAR" : L"TRANSMITIR";
+        const std::wstring rotulo = transmitindo ? L"Parar" : L"Transmitir";
         const float larguraTexto = render.larguraDoTexto(rotulo, Fonte::Pequena);
         const float meio = (btBarraTransmitir.left + btBarraTransmitir.right) / 2;
         const float inicio = meio - (larguraTexto + 22) / 2;
@@ -3111,8 +3085,11 @@ void Aplicacao::Interno::desenharEntrada() {
     const float larg = render.largura();
     const float alt = render.altura();
 
-    const float largCartao = 520;
-    const float altCartao = 460;
+    const float largCartao = 560;
+    const size_t capacidade = static_cast<size_t>(std::max(0.0f,
+        std::min(3.0f, (alt - tema::kAlturaTitulo - 460 - 62) / 40)));
+    const size_t servidoresVisiveis = std::min(config.servidores.size(), capacidade);
+    const float altCartao = 460 + (servidoresVisiveis ? 34 + 40 * static_cast<float>(servidoresVisiveis) : 0);
     const float x = (larg - largCartao) / 2;
     const float y = (alt - altCartao) / 2 + tema::kAlturaTitulo / 2;
 
@@ -3121,22 +3098,26 @@ void Aplicacao::Interno::desenharEntrada() {
     render.contorno(D2D1::RectF(x, y, x + largCartao, y + altCartao), tema::kLinha,
                     tema::kRaioCartao);
 
-    render.logo(D2D1::RectF(x + 36, y + 26, x + 36 + 56, y + 82));
-    render.texto(L"SEM CONTA · SEM LIMITE DE TEMPO",
-                 D2D1::RectF(x + 104, y + 34, x + largCartao - 36, y + 54), tema::kVerde,
-                 Fonte::Pequena);
-    render.texto(L"Entrar numa sala",
-                 D2D1::RectF(x + 104, y + 54, x + largCartao - 36, y + 92), tema::kTexto,
-                 Fonte::Subtitulo);
+    render.logo(D2D1::RectF(x + largCartao / 2 - 26, y + 24, x + largCartao / 2 + 26, y + 76));
+    render.texto(L"Bem-vindo ao GreenLabs",
+                 D2D1::RectF(x + 24, y + 86, x + largCartao - 24, y + 126), tema::kTexto,
+                 Fonte::Titulo, DWRITE_TEXT_ALIGNMENT_CENTER);
+    render.texto(L"Configure seu nome e o servidor para começar.",
+                 D2D1::RectF(x + 24, y + 130, x + largCartao - 24, y + 154), tema::kApagado,
+                 Fonte::Corpo, DWRITE_TEXT_ALIGNMENT_CENTER);
 
     const float larguraCampo = largCartao - 72;
-    campoNome.area = D2D1::RectF(x + 36, y + 140, x + 36 + larguraCampo, y + 186);
-    campoServidor.area = D2D1::RectF(x + 36, y + 222, x + 36 + larguraCampo, y + 268);
-    campoSala.area = D2D1::RectF(x + 36, y + 304, x + 36 + larguraCampo, y + 350);
+    campoNome.area = D2D1::RectF(x + 36, y + 194, x + 36 + larguraCampo, y + 240);
+    campoServidor.area = D2D1::RectF(x + 36, y + 284, x + 36 + larguraCampo * 0.65f - 7, y + 330);
+    campoSala.area = D2D1::RectF(campoServidor.area.right + 14, y + 284, x + 36 + larguraCampo, y + 330);
 
     desenharCampo(campoNome, L"SEU APELIDO");
     desenharCampo(campoServidor, L"SERVIDOR");
     desenharCampo(campoSala, L"SALA");
+
+    render.texto(L"Tela, câmera e som do sistema. Sem cadastro.",
+                 D2D1::RectF(x + 36, y + 342, x + largCartao - 36, y + 366),
+                 tema::kApagado, Fonte::Pequena);
 
     btEntrar = D2D1::RectF(x + 36, y + 380, x + 36 + larguraCampo, y + 428);
     desenharBotao(btEntrar, L"ENTRAR NA SALA", true);
@@ -3155,14 +3136,15 @@ void Aplicacao::Interno::desenharEntrada() {
 
     // Servidores já usados, como atalho. Clicar preenche o campo.
     btServidores.clear();
-    if (!config.servidores.empty()) {
-        float linha = y + altCartao + 16;
+    if (servidoresVisiveis > 0) {
+        float linha = y + 466;
         render.texto(L"SERVIDORES SALVOS",
                      D2D1::RectF(x + 36, linha, x + largCartao - 36, linha + 16), tema::kApagado,
                      Fonte::Pequena);
         linha += 24;
 
-        for (const auto& endereco : config.servidores) {
+        for (size_t i = 0; i < servidoresVisiveis; ++i) {
+            const auto& endereco = config.servidores[i];
             const auto area = D2D1::RectF(x + 36, linha, x + largCartao - 36, linha + 34);
             btServidores.push_back(area);
 
@@ -3199,7 +3181,7 @@ void Aplicacao::Interno::desenharAoVivo() {
     const float topo =
         telaCheia ? 0.0f : tema::kAlturaTitulo + 2 * tema::kEspaco + tema::kAlturaAcoes;
     const float painelX =
-        telaCheia ? larg : larg - tema::kLarguraPainelLateral - tema::kEspaco;
+        telaCheia ? larg : larg - (painelRecolhido ? 64.0f : tema::kLarguraPainelLateral) - tema::kEspaco;
 
     // Fotografia das transmissões deste quadro. Copiar o essencial sob trava e
     // desenhar fora dela: o desenho é longo e a trava é disputada com a thread
@@ -3428,13 +3410,27 @@ void Aplicacao::Interno::desenharAoVivo() {
 
     const float esq = painel.left + 16;
     const float dir = painel.right - 16;
+    btRecolherPainel = D2D1::RectF(painel.right - 44, painel.top + 10, painel.right - 10, painel.top + 44);
+    render.retangulo(btRecolherPainel, apontando(btRecolherPainel) ? tema::kPainel3 : tema::kPainel2, 10);
+    if (painelRecolhido) {
+        icone::maximizar(render, btRecolherPainel, tema::kApagado, 14);
+        const auto contador = D2D1::RectF(painel.left + 10, painel.top + 58, painel.right - 10, painel.top + 102);
+        render.retangulo(contador, tema::kVerdeSuave, 12);
+        render.texto(std::to_wstring(aoVivo.size()), contador, tema::kVerde, Fonte::Subtitulo,
+                     DWRITE_TEXT_ALIGNMENT_CENTER);
+        areaRolavel = {};
+        btTransmissoes.clear();
+        idsTransmissoes.clear();
+        return;
+    }
+    icone::minimizar(render, btRecolherPainel, tema::kApagado, 14);
 
     // A área que rola vai do topo do painel até onde os botões começam. Eles
     // ficam ancorados na base e fora do recorte: botão que rola para fora da
     // vista é botão que não existe na hora em que se precisa dele.
     // Cabeçalho do painel, fora do que rola - como o .side-header do Electron.
     render.texto(L"PAINEL DE CONTROLE",
-                 D2D1::RectF(esq, painel.top + 14, dir, painel.top + 32), tema::kVerde,
+                 D2D1::RectF(esq, painel.top + 14, dir - 36, painel.top + 32), tema::kVerde,
                  Fonte::Pequena);
 
     // Sem botoes no pe, a lista vai ate a base do painel - so o diagnostico,
@@ -3539,7 +3535,7 @@ void Aplicacao::Interno::desenharAoVivo() {
     // ---- transmissões, com miniatura ao vivo de cada uma
     {
         const float topo =
-            abrirSecao(0, L"TRANSMISSÕES (" + std::to_wstring(aoVivo.size()) + L")");
+            abrirSecao(0, L"Transmissões (" + std::to_wstring(aoVivo.size()) + L")");
 
         btTransmissoes.clear();
         idsTransmissoes.clear();
@@ -3553,6 +3549,12 @@ void Aplicacao::Interno::desenharAoVivo() {
                 const float alturaMini = larguraCartao * 9.0f / 16.0f;
                 const auto cartao =
                     D2D1::RectF(esq + 10, y, dir - 10, y + alturaMini + 28);
+                if (cartao.bottom < areaRolavel.top || cartao.top > areaRolavel.bottom) {
+                    btTransmissoes.push_back(cartao);
+                    idsTransmissoes.push_back(n.id);
+                    y += alturaMini + 38;
+                    continue;
+                }
 
                 const bool ativo = n.id == noPalco;
                 const bool sob = !ativo && sobre(cartao) && sobre(areaRolavel);
@@ -3572,8 +3574,7 @@ void Aplicacao::Interno::desenharAoVivo() {
                 // que a etiqueta em cima do vídeo se serve. Desenhar a mesma
                 // chave duas vezes mandaria a etiqueta para cima do cartão.
                 if (ativo) {
-                    render.texto(L"no palco", areaMini, tema::kVerde, Fonte::Pequena,
-                                 DWRITE_TEXT_ALIGNMENT_CENTER);
+                    render.miniatura(n.id, n.quadro, areaMini);
                 } else {
                     render.video(n.id, n.quadro, areaMini);
                 }
@@ -3608,7 +3609,7 @@ void Aplicacao::Interno::desenharAoVivo() {
 
     {
         const float topo =
-            abrirSecao(1, L"PESSOAS (" + std::to_wstring(copia.size() + 1) + L")");
+            abrirSecao(1, L"Pessoas (" + std::to_wstring(copia.size() + 1) + L")");
         y += 10;
 
         // Uma pessoa por linha, com avatar de iniciais e pastilha de ping - o
@@ -4214,7 +4215,7 @@ void Aplicacao::Interno::desenharConfig() {
     const float alturaPe = 76;
     const auto moldura = desenharMoldura(1, L"Configuração",
                                          L"Conexão e servidores salvos.", alturaPe,
-                                         {L"Conexão", L"Servidores"}, abaConfig, areasDasAbas);
+                                         {L"Conexão", L"Servidores", L"Diagnóstico"}, abaConfig, areasDasAbas);
     btAbasConfig = areasDasAbas;
 
     const auto& corpo = moldura.corpo;
@@ -4308,7 +4309,7 @@ void Aplicacao::Interno::desenharConfig() {
                      D2D1::RectF(corpo.left, y, corpo.right, y + 60), tema::kApagado,
                      Fonte::Pequena);
         y += 64;
-    } else {
+    } else if (abaConfig == 1) {
         btServidoresConfig.clear();
         btRemoverServidor.clear();
 
@@ -4346,6 +4347,20 @@ void Aplicacao::Interno::desenharConfig() {
         }
     }
 
+    if (abaConfig == 2) {
+        render.texto(L"Logs leves, limpeza automática", D2D1::RectF(corpo.left, y, corpo.right, y + 32),
+                     tema::kTexto, Fonte::Subtitulo);
+        y += 44;
+        render.texto(L"Um único arquivo de até 512 KB. Mensagens repetidas são reduzidas. "
+                     L"Ao atingir o limite, o arquivo recomeça automaticamente.",
+                     D2D1::RectF(corpo.left, y, corpo.right, y + 76), tema::kApagado);
+        y += 88;
+        btLimparLog = D2D1::RectF(corpo.left, y, corpo.right, y + 44);
+        desenharBotao(btLimparLog, L"Limpar logs agora", false);
+        y += 56;
+        render.texto(avisoConfig, D2D1::RectF(corpo.left, y, corpo.right, y + 28), tema::kVerde);
+        y += 36;
+    }
     alturaConteudoConfig = y - corpo.top;
     render.soltarRecorte();
 }
@@ -4353,6 +4368,7 @@ void Aplicacao::Interno::desenharConfig() {
 void Aplicacao::Interno::desenhar() {
     render.comecarQuadro();
     render.limpar(tema::kFundo);
+    if (!telaCheia) render.fundoAmbiente();
 
     // Zerado a cada quadro e remarcado por quem estiver sob o ponteiro. É o que
     // decide o cursor: quem não desenha nada clicável no lugar do mouse deixa

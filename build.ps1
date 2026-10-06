@@ -10,6 +10,8 @@
 param(
     [ValidateSet('Debug', 'Release')]
     [string]$Config = 'Release',
+    [ValidatePattern('^[A-Za-z0-9_-]+$')]
+    [string]$NomeExecutavel = 'GreenLabs',
     [switch]$Limpar
 )
 
@@ -53,6 +55,8 @@ $saida = Join-Path $PSScriptRoot "build\$Config"
 if ($Limpar -and (Test-Path $saida)) { Remove-Item $saida -Recurse -Force }
 
 & $cmake -S $PSScriptRoot -B $saida -G Ninja `
+    -DFETCHCONTENT_UPDATES_DISCONNECTED=ON `
+    "-DGREENLABS_OUTPUT_NAME=$NomeExecutavel" `
     -DCMAKE_MAKE_PROGRAM="$ninja" `
     -DCMAKE_C_COMPILER="$cl" `
     -DCMAKE_CXX_COMPILER="$cl" `

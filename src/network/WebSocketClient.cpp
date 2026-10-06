@@ -167,10 +167,36 @@ bool WebSocketClient::conectar(const std::string& endereco, uint32_t prazoMs) {
     }
 
     SOCKET s = INVALID_SOCKET;
+    // connect bloqueante ignora SO_RCVTIMEO: um IP que nao responde podia
+    // prender a interface por muito mais tempo que o prazo anunciado.
+    const ULONGLONG limite = ::GetTickCount64() + (prazoMs > 0 ? prazoMs : 1);
     for (addrinfo* a = encontrados; a; a = a->ai_next) {
+        if (::GetTickCount64() >= limite) break;
         s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (s == INVALID_SOCKET) continue;
-        if (::connect(s, a->ai_addr, static_cast<int>(a->ai_addrlen)) == 0) break;
+        u_long naoBloqueante = 1;
+        bool conectou = false;
+        if (::ioctlsocket(s, FIONBIO, &naoBloqueante) == 0) {
+            conectou = ::connect(s, a->ai_addr, static_cast<int>(a->ai_addrlen)) == 0;
+            const int erroConexao = conectou ? 0 : ::WSAGetLastError();
+            if (!conectou && (erroConexao == WSAEWOULDBLOCK || erroConexao == WSAEINPROGRESS)) {
+                const auto agora = ::GetTickCount64();
+                const auto restante = agora < limite ? limite - agora : 0;
+                timeval espera{static_cast<long>(restante / 1000), static_cast<long>((restante % 1000) * 1000)};
+                fd_set escrita, falhas;
+                FD_ZERO(&escrita); FD_SET(s, &escrita);
+                FD_ZERO(&falhas); FD_SET(s, &falhas);
+                if (::select(0, nullptr, &escrita, &falhas, &espera) > 0 && FD_ISSET(s, &escrita)) {
+                    int codigo = 0;
+                    int tamanho = sizeof(codigo);
+                    conectou = ::getsockopt(s, SOL_SOCKET, SO_ERROR,
+                        reinterpret_cast<char*>(&codigo), &tamanho) == 0 && codigo == 0;
+                }
+            }
+            naoBloqueante = 0;
+            if (::ioctlsocket(s, FIONBIO, &naoBloqueante) != 0) conectou = false;
+        }
+        if (conectou) break;
         ::closesocket(s);
         s = INVALID_SOCKET;
     }
@@ -186,8 +212,10 @@ bool WebSocketClient::conectar(const std::string& endereco, uint32_t prazoMs) {
     BOOL semAtraso = TRUE;
     ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&semAtraso),
                  sizeof(semAtraso));
-    DWORD prazo = prazoMs;
+    const auto agoraHandshake = ::GetTickCount64();
+    DWORD prazo = static_cast<DWORD>(agoraHandshake < limite ? limite - agoraHandshake : 1);
     ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&prazo), sizeof(prazo));
+    ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&prazo), sizeof(prazo));
 
     d_->soquete = s;
 
@@ -215,6 +243,14 @@ bool WebSocketClient::conectar(const std::string& endereco, uint32_t prazoMs) {
     std::string cabecalhos;
     uint8_t pedaco[2048];
     for (;;) {
+        const auto agora = ::GetTickCount64();
+        if (agora >= limite) {
+            erro("prazo do handshake esgotado");
+            fechar();
+            return false;
+        }
+        prazo = static_cast<DWORD>(limite - agora);
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&prazo), sizeof(prazo));
         const int lidos = ::recv(d_->soquete, reinterpret_cast<char*>(pedaco), sizeof(pedaco), 0);
         if (lidos <= 0) {
             erro("servidor fechou durante o handshake");
@@ -338,6 +374,10 @@ void WebSocketClient::Interno::laco() {
 
         const bool fim = (cabecalho[0] & 0x80) != 0;
         const uint8_t opcode = cabecalho[0] & 0x0F;
+        if ((cabecalho[0] & 0x70) != 0) {
+            encerrar("extensao WebSocket nao negociada");
+            return;
+        }
         const bool mascarado = (cabecalho[1] & 0x80) != 0;
         uint64_t tamanho = cabecalho[1] & 0x7F;
 
@@ -362,6 +402,10 @@ void WebSocketClient::Interno::laco() {
             encerrar("quadro grande demais");
             return;
         }
+        if (opcode >= opFechar && (!fim || tamanho > 125)) {
+            encerrar("quadro de controle invalido");
+            return;
+        }
 
         std::vector<uint8_t> dados(static_cast<size_t>(tamanho));
         if (tamanho > 0 && !lerExato(dados.data(), dados.size())) break;
@@ -375,7 +419,9 @@ void WebSocketClient::Interno::laco() {
         if (opcode == opPong) continue;
         if (opcode == opFechar) {
             enviarQuadro(opFechar, nullptr, 0);
-            encerrar("servidor encerrou a conexao");
+            const std::string motivo = dados.size() > 2
+                ? std::string(dados.begin() + 2, dados.end()) : "servidor encerrou a conexao";
+            encerrar(motivo);
             return;
         }
 

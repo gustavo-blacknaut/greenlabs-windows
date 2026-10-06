@@ -50,11 +50,8 @@ BrandingText "${NOME} ${VERSAO}"
 Section "Principal" SecPrincipal
   SectionIn RO
 
-  ; O programa pode estar aberto: instalar por cima de um executavel em uso
-  ; falha no meio e deixa a pasta pela metade.
-  DetailPrint "Fechando o ${NOME}, se estiver aberto..."
-  nsExec::Exec 'taskkill /F /IM GreenLabs.exe'
-  Pop $0
+  ; Se o executavel estiver em uso, o NSIS oferece repetir/cancelar a copia.
+  ; Nao encerra processos por nome: o cliente Electron tambem usa GreenLabs.exe.
 
   SetOutPath "$INSTDIR"
   File "${EXECUTAVEL}"
@@ -78,10 +75,11 @@ Section "Principal" SecPrincipal
 SectionEnd
 
 Section "Uninstall"
-  nsExec::Exec 'taskkill /F /IM GreenLabs.exe'
-  Pop $0
-
+  ClearErrors
   Delete "$INSTDIR\GreenLabs.exe"
+  IfErrors 0 +3
+    MessageBox MB_OK|MB_ICONEXCLAMATION "Feche o GreenLabs e tente desinstalar novamente."
+    Abort
   Delete "$INSTDIR\Desinstalar.exe"
   RMDir "$INSTDIR"
 

@@ -93,16 +93,13 @@ resolve o caso normal, e o motivo de cada escolha está no código.
 
 ## Sem placa de vídeo dedicada?
 
-Funciona igual. Todo processador moderno traz gráficos integrados com encoder
-de H.264 em hardware - Quick Sync na Intel, VCN na AMD - e é ele que o
-`MFTEnumEx` acha primeiro.
+Uma GPU integrada compativel pode capturar e codificar sem placa dedicada.
+O encoder disponivel depende do hardware e do driver instalado.
 
-Sem nenhum acelerador (máquina virtual, PC muito antigo), o cliente cai sozinho
-para o encoder de software da Microsoft e para o rasterizador WARP. Continua
-funcionando, custando CPU. Nesse caso vale escolher **720p** no painel: é a
-diferença entre a máquina dar conta e não dar. Mesmo assim ele é mais leve que
-o cliente em Electron, que carrega um Chromium inteiro antes de codificar o
-primeiro quadro.
+Existe fallback de codificacao por software, mas ele nao garante captura:
+Desktop Duplication exige um adaptador e um driver compativeis. WARP sozinho
+nao resolve essa exigencia. Maquinas virtuais e drivers antigos precisam ser
+testados; reduzir para 720p pode diminuir o custo de codificacao.
 
 O painel diz em qual dos dois você está: a linha `captura` mostra `GPU` ou
 `CPU`.
@@ -174,14 +171,11 @@ versão 0.2.7 do cliente em Electron.
 
 ### A câmera vai composta no quadro, não numa segunda faixa
 
-O servidor abre **um** transceiver de vídeo por pessoa, e monta o identificador
-da faixa de saída a partir do dono mais o tipo. Duas faixas de vídeo do mesmo
-dono colidiriam nesse identificador e a segunda seria descartada em silêncio.
-
-Então a câmera entra pelo Video Processor, na mesma passada que converte a cor -
-custo zero, porque a unidade de função fixa da placa já está lendo o quadro de
-qualquer jeito. O efeito colateral é o melhor possível: quem assiste pelo
-Electron ou pelo celular vê a câmera **hoje**, sem atualizar nada.
+A sobreposicao da camera e feita pelo Video Processor antes da codificacao,
+na mesma faixa de video. Isso evita negociar uma faixa adicional para a
+sobreposicao, mas ainda consome recursos da GPU. O servidor atual identifica
+faixas individualmente; a composicao nao depende de uma limitacao de faixa
+unica por participante.
 
 ---
 

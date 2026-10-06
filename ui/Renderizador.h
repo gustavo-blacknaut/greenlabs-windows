@@ -57,6 +57,7 @@ public:
     float altura() const;
 
     void limpar(const D2D1_COLOR_F& cor);
+    void fundoAmbiente();
     void retangulo(const D2D1_RECT_F& area, const D2D1_COLOR_F& cor, float raio = 0.0f);
     void contorno(const D2D1_RECT_F& area, const D2D1_COLOR_F& cor, float raio = 0.0f,
                   float espessura = 1.0f);
@@ -84,6 +85,7 @@ public:
     // telas ao mesmo tempo era impossivel - a segunda sobrescrevia a primeira a
     // cada quadro.
     void video(const std::string& chave, ID3D11Texture2D* textura, const D2D1_RECT_F& area);
+    void miniatura(const std::string& chave, ID3D11Texture2D* textura, const D2D1_RECT_F& area);
 
     // Houve algum quadro para esta chave.
     bool temQuadro(const std::string& chave) const;

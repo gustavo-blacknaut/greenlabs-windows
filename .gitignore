@@ -11,3 +11,4 @@ out/
 CMakeUserPresets.json
 
 dist/
+release/

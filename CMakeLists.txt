@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(GreenLabs
-    VERSION 1.1.7
+    VERSION 1.1.8
     DESCRIPTION "Cliente nativo do GreenLabs Live Streaming"
     LANGUAGES C CXX)
 
@@ -198,6 +198,8 @@ string(REPLACE "." "," GREENLABS_VERSAO_RC "${PROJECT_VERSION},0")
 configure_file(ui/recursos.rc.in ${CMAKE_CURRENT_BINARY_DIR}/recursos.rc @ONLY)
 
 add_executable(GreenLabs WIN32 src/main/main.cpp ${CMAKE_CURRENT_BINARY_DIR}/recursos.rc)
+set(GREENLABS_OUTPUT_NAME "GreenLabs" CACHE STRING "Nome do executavel nativo")
+set_target_properties(GreenLabs PROPERTIES OUTPUT_NAME "${GREENLABS_OUTPUT_NAME}")
 target_link_libraries(GreenLabs PRIVATE greenlabs_core)
 greenlabs_flags(GreenLabs)
 
@@ -212,3 +214,11 @@ greenlabs_flags(greenlabs-sinal)
 
 set_target_properties(GreenLabs greenlabs-probe greenlabs-sinal PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(greenlabs-testes tools/testes/main.cpp)
+    target_include_directories(greenlabs-testes PRIVATE src)
+    greenlabs_flags(greenlabs-testes)
+    add_test(NAME fila_audio COMMAND greenlabs-testes)
+endif()

@@ -66,6 +66,6 @@ inline constexpr float kAlturaAcoes = 56.0f;
 inline constexpr float kRaioCartao = 18.0f;
 inline constexpr float kRaioBotao = 12.0f;
 inline constexpr float kEspaco = 14.0f;
-inline constexpr float kLarguraPainelLateral = 300.0f;
+inline constexpr float kLarguraPainelLateral = 320.0f;
 
 }  // namespace gl::tema

@@ -50,9 +50,12 @@ struct Renderizador::Interno {
     ComPtr<ID2D1DeviceContext> contexto2d;
     ComPtr<ID2D1Bitmap1> alvo;
     ComPtr<ID2D1SolidColorBrush> pincel;
+    ComPtr<ID2D1RadialGradientBrush> brilhoVerde;
+    ComPtr<ID2D1RadialGradientBrush> brilhoAzul;
 
     ComPtr<IDWriteFactory> fabricaTexto;
     std::map<int, ComPtr<IDWriteTextFormat>> formatos;
+    std::map<std::pair<int, std::wstring>, float> largurasTexto;
 
     // Uma entrada por imagem na tela. A textura da duplicacao vem sem a flag
     // de recurso compartilhavel que o Direct2D exige, entao cada uma tem a sua
@@ -95,7 +98,10 @@ void Renderizador::liberar() {
     d_->bitmapLogo.Reset();
     d_->tentouLogo = false;
     d_->formatos.clear();
+    d_->largurasTexto.clear();
     d_->pincel.Reset();
+    d_->brilhoVerde.Reset();
+    d_->brilhoAzul.Reset();
     d_->alvo.Reset();
     d_->contexto2d.Reset();
     d_->dispositivo2d.Reset();
@@ -369,6 +375,29 @@ bool Renderizador::dispositivoPerdido() const { return d_->dispositivoPerdido; }
 
 void Renderizador::limpar(const D2D1_COLOR_F& cor) { d_->contexto2d->Clear(cor); }
 
+void Renderizador::fundoAmbiente() {
+    auto preparar = [&](ComPtr<ID2D1RadialGradientBrush>& brush, D2D1_COLOR_F cor) {
+        if (brush) return;
+        const D2D1_GRADIENT_STOP stops[] = {{0.0f, cor}, {1.0f, tema::kTransparente}};
+        ComPtr<ID2D1GradientStopCollection> collection;
+        if (FAILED(d_->contexto2d->CreateGradientStopCollection(stops, 2, &collection))) return;
+        d_->contexto2d->CreateRadialGradientBrush(
+            D2D1::RadialGradientBrushProperties(D2D1::Point2F(), D2D1::Point2F(), 576, 576),
+            collection.Get(), &brush);
+    };
+    preparar(d_->brilhoVerde, tema::cor(0x37FF94, 0.16f));
+    preparar(d_->brilhoAzul, tema::cor(0x53A8FF, 0.16f));
+    const auto area = D2D1::RectF(0, 0, largura(), altura());
+    if (d_->brilhoVerde) {
+        d_->brilhoVerde->SetCenter(D2D1::Point2F(largura() * 0.18f, -24));
+        d_->contexto2d->FillRectangle(area, d_->brilhoVerde.Get());
+    }
+    if (d_->brilhoAzul) {
+        d_->brilhoAzul->SetCenter(D2D1::Point2F(largura() * 1.04f, altura() * 1.04f));
+        d_->contexto2d->FillRectangle(area, d_->brilhoAzul.Get());
+    }
+}
+
 void Renderizador::retangulo(const D2D1_RECT_F& area, const D2D1_COLOR_F& cor, float raio) {
     if (cor.a <= 0.0f) return;
     d_->pincel->SetColor(cor);
@@ -416,12 +445,17 @@ void Renderizador::texto(const std::wstring& conteudo, const D2D1_RECT_F& area,
     IDWriteTextFormat* f = d_->formato(fonte);
     if (!f || conteudo.empty()) return;
     f->SetTextAlignment(alinhamento);
+    f->SetWordWrapping(area.bottom - area.top > estiloDe(fonte).tamanho * 2.2f
+        ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
     d_->pincel->SetColor(cor);
     d_->contexto2d->DrawTextW(conteudo.c_str(), static_cast<UINT32>(conteudo.size()), f, area,
                               d_->pincel.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 float Renderizador::larguraDoTexto(const std::wstring& conteudo, Fonte fonte) {
+    const auto chave = std::make_pair(static_cast<int>(fonte), conteudo);
+    const auto existente = d_->largurasTexto.find(chave);
+    if (existente != d_->largurasTexto.end()) return existente->second;
     IDWriteTextFormat* f = d_->formato(fonte);
     if (!f || conteudo.empty()) return 0.0f;
 
@@ -433,7 +467,16 @@ float Renderizador::larguraDoTexto(const std::wstring& conteudo, Fonte fonte) {
     }
     DWRITE_TEXT_METRICS medidas{};
     arranjo->GetMetrics(&medidas);
+    if (d_->largurasTexto.size() >= 256) d_->largurasTexto.clear();
+    d_->largurasTexto.emplace(chave, medidas.widthIncludingTrailingWhitespace);
     return medidas.widthIncludingTrailingWhitespace;
+}
+
+void Renderizador::miniatura(const std::string& chave, ID3D11Texture2D* textura,
+                            const D2D1_RECT_F& area) {
+    const auto destino = areaDoVideo(chave);
+    video(chave, temQuadro(chave) ? nullptr : textura, area);
+    d_->videoDe(chave).destino = destino;
 }
 
 // Cada imagem tem a sua entrada, achada pela chave.
